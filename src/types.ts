@@ -2,6 +2,8 @@ export type SupportedDialect = "postgres" | "mysql" | "mariadb" | "sqlite" | "ms
 
 export type Profile = {
   name: string;
+  alias: string;
+  operatorKey: string;
   dialect: SupportedDialect;
   client: string;
   connection: KnexConnectionConfig;
@@ -10,6 +12,10 @@ export type Profile = {
   initialDatabase: string;
   allowedDatabases: string[] | "all";
   requireQualifiedDatabase: boolean;
+  displayName?: string;
+  description?: string;
+  tags?: string[];
+  capabilities: string[];
 };
 
 export type KnexConnectionConfig =
@@ -47,10 +53,15 @@ export type KnexConnectionConfig =
 
 export type ProfileSummary = {
   name: string;
+  alias: string;
   dialect: SupportedDialect;
   scope: "server" | "database";
   allowedDatabases: string[] | "all";
   requireQualifiedDatabase: boolean;
+  displayName?: string;
+  description?: string;
+  tags?: string[];
+  capabilities: string[];
 };
 
 export type QueryResult = {

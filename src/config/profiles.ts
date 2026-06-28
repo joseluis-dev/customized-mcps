@@ -1,11 +1,151 @@
 import path from "node:path";
 import { readBool, readInt, readOptionalString, readString } from "./env.js";
 import type { KnexConnectionConfig, Profile, SupportedDialect } from "../types.js";
+import { FileSecretProvider, parseSecretRef } from "../secrets/SecretProvider.js";
 
 export class ProfileError extends Error {
-  constructor(message: string) {
+  readonly kind: string | undefined;
+  readonly alias: string | undefined;
+  constructor(
+    message: string,
+    options: { kind?: string; alias?: string } = {},
+  ) {
     super(message);
     this.name = "ProfileError";
+    this.kind = options.kind;
+    this.alias = options.alias;
+  }
+}
+
+const ALIAS_REGEX = /^[A-Za-z0-9_]+$/;
+const ALIAS_MAX_LENGTH = 64;
+const UNSAFE_DISPLAY_PATTERNS: RegExp[] = [
+  /\$\{secret:[^}]*\}/i,
+  /[a-zA-Z][a-zA-Z0-9+.\-]*:\/\/[^\s@]+:[^\s@]+@/i,
+  /\b(password|passwd|pwd|secret|token|api[_-]?key|connection[_-]?string)\b\s*[=:]\s*[^\s;]+/i,
+  /\b(?:password|passwd|pwd)\s*=\s*[^;\s]+/i,
+  /\b(?:user|uid)\s*=\s*[^;\s]+/i,
+];
+
+export function isUnsafeDisplayMetadata(value: string): boolean {
+  if (typeof value !== "string" || value.length === 0) return false;
+  for (const p of UNSAFE_DISPLAY_PATTERNS) {
+    if (p.test(value)) return true;
+  }
+  return false;
+}
+
+function parseAlias(name: string): string {
+  const v = readOptionalString(`DB_${name}_ALIAS`);
+  if (v === undefined) return name;
+  const trimmed = v.trim();
+  if (trimmed.length === 0) return name;
+  if (trimmed.length > ALIAS_MAX_LENGTH) {
+    throw new ProfileError(
+      `Invalid alias for profile "${name}": alias exceeds ${ALIAS_MAX_LENGTH} characters`,
+      { kind: "alias" },
+    );
+  }
+  if (!ALIAS_REGEX.test(trimmed)) {
+    throw new ProfileError(
+      `Invalid alias for profile "${name}": alias must match ${ALIAS_REGEX.source}`,
+      { kind: "alias" },
+    );
+  }
+  return trimmed;
+}
+
+function parseCommaList(value: string | undefined): string[] {
+  if (value === undefined) return [];
+  const out: string[] = [];
+  const seen = new Set<string>();
+  for (const raw of value.split(",")) {
+    const t = raw.trim();
+    if (t.length === 0) continue;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
+}
+
+function parseMetadata(name: string, alias: string): {
+  displayName?: string;
+  description?: string;
+  tags?: string[];
+  capabilities: string[];
+} {
+  const rawDisplay = readOptionalString(`DB_${name}_DISPLAY_NAME`);
+  const rawDescription = readOptionalString(`DB_${name}_DESCRIPTION`);
+  const rawTags = readOptionalString(`DB_${name}_TAGS`);
+  const rawCapabilities = readOptionalString(`DB_${name}_CAPABILITIES`);
+
+  const displayName =
+    rawDisplay !== undefined && !isUnsafeDisplayMetadata(rawDisplay)
+      ? rawDisplay
+      : undefined;
+  const description =
+    rawDescription !== undefined && !isUnsafeDisplayMetadata(rawDescription)
+      ? rawDescription
+      : undefined;
+  const tagsAll = rawTags !== undefined ? parseCommaList(rawTags) : [];
+  const tags = tagsAll.filter((t) => !isUnsafeDisplayMetadata(t));
+
+  const capabilities =
+    rawCapabilities !== undefined
+      ? parseCommaList(rawCapabilities)
+      : ["read-only"];
+  if (capabilities.length === 0) capabilities.push("read-only");
+
+  const out: ReturnType<typeof parseMetadata> = { capabilities };
+  if (displayName !== undefined) out.displayName = displayName;
+  if (description !== undefined) out.description = description;
+  if (tags.length > 0) out.tags = tags;
+  if (rawDisplay !== undefined && displayName === undefined) {
+    warnUnsafeMetadata(alias, "displayName");
+  }
+  if (rawDescription !== undefined && description === undefined) {
+    warnUnsafeMetadata(alias, "description");
+  }
+  for (const t of tagsAll) {
+    if (isUnsafeDisplayMetadata(t)) {
+      warnUnsafeMetadata(alias, "tags");
+      break;
+    }
+  }
+  return out;
+}
+
+function warnUnsafeMetadata(alias: string, field: string): void {
+  process.stderr.write(
+    `[mcp-readonly-sql] Profile "${alias}": omitted unsafe ${field} (value matched a sensitive pattern)\n`,
+  );
+}
+
+function checkAliasCollisions(
+  candidates: Array<{ alias: string; operatorKey: string }>,
+): void {
+  const aliasOwners = new Map<string, string>(); // lower -> original
+  const operatorOwners = new Map<string, string>(); // lower -> original
+  for (const c of candidates) {
+    operatorOwners.set(c.operatorKey.toLowerCase(), c.operatorKey);
+  }
+  for (const c of candidates) {
+    const aliasKey = c.alias.toLowerCase();
+    const dup = aliasOwners.get(aliasKey);
+    if (dup !== undefined) {
+      throw new ProfileError(
+        `Duplicate alias "${c.alias}"`,
+        { kind: "alias", alias: c.alias },
+      );
+    }
+    if (operatorOwners.has(aliasKey) && aliasKey !== c.operatorKey.toLowerCase()) {
+      throw new ProfileError(
+        `Alias "${c.alias}" collides with another profile's operator key`,
+        { kind: "alias", alias: c.alias },
+      );
+    }
+    aliasOwners.set(aliasKey, c.alias);
   }
 }
 
@@ -81,25 +221,44 @@ function resolveRelativeToProject(rel: string, profileName: string): string {
 
 function buildConnection(
   name: string,
+  alias: string,
   raw: Record<string, string | undefined>,
   dialect: SupportedDialect,
   initialDatabase: string,
-): KnexConnectionConfig {
+  secretProvider: FileSecretProvider,
+): Promise<KnexConnectionConfig> | KnexConnectionConfig {
   switch (dialect) {
     case "postgres": {
       const host = readString(`DB_${name}_HOST`);
       const port = readInt(`DB_${name}_PORT`, 5432);
       const user = readString(`DB_${name}_USER`);
-      const password = readString(`DB_${name}_PASSWORD`);
       const ssl = readBool(`DB_${name}_SSL`, false);
-      return { kind: "postgres", host, port, database: initialDatabase, user, password, ssl };
+      return resolvePassword(`DB_${name}_PASSWORD`, alias, secretProvider).then(
+        (password) => ({
+          kind: "postgres" as const,
+          host,
+          port,
+          database: initialDatabase,
+          user,
+          password,
+          ssl,
+        }),
+      );
     }
     case "mysql": {
       const host = readString(`DB_${name}_HOST`);
       const port = readInt(`DB_${name}_PORT`, 3306);
       const user = readString(`DB_${name}_USER`);
-      const password = readString(`DB_${name}_PASSWORD`);
-      return { kind: "mysql", host, port, database: initialDatabase, user, password };
+      return resolvePassword(`DB_${name}_PASSWORD`, alias, secretProvider).then(
+        (password) => ({
+          kind: "mysql" as const,
+          host,
+          port,
+          database: initialDatabase,
+          user,
+          password,
+        }),
+      );
     }
     case "sqlite": {
       const filename = readString(`DB_${name}_FILENAME`);
@@ -110,27 +269,55 @@ function buildConnection(
       const host = readString(`DB_${name}_HOST`);
       const port = readInt(`DB_${name}_PORT`, 3306);
       const user = readString(`DB_${name}_USER`);
-      const password = readString(`DB_${name}_PASSWORD`);
-      return { kind: "mysql", host, port, database: initialDatabase, user, password };
+      return resolvePassword(`DB_${name}_PASSWORD`, alias, secretProvider).then(
+        (password) => ({
+          kind: "mysql" as const,
+          host,
+          port,
+          database: initialDatabase,
+          user,
+          password,
+        }),
+      );
     }
     case "mssql": {
       const host = readString(`DB_${name}_HOST`);
       const port = readInt(`DB_${name}_PORT`, 1433);
       const user = readString(`DB_${name}_USER`);
-      const password = readString(`DB_${name}_PASSWORD`);
       const encrypt = readBool(`DB_${name}_ENCRYPT`, true);
       const trustServerCertificate = readBool(`DB_${name}_TRUST_SERVER_CERTIFICATE`, false);
-      return {
-        kind: "mssql",
-        host,
-        port,
-        database: initialDatabase,
-        user,
-        password,
-        encrypt,
-        trustServerCertificate,
-      };
+      return resolvePassword(`DB_${name}_PASSWORD`, alias, secretProvider).then(
+        (password) => ({
+          kind: "mssql" as const,
+          host,
+          port,
+          database: initialDatabase,
+          user,
+          password,
+          encrypt,
+          trustServerCertificate,
+        }),
+      );
     }
+  }
+}
+
+async function resolvePassword(
+  envName: string,
+  alias: string,
+  provider: FileSecretProvider,
+): Promise<string> {
+  const raw = readString(envName);
+  const ref = parseSecretRef(raw);
+  if (!ref) return raw;
+  try {
+    return await provider.resolve(raw, { alias });
+  } catch (e) {
+    const err = e as Error & { kind?: string };
+    throw new ProfileError(
+      `Profile "${alias}": could not resolve the connection password (${err.kind ?? "secret"} kind)`,
+      { kind: err.kind ?? "secret", alias },
+    );
   }
 }
 
@@ -176,48 +363,95 @@ function parseInitialDatabase(
   return defaultInitialDatabase(dialect);
 }
 
-export function loadProfile(name: string, raw: Record<string, string | undefined>): Profile {
-  if (!/^[A-Za-z0-9_]+$/.test(name)) {
-    throw new ProfileError(`Invalid profile name: ${name}`);
+export function loadProfile(
+  name: string,
+  raw: Record<string, string | undefined>,
+  options: { secretProvider?: FileSecretProvider } = {},
+): Promise<Profile> {
+  try {
+    if (!/^[A-Za-z0-9_]+$/.test(name)) {
+      throw new ProfileError(`Invalid profile name: ${name}`);
+    }
+    const alias = parseAlias(name);
+    const clientRaw = readString(`DB_${name}_CLIENT`);
+    const dialect = toDialect(clientRaw);
+    if (!SUPPORTED_DIALECTS.includes(dialect)) {
+      throw new ProfileError(
+        `Unsupported dialect for profile ${name}: ${dialect}`,
+      );
+    }
+    const scope: "server" | "database" =
+      dialect === "sqlite" ? "database" : "server";
+    const allowedDatabases = parseAllowedDatabases(raw, name);
+    const requireQualifiedDatabase = readBool(
+      `DB_${name}_REQUIRE_QUALIFIED_DATABASE`,
+      scope === "server",
+    );
+    const initialDatabase = parseInitialDatabase(raw, name, dialect);
+    const metadata = parseMetadata(name, alias);
+    const secretProvider =
+      options.secretProvider ?? new FileSecretProvider();
+    const connectionResult = buildConnection(
+      name,
+      alias,
+      raw,
+      dialect,
+      initialDatabase,
+      secretProvider,
+    );
+    return Promise.resolve(connectionResult).then(
+      (connection): Profile => {
+        const client = knexClientFor(dialect);
+        const knexOptions: Record<string, unknown> = {};
+        if (dialect === "sqlite") {
+          knexOptions.useNullAsDefault = true;
+        }
+        const profile: Profile = {
+          name: alias,
+          alias,
+          operatorKey: name,
+          dialect,
+          client,
+          connection,
+          knexOptions,
+          scope,
+          initialDatabase,
+          allowedDatabases,
+          requireQualifiedDatabase,
+          capabilities: metadata.capabilities,
+        };
+        if (metadata.displayName !== undefined) {
+          profile.displayName = metadata.displayName;
+        }
+        if (metadata.description !== undefined) {
+          profile.description = metadata.description;
+        }
+        if (metadata.tags !== undefined) {
+          profile.tags = metadata.tags;
+        }
+        return profile;
+      },
+    );
+  } catch (e) {
+    return Promise.reject(e);
   }
-  const clientRaw = readString(`DB_${name}_CLIENT`);
-  const dialect = toDialect(clientRaw);
-  if (!SUPPORTED_DIALECTS.includes(dialect)) {
-    throw new ProfileError(`Unsupported dialect for profile ${name}: ${dialect}`);
-  }
-  const scope: "server" | "database" =
-    dialect === "sqlite" ? "database" : "server";
-  const allowedDatabases = parseAllowedDatabases(raw, name);
-  const requireQualifiedDatabase = readBool(
-    `DB_${name}_REQUIRE_QUALIFIED_DATABASE`,
-    scope === "server",
-  );
-  const initialDatabase = parseInitialDatabase(raw, name, dialect);
-  const connection = buildConnection(name, raw, dialect, initialDatabase);
-  const client = knexClientFor(dialect);
-  const knexOptions: Record<string, unknown> = {};
-  if (dialect === "sqlite") {
-    knexOptions.useNullAsDefault = true;
-  }
-  return {
-    name,
-    dialect,
-    client,
-    connection,
-    knexOptions,
-    scope,
-    initialDatabase,
-    allowedDatabases,
-    requireQualifiedDatabase,
-  };
 }
 
 export function loadAllProfiles(
   profileNames: string[],
   raw: Record<string, string | undefined>,
-): Profile[] {
+  options: { secretProvider?: FileSecretProvider } = {},
+): Promise<Profile[]> {
   if (profileNames.length === 0) {
-    return [];
+    return Promise.resolve([]);
   }
-  return profileNames.map((n) => loadProfile(n, raw));
+  const secretProvider = options.secretProvider ?? new FileSecretProvider();
+  return Promise.all(
+    profileNames.map((n) => loadProfile(n, raw, { secretProvider })),
+  ).then((profiles) => {
+    checkAliasCollisions(
+      profiles.map((p) => ({ alias: p.alias, operatorKey: p.operatorKey })),
+    );
+    return profiles;
+  });
 }

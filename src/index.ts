@@ -14,7 +14,7 @@ export async function runServer(): Promise<void> {
   const { profileNames, raw } = loadRawEnv();
   let profiles;
   try {
-    profiles = loadAllProfiles(profileNames, raw);
+    profiles = await loadAllProfiles(profileNames, raw);
   } catch (e) {
     if (e instanceof ProfileError) {
       log(`Profile configuration error: ${e.message}`);
@@ -28,7 +28,7 @@ export async function runServer(): Promise<void> {
   if (profiles.length === 0) {
     log("No DB_PROFILES configured. The server will start but no profile will be available.");
   } else {
-    log(`Loaded ${profiles.length} profile(s): ${profiles.map((p) => p.name).join(", ")}`);
+    log(`Loaded ${profiles.length} profile(s): ${profiles.map((p) => p.alias).join(", ")}`);
   }
 
   const limits = readSafetyLimits();

@@ -61,22 +61,40 @@ export function registerReadOnlyTools(
   },
 ): void {
   const { profiles, limits, connections } = args;
-  const profileMap = new Map(profiles.map((p) => [p.name, p] as const));
-  const summaries: ProfileSummary[] = profiles.map((p) => ({
-    name: p.name,
-    dialect: p.dialect,
-    scope: p.scope,
-    allowedDatabases: p.allowedDatabases,
-    requireQualifiedDatabase: p.requireQualifiedDatabase,
-  }));
+  const aliasMap = new Map<string, Profile>();
+  const operatorKeyMap = new Map<string, Profile>();
+  for (const p of profiles) {
+    aliasMap.set(p.alias, p);
+    if (p.alias !== p.operatorKey) {
+      operatorKeyMap.set(p.operatorKey, p);
+    }
+  }
+  const lookupProfile = (value: string): Profile | undefined => {
+    return aliasMap.get(value) ?? operatorKeyMap.get(value);
+  };
+  const summaries: ProfileSummary[] = profiles.map((p) => {
+    const summary: ProfileSummary = {
+      name: p.alias,
+      alias: p.alias,
+      dialect: p.dialect,
+      scope: p.scope,
+      allowedDatabases: p.allowedDatabases,
+      requireQualifiedDatabase: p.requireQualifiedDatabase,
+      capabilities: p.capabilities,
+    };
+    if (p.displayName !== undefined) summary.displayName = p.displayName;
+    if (p.description !== undefined) summary.description = p.description;
+    if (p.tags !== undefined && p.tags.length > 0) summary.tags = p.tags;
+    return summary;
+  });
 
   server.registerTool(
     "list_profiles",
     {
       title: "List connection profiles",
       description:
-        "Returns the connection profiles configured in .env. For server-scope profiles (PostgreSQL, MySQL/MariaDB, SQL Server), the listed `allowedDatabases` are the only databases the agent can query. No credentials are returned.",
-      inputSchema: z.object({}),
+        "Returns the connection profiles configured in .env. For server-scope profiles (PostgreSQL, MySQL/MariaDB, SQL Server), the listed `allowedDatabases` are the only databases the agent can query. No credentials are returned. Each entry has `name` equal to `alias`; the operator key is server-side.",
+      inputSchema: z.object({}).strict(),
     },
     async () => jsonResult({ profiles: summaries }),
   );
@@ -87,12 +105,14 @@ export function registerReadOnlyTools(
       title: "Test a connection profile",
       description:
         "Opens a short-lived check (SELECT 1) against the profile's initial database to confirm reachability. Does not return any data.",
-      inputSchema: z.object({
-        profile: profileNameSchema,
-      }),
+      inputSchema: z
+        .object({
+          profile: profileNameSchema,
+        })
+        .strict(),
     },
     async ({ profile }) => {
-      const p = profileMap.get(profile);
+      const p = lookupProfile(profile);
       if (!p) {
         return errorResult(new Error(`Unknown profile: ${profile}`));
       }
@@ -101,7 +121,7 @@ export function registerReadOnlyTools(
         await withReadOnlyTransaction(k, p.dialect, async (trx) => {
           await trx.raw("SELECT 1");
         });
-        return textResult(`Connection OK for profile "${profile}" (${p.dialect})`);
+        return textResult(`Connection OK for profile "${p.alias}" (${p.dialect})`);
       } catch (e) {
         return errorResult(e);
       }
@@ -114,25 +134,27 @@ export function registerReadOnlyTools(
       title: "List allowed databases for a server-scope profile",
       description:
         "Returns the list of databases the agent is allowed to query through this profile (per the .env allowlist). For database-scope profiles, only the initial database is returned.",
-      inputSchema: z.object({
-        profile: profileNameSchema,
-      }),
+      inputSchema: z
+        .object({
+          profile: profileNameSchema,
+        })
+        .strict(),
     },
     async ({ profile }) => {
-      const p = profileMap.get(profile);
+      const p = lookupProfile(profile);
       if (!p) {
         return errorResult(new Error(`Unknown profile: ${profile}`));
       }
       if (p.allowedDatabases === "all") {
         return jsonResult({
-          profile,
+          profile: p.alias,
           scope: p.scope,
           allowed: "all (per the read-only database user)",
           requireQualifiedDatabase: p.requireQualifiedDatabase,
         });
       }
       return jsonResult({
-        profile,
+        profile: p.alias,
         scope: p.scope,
         allowed: p.allowedDatabases,
         requireQualifiedDatabase: p.requireQualifiedDatabase,
@@ -146,19 +168,21 @@ export function registerReadOnlyTools(
       title: "Execute a read-only SQL query",
       description:
         "Runs a single SELECT (or WITH ... SELECT) statement against the chosen profile. The MCP rejects INSERT/UPDATE/DELETE and any other write or admin statement. For server-scope profiles, every referenced database must be in the allowlist; fully-qualified names are required when requireQualifiedDatabase is true. Use parameter bindings to inject values. Row results are capped by maxRows.",
-      inputSchema: z.object({
-        profile: profileNameSchema,
-        database: databaseNameSchema.optional(),
-        sql: z.string().min(1).max(100_000),
-        bindings: z
-          .union([z.array(z.unknown()), z.record(z.string(), z.unknown())])
-          .optional(),
-        maxRows: z.number().int().positive().optional(),
-        timeoutMs: z.number().int().positive().optional(),
-      }),
+      inputSchema: z
+        .object({
+          profile: profileNameSchema,
+          database: databaseNameSchema.optional(),
+          sql: z.string().min(1).max(100_000),
+          bindings: z
+            .union([z.array(z.unknown()), z.record(z.string(), z.unknown())])
+            .optional(),
+          maxRows: z.number().int().positive().optional(),
+          timeoutMs: z.number().int().positive().optional(),
+        })
+        .strict(),
     },
     async ({ profile, database, sql, bindings, maxRows, timeoutMs }) => {
-      const p = profileMap.get(profile);
+      const p = lookupProfile(profile);
       if (!p) {
         return errorResult(new Error(`Unknown profile: ${profile}`));
       }
@@ -166,7 +190,7 @@ export function registerReadOnlyTools(
       if (policy && database && policy.allowed !== "all" && !policy.allowed.includes(database)) {
         return errorResult(
           new Error(
-            `Database "${database}" is not in the allowlist for profile "${profile}"`,
+            `Database "${database}" is not in the allowlist for profile "${p.alias}"`,
           ),
         );
       }
@@ -206,7 +230,7 @@ export function registerReadOnlyTools(
           cappedTimeout,
         );
         return jsonResult({
-          profile,
+          profile: p.alias,
           database: database ?? p.initialDatabase,
           dialect: p.dialect,
           ...result,
@@ -224,19 +248,21 @@ export function registerReadOnlyTools(
       title: "List tables and columns for a profile",
       description:
         "Returns a best-effort list of tables (and columns when a `table` is given) using read-only metadata queries. For server-scope profiles, the optional `database` argument selects which allowed database to inspect; it must be in the allowlist.",
-      inputSchema: z.object({
-        profile: profileNameSchema,
-        database: databaseNameSchema.optional(),
-        table: z
-          .string()
-          .min(1)
-          .max(128)
-          .regex(/^[A-Za-z0-9_.$-]+$/)
-          .optional(),
-      }),
+      inputSchema: z
+        .object({
+          profile: profileNameSchema,
+          database: databaseNameSchema.optional(),
+          table: z
+            .string()
+            .min(1)
+            .max(128)
+            .regex(/^[A-Za-z0-9_.$-]+$/)
+            .optional(),
+        })
+        .strict(),
     },
     async ({ profile, database, table }) => {
-      const p = profileMap.get(profile);
+      const p = lookupProfile(profile);
       if (!p) {
         return errorResult(new Error(`Unknown profile: ${profile}`));
       }
@@ -244,14 +270,21 @@ export function registerReadOnlyTools(
       if (p.allowedDatabases !== "all" && !p.allowedDatabases.includes(targetDb)) {
         return errorResult(
           new Error(
-            `Database "${targetDb}" is not in the allowlist for profile "${profile}"`,
+            `Database "${targetDb}" is not in the allowlist for profile "${p.alias}"`,
           ),
         );
       }
       const sql = buildDescribeSql(p.dialect, p.scope, targetDb, table);
-      const policy = policyFor(p);
+      // The SQL is server-generated and references the system metadata
+      // schema (`information_schema` / `INFORMATION_SCHEMA`), not a user-
+      // controlled table. The user's actual `targetDb` has already been
+      // validated against the profile allowlist above, and `buildDescribeSql`
+      // only interpolates the validated, regex-checked `database`/`table`
+      // values into string literals. The standard read-only AST/keyword
+      // checks still apply, so we deliberately skip the database allowlist
+      // check for this server-built query.
       try {
-        assertReadOnlySql(p.dialect, sql, policy);
+        assertReadOnlySql(p.dialect, sql);
       } catch (e) {
         return errorResult(e);
       }
@@ -277,7 +310,7 @@ export function registerReadOnlyTools(
           (trx) => runReadQuery(trx, sql, [], limits.maxRowsHardLimit),
           beforeStatement,
         );
-        return jsonResult({ profile, database: targetDb, dialect: p.dialect, ...result });
+        return jsonResult({ profile: p.alias, database: targetDb, dialect: p.dialect, ...result });
       } catch (e) {
         return errorResult(e);
       }

@@ -1,0 +1,61 @@
+schema: spec-driven
+
+context: |
+  Project: mcp-readonly-sql (Node.js >=20, TypeScript 5.7, ESM, NodeNext modules).
+  Architecture: hexagonal — src/{config,db,security,tools}/ + index.ts entrypoint over stdio.
+  Testing: vitest 2.1 (unit) on test/**/*.test.ts; no integration/E2E; no coverage tool wired.
+  Style: strict TS (noUncheckedIndexedAccess, noImplicitOverride), pnpm 10.33, zod 3.23 for input schemas.
+  Domains: connection profiles, SQL read-only guard, dialect-specific read execution, MCP tool surface.
+
+rules:
+  proposal:
+    - Every change MUST keep the read-only safety guarantee observable (sqlGuard or engine-level).
+    - Include rollback plan when adding a new tool, dialect, or storage backend.
+  specs:
+    - Use Given/When/Then for scenarios.
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY).
+    - New MCP tools MUST be tagged with profile-scope, allowlist behavior, and error contract.
+  design:
+    - Document any new SQL parsing or AST traversal with rationale vs. node-sql-parser AST shape.
+    - Document cross-database routing (USE / SET search_path / connection DB) for each dialect.
+    - Security-sensitive decisions (allowlist, qualification, path traversal) MUST list threats + mitigations.
+  tasks:
+    - Group by phase, use hierarchical numbering (1, 1.1, 1.2, 2, ...).
+    - Keep tasks completable in one session; pair every code task with a vitest task when logic is testable.
+  apply:
+    settings:
+      tdd: true
+      test_command: pnpm test
+      build_command: pnpm build
+    rules:
+      - "Follow existing module layout: src/{config,db,security,tools}."
+      - "New SQL guard rules MUST ship with vitest cases in test/sqlGuard.test.ts first."
+  verify:
+    settings:
+      test_command: pnpm test
+      build_command: pnpm build
+      typecheck_command: pnpm exec tsc -p tsconfig.json --noEmit
+      coverage_threshold: 0
+    rules:
+      - Confirm TypeScript strictness still passes (noUncheckedIndexedAccess + noImplicitOverride).
+  archive:
+    - Warn before merging deltas that change the public MCP tool surface.
+
+testing:
+  strict_tdd: true
+  runner: vitest
+  runner_command: pnpm test
+  watch_command: pnpm test:watch
+  layers:
+    unit: true
+    integration: false
+    e2e: false
+  coverage_available: false
+  coverage_command: ""
+  typecheck_command: pnpm exec tsc -p tsconfig.json --noEmit
+  lint_command: ""
+  format_command: ""
+  notes:
+    - "Vitest 2.1 is the only test framework declared; no playwright/cypress/supertest present."
+    - "@vitest/coverage is not in devDependencies — coverage tooling is unavailable until added."
+    - "No ESLint, Prettier, or editorconfig files are present; style is enforced by tsc + manual review."

@@ -10,6 +10,12 @@ const SENSITIVE_KEYS = [
   "connection_string",
 ];
 
+const SECRET_REF_LITERAL = /\$\{secret:[^}]*\}/g;
+const CONN_STRING_INLINE = /([a-zA-Z][a-zA-Z0-9+.\-]*:\/\/)([^@\s]+)@/g;
+const BARE_CREDENTIALS = /(?<![A-Za-z0-9._+\-/])([A-Za-z0-9._+-]+):([A-Za-z0-9._+-]+)@/g;
+const DSN_CRED_PAIR =
+  /((?:password|passwd|pwd|user|uid)\s*=\s*)([^;\s]+)/gi;
+
 function maskValue(key: string, value: unknown): unknown {
   const k = key.toLowerCase();
   if (SENSITIVE_KEYS.some((s) => k.includes(s))) {
@@ -43,6 +49,10 @@ function scrubValue(v: unknown): unknown {
 export function sanitizeErrorMessage(message: string): string {
   if (typeof message !== "string") return String(message);
   return message
+    .replace(SECRET_REF_LITERAL, "${secret:***}")
+    .replace(CONN_STRING_INLINE, "$1***@")
+    .replace(BARE_CREDENTIALS, "***@")
+    .replace(DSN_CRED_PAIR, (m, k) => `${k}***`)
     .replace(/(password|passwd|pwd)\s*=\s*[^;\s]+/gi, "$1=***")
     .replace(/(user|uid)\s*=\s*([^;\s]+)/gi, (m, p1, p2) => {
       if (/(password|passwd|pwd)/i.test(message)) return `${p1}=${p2}`;

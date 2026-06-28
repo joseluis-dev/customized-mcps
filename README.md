@@ -60,6 +60,8 @@ src/
     dialects.ts       dialect mapping
     knexFactory.ts    connection manager + read-only transactions
     resultNormalizer.ts  result shaping
+  secrets/
+    SecretProvider.ts async secret resolution (file-backed)
   security/
     sqlGuard.ts       SQL allowlist + cross-DB enforcement
     sanitizeError.ts  error scrubbing
@@ -73,6 +75,8 @@ test/                 vitest unit tests
 ## Configure profiles
 
 Copy `.env.example` to `.env` and fill in one or more profiles. A profile is a set of `DB_<NAME>_*` variables referenced from `DB_PROFILES`.
+
+The prefix `DB_<NAME>` is the **server-side operator key** — the name the operator uses in `DB_PROFILES` and in env var names. The MCP-facing **alias** is what agents see and pass to tool calls. By default, the alias equals the operator key. Set `DB_<NAME>_ALIAS` to expose a different, friendlier identifier (e.g. `DB_SQLSERVER_BI_ALIAS=bi_catastro`). The alias must match `^[A-Za-z0-9_]+$` and be 1–64 characters; startup fails closed on duplicates and on aliases that collide with another profile's operator key.
 
 ### SQL Server example (your case)
 
@@ -89,6 +93,9 @@ DB_CATASTRO_SERVER_ENCRYPT=true
 DB_CATASTRO_SERVER_TRUST_SERVER_CERTIFICATE=true
 DB_CATASTRO_SERVER_ALLOWED_DATABASES=catastral,catastro
 DB_CATASTRO_SERVER_REQUIRE_QUALIFIED_DATABASE=true
+DB_CATASTRO_SERVER_ALIAS=bi_catastro
+DB_CATASTRO_SERVER_DISPLAY_NAME=Catastro BI
+DB_CATASTRO_SERVER_TAGS=bi,finance
 ```
 
 `TRUST_SERVER_CERTIFICATE=true` is what fixes the *self-signed certificate* error you saw in the inspector. The connection still uses TLS, it just does not validate the server's certificate against a trusted CA.
@@ -134,12 +141,23 @@ DB_SQLITE_DEMO_FILENAME=./data/demo.sqlite
 DB_SQLITE_DEMO_ALLOWED_DATABASES=main
 ```
 
+### File-backed secrets
+
+Any secret-bearing field (currently `DB_<NAME>_PASSWORD`) can point at a file using the `${secret:file:/abs/path}` syntax. The loader resolves the file at startup using async I/O with a per-resolve timeout (default 5s). The literal never appears in logs, errors, or `ProfileSummary`; only the resolved value is held in memory.
+
+```env
+DB_SQLSERVER_BI_PASSWORD=${secret:file:/run/secrets/db_pw}
+```
+
 Rules:
 
-- Profile names must match `^[A-Za-z0-9_]+$`.
+- Profile names (operator keys) must match `^[A-Za-z0-9_]+$`.
+- Aliases (`DB_<NAME>_ALIAS`) must match `^[A-Za-z0-9_]+$`, 1–64 characters.
 - For server-scope profiles, `DB_<NAME>_ALLOWED_DATABASES` is **required**. Use a comma-separated list of database names, or `*` to allow any database the read-only user can see. Database identifiers must match `^[A-Za-z0-9_\-$]+$`.
 - `DB_<NAME>_INITIAL_DATABASE` (or the legacy `DB_<NAME>_DATABASE`) sets the database used at connection time. Defaults are `master` for SQL Server, `postgres` for PostgreSQL, `mysql` for MySQL/MariaDB.
 - `DB_<NAME>_REQUIRE_QUALIFIED_DATABASE` defaults to `true` for server-scope profiles. Set `false` to allow unqualified `SELECT * FROM t` style queries.
+- `DB_<NAME>_DISPLAY_NAME`, `DB_<NAME>_DESCRIPTION`, and `DB_<NAME>_TAGS` are optional display fields. Tags are comma-separated, trimmed, deduped, and order-preserving. If a value matches a sensitive pattern (e.g. contains `${secret:...}`, a `password=…` pair, or a `user:pass@` URI fragment), the value is omitted from `list_profiles` and a warning is written to stderr.
+- `DB_<NAME>_CAPABILITIES` defaults to `["read-only"]`.
 - For SQLite, `DB_<NAME>_FILENAME` must be a **relative** path; absolute paths and `..` traversal are rejected at startup. The resolved file must remain inside the project root. As an extra defense, every SQLite connection sets `PRAGMA query_only = ON`, and you can additionally set the file as read-only at the OS level.
 - Safety caps: `MAX_ROWS_DEFAULT`, `MAX_ROWS_HARD_LIMIT`, `QUERY_TIMEOUT_MS_DEFAULT`, `QUERY_TIMEOUT_MS_HARD_LIMIT`.
 
@@ -167,17 +185,19 @@ pnpm inspect
 
 | Tool | Purpose |
 | ---- | ------- |
-| `list_profiles` | Lists the configured profile names and their scope/allowlist. No credentials. |
+| `list_profiles` | Lists the configured profile aliases and their scope/allowlist, plus optional `displayName`, `description`, `tags`, and `capabilities`. No credentials. |
 | `list_databases` | Returns the allowlist (or `*`) for a given server-scope profile. |
 | `test_connection` | Runs `SELECT 1` against the initial database to confirm reachability. |
 | `execute_read_query` | Runs a read-only `SELECT`/`WITH` query, optionally with a `database` argument. |
 | `describe_schema` | Returns tables (and columns when a `table` is given) for the given `database`. |
 
+Tools accept the **alias** (default = operator key) for the `profile` argument; the operator key is also accepted as a synonym for backward compatibility. The `profile` value is never enriched with connection fields, host, port, user, or password — those are server-side only. The zod input schemas are `.strict()` so extra fields (including `host`/`user`/`password`/`port`) are rejected.
+
 ### Example: execute_read_query (SQL Server, two databases)
 
 ```json
 {
-  "profile": "CATASTRO_SERVER",
+  "profile": "bi_catastro",
   "sql": "SELECT TOP 100 p.*, t.* FROM [catastral].[dbo].[Predios] p JOIN [catastro].[dbo].[Titulares] t ON t.id = p.titular_id",
   "maxRows": 100
 }
@@ -199,7 +219,7 @@ pnpm inspect
 
 ```json
 {
-  "profile": "CATASTRO_SERVER",
+  "profile": "bi_catastro",
   "database": "catastral",
   "table": "Predios"
 }
@@ -245,7 +265,10 @@ The test suite covers:
 
 - `sqlGuard` blocks every form of write/admin statement and allows only `SELECT`/`WITH`.
 - `sqlGuard` enforces the database allowlist for server-scope profiles across dialects.
-- `profiles` loader handles PostgreSQL, MySQL, SQLite, MSSQL, and rejects unsafe SQLite paths and missing allowlists.
+- `profiles` loader handles PostgreSQL, MySQL, SQLite, MSSQL, rejects unsafe SQLite paths and missing allowlists, parses alias/display/tags/capabilities, rejects collisions, and resolves `${secret:file:...}` password refs without leaking path/host/user/password/port.
+- `profileAlias` covers `ProfileSummary` shape (no host/user/password/port, `name === alias`), alias-first lookup with operator-key fallback, caller-keyed error messages, and strict zod rejection of extra fields on every tool.
+- `secretRefs` covers the `FileSecretProvider` (success, missing file, relative path rejection, pre-aborted signal, unsupported kinds, signal+timeout composition).
+- `sanitizeError` masks `${secret:...}` literals, DSN-style credential pairs, and `user:pass@` URI fragments.
 
 ## License
 
