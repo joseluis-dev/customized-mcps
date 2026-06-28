@@ -1,0 +1,9 @@
+[project]
+name = "db-workspace"
+version = "0.0.0"
+description = "Workspace root for MCP server apps (pnpm + uv). No app code lives here; each app is a self-contained package under apps/."
+requires-python = ">=3.12"
+dependencies = []
+
+[tool.uv.workspace]
+members = []

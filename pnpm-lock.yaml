@@ -6,7 +6,9 @@ settings:
 
 importers:
 
-  .:
+  .: {}
+
+  apps/mcp-readonly-sql:
     dependencies:
       '@modelcontextprotocol/sdk':
         specifier: ^1.29.0

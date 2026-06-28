@@ -1,16 +1,19 @@
 schema: spec-driven
 
 context: |
-  Project: mcp-readonly-sql (Node.js >=20, TypeScript 5.7, ESM, NodeNext modules).
-  Architecture: hexagonal — src/{config,db,security,tools}/ + index.ts entrypoint over stdio.
-  Testing: vitest 2.1 (unit) on test/**/*.test.ts; no integration/E2E; no coverage tool wired.
-  Style: strict TS (noUncheckedIndexedAccess, noImplicitOverride), pnpm 10.33, zod 3.23 for input schemas.
-  Domains: connection profiles, SQL read-only guard, dialect-specific read execution, MCP tool surface.
+  Workspace: pnpm + uv monorepo for hosting multiple MCP apps (TypeScript and Python).
+  Architecture: workspace root is non-deployable; each MCP app lives in apps/<app-name>/ and owns
+  its own manifest, source, tests, .env.example, and build artifact.
+  The current change is apps/mcp-readonly-sql — a TypeScript ESM package (Node >=20, TS 5.7,
+  NodeNext modules, vitest 2.1) that exposes a read-only MCP SQL server over stdio.
+  Future Python MCPs will live in apps/<py-app>/ and are invoked with `uv --project apps/<py-app>`.
+  All apply/verify commands target ONE app at a time via `pnpm --filter <app-name>` (TS) or
+  `uv --project apps/<py-app>` (Python). No command resolves to the whole repo.
 
 rules:
   proposal:
     - Every change MUST keep the read-only safety guarantee observable (sqlGuard or engine-level).
-    - Include rollback plan when adding a new tool, dialect, or storage backend.
+    - Include rollback plan when adding a new tool, dialect, storage backend, or app.
   specs:
     - Use Given/When/Then for scenarios.
     - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY).
@@ -19,43 +22,48 @@ rules:
     - Document any new SQL parsing or AST traversal with rationale vs. node-sql-parser AST shape.
     - Document cross-database routing (USE / SET search_path / connection DB) for each dialect.
     - Security-sensitive decisions (allowlist, qualification, path traversal) MUST list threats + mitigations.
+    - Workspace-affecting changes MUST list which app(s) own the behavior and which commands target them.
   tasks:
     - Group by phase, use hierarchical numbering (1, 1.1, 1.2, 2, ...).
     - Keep tasks completable in one session; pair every code task with a vitest task when logic is testable.
   apply:
     settings:
       tdd: true
-      test_command: pnpm test
-      build_command: pnpm build
+      test_command: pnpm --filter mcp-readonly-sql test
+      build_command: pnpm --filter mcp-readonly-sql build
     rules:
-      - "Follow existing module layout: src/{config,db,security,tools}."
-      - "New SQL guard rules MUST ship with vitest cases in test/sqlGuard.test.ts first."
+      - "Follow existing app module layout: apps/<app-name>/src/{config,db,security,tools}."
+      - "New SQL guard rules MUST ship with vitest cases in apps/<app-name>/test/sqlGuard.test.ts first."
+      - "Never edit the workspace root's src/ or test/ directories — apps own their own source tree."
   verify:
     settings:
-      test_command: pnpm test
-      build_command: pnpm build
-      typecheck_command: pnpm exec tsc -p tsconfig.json --noEmit
+      test_command: pnpm --filter mcp-readonly-sql test
+      build_command: pnpm --filter mcp-readonly-sql build
+      typecheck_command: pnpm --filter mcp-readonly-sql typecheck
       coverage_threshold: 0
     rules:
       - Confirm TypeScript strictness still passes (noUncheckedIndexedAccess + noImplicitOverride).
+      - Confirm the workspace root has no `bin` field, no `dist/`, and no app-owned code at the root.
   archive:
     - Warn before merging deltas that change the public MCP tool surface.
+    - When an app moves between paths or a new app is added, regenerate the root README app index.
 
 testing:
   strict_tdd: true
   runner: vitest
-  runner_command: pnpm test
-  watch_command: pnpm test:watch
+  runner_command: pnpm --filter mcp-readonly-sql test
+  watch_command: pnpm --filter mcp-readonly-sql test:watch
   layers:
     unit: true
     integration: false
     e2e: false
   coverage_available: false
   coverage_command: ""
-  typecheck_command: pnpm exec tsc -p tsconfig.json --noEmit
+  typecheck_command: pnpm --filter mcp-readonly-sql typecheck
   lint_command: ""
   format_command: ""
   notes:
     - "Vitest 2.1 is the only test framework declared; no playwright/cypress/supertest present."
     - "@vitest/coverage is not in devDependencies — coverage tooling is unavailable until added."
     - "No ESLint, Prettier, or editorconfig files are present; style is enforced by tsc + manual review."
+    - "Tests run from the app directory because pnpm `--filter` sets cwd to the app's package root; vitest config include path is `test/**/*.test.ts` (relative to the app)."

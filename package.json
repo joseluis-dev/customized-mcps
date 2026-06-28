@@ -1,61 +1,25 @@
 {
-  "name": "mcp-readonly-sql",
-  "version": "0.1.0",
-  "description": "Read-only MCP server for SQL databases (PostgreSQL, MySQL/MariaDB, SQL Server, SQLite) backed by connection profiles from .env",
-  "type": "module",
-  "bin": {
-    "mcp-readonly-sql": "dist/index.js"
-  },
-  "main": "dist/index.js",
-  "files": [
-    "dist",
-    "README.md"
-  ],
+  "name": "db-workspace",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Workspace root for MCP server apps. This package is not deployable; each app under apps/ is its own package.",
   "scripts": {
-    "dev": "tsx src/index.ts",
-    "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
-    "test": "vitest run",
-    "test:watch": "vitest",
-    "inspect": "pnpm dlx @modelcontextprotocol/inspector node dist/index.js"
+    "dev": "pnpm --filter mcp-readonly-sql dev",
+    "start": "pnpm --filter mcp-readonly-sql start",
+    "inspect": "pnpm --filter mcp-readonly-sql inspect",
+    "test:watch": "pnpm --filter mcp-readonly-sql test:watch",
+    "test": "pnpm --filter mcp-readonly-sql test",
+    "build": "pnpm --filter mcp-readonly-sql build",
+    "typecheck": "pnpm --filter mcp-readonly-sql typecheck"
   },
   "engines": {
     "node": ">=20"
   },
-  "keywords": [
-    "mcp",
-    "model-context-protocol",
-    "sql",
-    "readonly",
-    "postgres",
-    "mysql",
-    "mssql",
-    "sqlite"
-  ],
-  "author": "",
-  "license": "ISC",
   "packageManager": "pnpm@10.33.0",
   "pnpm": {
     "onlyBuiltDependencies": [
       "esbuild",
       "sqlite3"
     ]
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "dotenv": "^16.4.7",
-    "knex": "^3.1.0",
-    "mysql2": "^3.11.5",
-    "node-sql-parser": "^5.3.10",
-    "pg": "^8.13.1",
-    "sqlite3": "^5.1.7",
-    "tedious": "^18.6.1",
-    "zod": "^3.23.8"
-  },
-  "devDependencies": {
-    "@types/node": "^22.10.2",
-    "tsx": "^4.19.2",
-    "typescript": "^5.7.2",
-    "vitest": "^2.1.8"
   }
 }
