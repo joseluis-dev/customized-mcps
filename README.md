@@ -52,7 +52,7 @@ aliases; they all delegate to `pnpm --filter mcp-readonly-sql <script>`.
 
 1. Create the directory: `apps/<new-app>/`.
 2. For TypeScript apps: drop in a `package.json` (with a unique `name` — do **not**
-   scope it to `@db/`), a `tsconfig.json` that extends `../../tsconfig.base.json`,
+   scope it to `@customized-mcps/`), a `tsconfig.json` that extends `../../tsconfig.base.json`,
    and the usual `src/` / `test/` folders.
 3. For Python apps: drop in a `pyproject.toml` with a `[project.scripts]` entry
    pointing at the wire entrypoint, and add the app to `[tool.uv.workspace]`

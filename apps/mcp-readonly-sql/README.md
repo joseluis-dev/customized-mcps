@@ -280,6 +280,72 @@ Three details matter for the host wiring:
 - `DOTENV_CONFIG_PATH` points at the app's `.env` so profile credentials load
   correctly even if the host's own cwd differs.
 
+## HTTP deployment (multi-agent)
+
+> This section is the operator-facing counterpart to the
+> `mcp-http-transport`, `mcp-agent-authorization`, and
+> `mcp-deployment-templates` specs. The shared transport and agent
+> authorization are implemented in `packages/mcp-http-base/`; this app
+> is a thin caller. The operational templates (systemd, Docker, nginx
+> example, runbook) ship in `deploy/` (PR 3) and are the recommended way
+> to run this app in production.
+
+The app exposes the same five read-only tools over Streamable HTTP
+when `MCP_TRANSPORT=streamableHttp`. Multiple agents can then share a
+single process behind a reverse proxy, each identified by an opaque
+HMAC bearer token. The wire contract is:
+
+| Concern | Behavior |
+|---|---|
+| Endpoint | `POST /mcp` (JSON-RPC) and `GET /mcp` (SSE stream) |
+| Health | `GET /healthz` (unauthenticated, `200 ok` / `503 shutting-down`) |
+| Auth | `Authorization: Bearer <token>` per request, validated as `HMAC(secret, token) === keyHash` in constant time |
+| Scopes | Per-agent `read|list|call:<resource>` matching; `*` wildcard per resource (v1 does not wildcard verbs) |
+| Session mode | Per-request stateless by default (`MCP_HTTP_STATELESS=true`); stateful is the single-agent opt-in |
+| Body cap | `Content-Length > MCP_HTTP_MAX_BODY_BYTES` → 413; chunked bodies → 411 unless `MCP_HTTP_ALLOW_UNBOUNDED_BODY=true` |
+| TLS | The app is plain HTTP; production MUST terminate TLS at the reverse proxy (`MCP_HTTP_BEHIND_PROXY=true` is the opt-in acknowledgement) |
+| Default port | `3001` (intentionally distinct from future MCPs on the same host) |
+
+### Quick start (dev/staging, loopback only)
+
+```bash
+# 1. Generate a 32-byte HMAC secret
+export MCP_AGENT_HMAC_SECRET="$(openssl rand -hex 32)"
+
+# 2. Create an agents file
+cat > /tmp/agents.json <<'EOF'
+[
+  { "id": "agent-a", "keyHash": "<hmac-of-token>", "scopes": ["read:*"] }
+]
+EOF
+export MCP_AGENTS_JSON=/tmp/agents.json
+
+# 3. Start the HTTP server (loopback only — no opt-in needed)
+MCP_TRANSPORT=streamableHttp pnpm --filter mcp-readonly-sql start:http
+```
+
+The app binds `127.0.0.1:3001` by default. Hit `/healthz` to confirm it
+is up; the spec scenarios in `openspec/changes/dedicated-mcp-server-deployment/specs/`
+are the canonical contract.
+
+### Production behind a reverse proxy
+
+For production, terminate TLS at the existing reverse proxy and proxy
+plain HTTP to the loopback. The app requires the explicit
+`MCP_HTTP_BEHIND_PROXY=true` opt-in when bound to anything other than
+`127.0.0.1`. The reverse proxy MUST also enforce a body-size cap
+(`client_max_body_size` for nginx or equivalent) — the app returns
+`411 Length Required` for chunked bodies without that opt-in, and the
+opt-in is only safe when the proxy enforces the cap. See
+`deploy/README.md` (PR 3) for the full runbook.
+
+### Rollback
+
+`MCP_TRANSPORT=stdio` (the default) restores the pre-PR2 behavior. The
+shared `packages/mcp-http-base/` package is an opt-in dependency —
+removing it and reverting `src/index.ts` to the previous shape
+restores the prior app in one commit.
+
 ## Tests
 
 ```bash

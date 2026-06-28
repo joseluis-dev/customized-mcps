@@ -8,9 +8,15 @@
     "start": "pnpm --filter mcp-readonly-sql start",
     "inspect": "pnpm --filter mcp-readonly-sql inspect",
     "test:watch": "pnpm --filter mcp-readonly-sql test:watch",
-    "test": "pnpm --filter mcp-readonly-sql test",
-    "build": "pnpm --filter mcp-readonly-sql build",
-    "typecheck": "pnpm --filter mcp-readonly-sql typecheck"
+    "test:apps": "pnpm --filter mcp-readonly-sql test",
+    "test:packages": "pnpm --filter @customized-mcps/mcp-http-base test",
+    "test": "pnpm -r --workspace-concurrency=1 run test",
+    "typecheck:apps": "pnpm --filter mcp-readonly-sql typecheck",
+    "typecheck:packages": "pnpm --filter @customized-mcps/mcp-http-base typecheck",
+    "typecheck": "pnpm -r --workspace-concurrency=1 run typecheck",
+    "build:apps": "pnpm --filter mcp-readonly-sql build",
+    "build:packages": "pnpm --filter @customized-mcps/mcp-http-base build",
+    "build": "pnpm -r --workspace-concurrency=1 run build"
   },
   "engines": {
     "node": ">=20"

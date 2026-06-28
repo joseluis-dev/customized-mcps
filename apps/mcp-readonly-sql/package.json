@@ -13,8 +13,10 @@
   ],
   "scripts": {
     "dev": "tsx src/index.ts",
+    "dev:http": "MCP_TRANSPORT=streamableHttp tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "start": "node dist/index.js",
+    "start:http": "MCP_TRANSPORT=streamableHttp node dist/index.js",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "tsc -p tsconfig.json --noEmit",
@@ -36,6 +38,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@customized-mcps/mcp-http-base": "workspace:*",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "dotenv": "^16.4.7",
     "knex": "^3.1.0",

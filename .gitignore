@@ -9,6 +9,8 @@
 .env.local
 **/.env
 **/.env.local
+**/.agents.local.json
+**/*.local.json
 **/data/*.sqlite*
 **/data/*.sqlite-journal
 **/data/*.sqlite-wal

@@ -104,8 +104,8 @@ describe("monorepo workspace structure", () => {
       expect(existsSync(join(appDir(), ".env.example"))).toBe(true);
     });
 
-    it("app package.json preserves the mcp-readonly-sql name (no @db/ scope)", () => {
-      // Proposal: Package identity — Keep app package name `mcp-readonly-sql` (NO @db/ rename)
+    it("app package.json preserves the mcp-readonly-sql name (no @customized-mcps/ scope)", () => {
+      // Proposal: Package identity — Keep app package name `mcp-readonly-sql` (NO @customized-mcps/ rename)
       const pkg = JSON.parse(readFileSync(join(appDir(), "package.json"), "utf8")) as {
         name: string;
       };

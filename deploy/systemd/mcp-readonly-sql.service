@@ -1,0 +1,83 @@
+[Unit]
+Description=mcp-readonly-sql (read-only MCP server for SQL databases)
+Documentation=https://modelcontextprotocol.io
+After=network-online.target
+Wants=network-online.target
+
+# mcp-readonly-sql is an opt-in HTTP transport of the existing stdio MCP server.
+# The unit reads its env from the app's own .env (the same file the app loads
+# via dotenv at startup), binds 127.0.0.1 by default, and lets the existing
+# reverse proxy handle TLS termination (see deploy/nginx/mcp.conf).
+# The shared @customized-mcps/mcp-http-base installs SIGTERM/SIGINT handlers in start()
+# and drains in-flight requests before exiting; see
+# packages/mcp-http-base/src/shutdown.ts for the drain contract.
+
+[Service]
+Type=simple
+
+# Run as the dedicated unprivileged user. The `mcp` user MUST exist and
+# have no interactive shell:
+#   useradd --system --no-create-home --shell /sbin/nologin mcp
+# The runbook (deploy/README.md) documents the exact bootstrap commands.
+User=mcp
+Group=mcp
+
+# App install path. Override the path here for staged deployments; the
+# app is single-process, so each host runs ONE instance per app per port.
+WorkingDirectory=/opt/mcp/db/apps/mcp-readonly-sql
+
+# Single source of truth for env vars: the app's own .env (the same file
+# dotenv reads at startup). Operators that prefer a separate /etc/mcp/
+# location can adjust this directive; see deploy/README.md → "Configuration:
+# where env vars come from".
+EnvironmentFile=/opt/mcp/db/apps/mcp-readonly-sql/.env
+
+# node is the LTS line installed at /usr/bin/node on standard Debian/Ubuntu
+# hosts. Operators using nvm or a version manager should adjust this to
+# their absolute node path.
+ExecStart=/usr/bin/node dist/index.js
+
+# Restart on failure with a backoff. Successful stops (exit 0) do NOT
+# trigger a restart; only non-zero exits do. RestartSec=5 is the
+# minimum sensible backoff; raise it for noisy environments.
+Restart=on-failure
+RestartSec=5
+
+# Allow up to 15s for the graceful drain to complete
+# (MCP_HTTP_SHUTDOWN_TIMEOUT_MS default 10000 plus a small buffer).
+# After this, systemd force-kills the process.
+TimeoutStopSec=15
+KillMode=mixed
+KillSignal=SIGTERM
+
+# ---- Hardening ----
+# Defense-in-depth on top of the unprivileged user. These directives
+# follow the systemd.service(5) hardening checklist; each one is a
+# well-known footgun mitigator.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The app writes nothing at runtime; if you add file-backed secrets later,
+# narrow ReadWritePaths to the secret directory only.
+ReadWritePaths=/opt/mcp/db/apps/mcp-readonly-sql
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+# stdout/stderr to journal. In HTTP mode the app writes logs to stderr
+# only (stdout is reserved for the transport stream); journalctl is the
+# operator's view. See deploy/README.md → "Read the structured logs".
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-readonly-sql
+
+[Install]
+WantedBy=multi-user.target
