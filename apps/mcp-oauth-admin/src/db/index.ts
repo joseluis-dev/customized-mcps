@@ -7,6 +7,7 @@ export {
   openDatabase,
   defaultDatabasePath,
   withSingleWriter,
+  drainWriterChain,
   SQLITE_BUSY_RETRY_BUDGET,
   type AuthorityDatabase,
   type AuthorityTrx,

@@ -176,20 +176,39 @@ export function openDatabase(options: { path: string }): AuthorityDatabase {
  *
  * The retry only fires on errors whose `.code === "SQLITE_BUSY"`.
  * Any other error short-circuits and bubbles immediately.
+ *
+ * The writer chain is per-DB (stored on the database wrapper).
+ * This matters for tests: a module-level singleton would leak
+ * across test cases (a closed db's pending writes would block
+ * the next test's queue).
  */
-let writerChain: Promise<unknown> = Promise.resolve();
-
 export async function withSingleWriter<T>(
-  db: AuthorityDatabase,
+  db: AuthorityDatabase & { __writerChain?: Promise<unknown> },
   fn: (trx: AuthorityTrx) => Promise<T>,
 ): Promise<T> {
-  // Run the write under a single chain so the whole authority
-  // serializes through one mutex. We rely on sqlite3's
-  // BEGIN/COMMIT semantics for atomicity per call; the chain
-  // is what enforces the spec's "single-writer mutex" wording.
-  const next = writerChain.then(() => runWithBusyRetry(db, fn));
-  writerChain = next.catch(() => undefined);
+  // Lazy-initialize the per-DB chain.
+  const prev = db.__writerChain ?? Promise.resolve();
+  const next = prev.then(() => runWithBusyRetry(db, fn));
+  db.__writerChain = next.catch(() => undefined);
   return next as Promise<T>;
+}
+
+/**
+ * Drain the writer chain for a database. Returns a promise that
+ * resolves when all pending writes (and any errors they
+ * swallowed) have settled. Tests call this in their teardown
+ * so a closed db's pending writes do not block the next test.
+ */
+export async function drainWriterChain(
+  db: AuthorityDatabase & { __writerChain?: Promise<unknown> },
+): Promise<void> {
+  const chain = db.__writerChain;
+  if (!chain) return;
+  try {
+    await chain;
+  } catch {
+    // Swallow — the chain swallows its own errors.
+  }
 }
 
 async function runWithBusyRetry<T>(

@@ -226,6 +226,57 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     expect(verified.payload.sub).toBeDefined();
   });
 
+  it("password grant: returns 400 password_change_required when requireChangeOnFirstLogin=1 (gate W3 remediation)", async () => {
+    // GIVEN a user whose `requireChangeOnFirstLogin` flag
+    //      is set (the bootstrap admin flow / first-login
+    //      rotation case)
+    // WHEN we POST grant_type=password with the user's
+    //      CURRENT password (the spec is clear: the agent
+    //      must NOT be able to bypass rotation by
+    //      presenting a working password at the token
+    //      endpoint)
+    // THEN the response is 400 + { error:
+    //      "password_change_required" } — the agent MUST
+    //      rotate via the admin UI before being allowed
+    //      to mint an access token.
+    const username = "alice-bootstrap";
+    const password = "p4ssw0rd";
+    const passwordHash = await makeArgonHash(password);
+    const clientSecret = "s3cret";
+    const clientHash = await makeArgonHash(clientSecret);
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        // requireChangeOnFirstLogin = 1 → must reject
+        [username, passwordHash, JSON.stringify(["read:bi_catastro"]), 1, 1, Math.floor(Date.now() / 1000)],
+      );
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-a", clientHash, "test", JSON.stringify(["read:bi_catastro"]), Math.floor(Date.now() / 1000)],
+      );
+    });
+
+    const body = new URLSearchParams({
+      grant_type: "password",
+      username,
+      password, // the password is correct — the flag is what trips
+      client_id: "client-a",
+      client_secret: clientSecret,
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+
+    // THEN the response is 400 + password_change_required
+    expect(res.status).toBe(400);
+    const json = (await res.json()) as { error: string };
+    expect(json.error).toBe("password_change_required");
+    // No access_token is returned.
+    expect((json as Record<string, unknown>).access_token).toBeUndefined();
+  });
+
   it("password grant: returns 400 invalid_grant on wrong password", async () => {
     // GIVEN a user with hash(password) + a registered client
     // WHEN we POST with the wrong password

@@ -37,11 +37,11 @@ Chain strategy: stacked-to-main
 - [x] 2.6 Wire `apps/mcp-readonly-sql/src/config/http.ts` to use `OAuthAdminAuthority` when `MCP_AUTHORITY_URL` set.
 
 ## Phase 3: Admin UI (PR 2)
-- [ ] 3.1 Test session: signed cookie, 32-byte secret, CSRF double-submit 403; implement + rotation.
-- [ ] 3.2 Test per-username backoff 5 fails/10m -> 429; not on `/oauth/token`; implement.
-- [ ] 3.3 Test agent CRUD: one-time plaintext, `argon2id`, `requireChangeOnFirstLogin`; bootstrap refuses mint; WARN; implement.
-- [ ] 3.4 Test client CRUD + scope catalog (refuse delete when assigned); revocation + audit row; implement.
-- [ ] 3.5 Test audit viewer paginate, filter, redact; 91d row swept; implement + refactor templates.
+- [x] 3.1 Test session: signed cookie, 32-byte secret, CSRF double-submit 403; implement + rotation.
+- [x] 3.2 Test per-username backoff 5 fails/10m -> 429; not on `/oauth/token`; implement.
+- [x] 3.3 Test agent CRUD: one-time plaintext, `argon2id`, `requireChangeOnFirstLogin`; bootstrap refuses mint; WARN; implement.
+- [x] 3.4 Test client CRUD + scope catalog (refuse delete when assigned); revocation + audit row; implement.
+- [x] 3.5 Test audit viewer paginate, filter, redact; 91d row swept; implement + refactor templates.
 
 ## Phase 4: Migrate readonly-sql (PR 3)
 - [ ] 4.1 Test: `MCP_AUTHORITY_URL` set, verified JWT scopes authorize only; missing scope denies.

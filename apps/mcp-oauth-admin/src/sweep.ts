@@ -136,6 +136,7 @@ export function startSweepLoop(options: {
   db: AuthorityDatabase;
   intervalSeconds?: number;
   disabled?: boolean;
+  onError?: (err: Error) => void;
 }): SweepScheduler {
   const intervalMs = (options.intervalSeconds ?? 24 * 60 * 60) * 1000;
   let inFlight: Promise<unknown> = Promise.resolve();
@@ -158,7 +159,16 @@ export function startSweepLoop(options: {
   }
   const fire = (): void => {
     if (!state.running) return;
-    inFlight = runRetentionSweep({ db: options.db }).catch(() => undefined);
+    inFlight = runRetentionSweep({ db: options.db }).catch((e: unknown) => {
+      const err = e instanceof Error ? e : new Error(String(e));
+      if (options.onError) {
+        options.onError(err);
+      } else {
+        process.stderr.write(
+          `[mcp-oauth-admin] sweep loop error: ${err.message}\n`,
+        );
+      }
+    });
     if (state.running) {
       timer = setTimeout(fire, intervalMs);
     }
