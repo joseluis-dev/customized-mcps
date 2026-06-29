@@ -15,7 +15,7 @@
  * response shape.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
 import { createHmac } from "node:crypto";
@@ -27,6 +27,12 @@ import {
   type McpServerFactory,
 } from "../src/server.js";
 import { createLogger } from "../src/logging.js";
+import {
+  TokenInvalidError,
+  AuthorityUnavailableError,
+  type TokenAuthority,
+  type VerifiedToken,
+} from "../src/authority/index.js";
 
 const SECRET = "super-secret-test-key-32-bytes!!";
 
@@ -604,6 +610,242 @@ describe("createHttpMcpServer — end-to-end contract (real McpServer)", () => {
       expect(seen.length).toBeGreaterThan(0);
       expect(seen[0]?.clientId).toBe("agent-a");
       expect(seen[0]?.scopes).toEqual(["read:*"]);
+    });
+  });
+
+  describe("TokenAuthority middleware wiring (Phase 1a)", () => {
+    // Phase 1a replaces the middleware's direct `validateBearer(...)` call
+    // with `await authority.verify(token)`. The middleware MUST still
+    // produce the same 401 / 503 / 200 mapping — only the verification
+    // surface has changed. These tests use a hand-rolled `TokenAuthority`
+    // implementation (a spy) to assert the contract end-to-end.
+    it("the middleware calls authority.verify with the bearer token", async () => {
+      // GIVEN a TokenAuthority spy AND a tool that echoes back the
+      // auth context the SDK observed via `MessageExtraInfo.authInfo`
+      // (so we can assert the resolved identity flowed through the
+      // middleware into the transport).
+      const verifySpy = vi.fn(
+        async (token: string): Promise<VerifiedToken> => {
+          if (token === "good-token") {
+            return { agentId: "spy-agent", scopes: ["read:spy"] };
+          }
+          throw new TokenInvalidError("bad token");
+        },
+      );
+      const authority: TokenAuthority = { verify: verifySpy };
+      const server = new McpServer(
+        { name: "auth-spy", version: "0.0.0" },
+        { capabilities: { tools: {} } },
+      );
+      server.tool(
+        "whoami",
+        "Returns the authenticated agent's id and scopes",
+        {},
+        async (_args, extra) => {
+          const info = (extra as unknown as { authInfo?: { clientId?: string; scopes?: string[] } }).authInfo;
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  clientId: info?.clientId,
+                  scopes: info?.scopes,
+                }),
+              },
+            ],
+          };
+        },
+      );
+      const { handle, port } = await startServer(
+        makeOptions({
+          authority,
+          sessionMode: "stateless",
+          serverFactory: (() => server) as McpServerFactory,
+        }),
+      );
+      stopHandle = handle;
+      // Step 1: initialize so the SDK has a session to dispatch the
+      // tool call through.
+      const init = await postRequest(
+        port,
+        "/mcp",
+        {
+          Authorization: "Bearer good-token",
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "auth-spy", version: "0.0.0" },
+          },
+        }),
+      );
+      expect(init.status).toBe(200);
+      // The middleware MUST have called verify with the trimmed token
+      // (the "Bearer " prefix must not be passed to the authority).
+      expect(verifySpy).toHaveBeenCalled();
+      const callArg = verifySpy.mock.calls[0]?.[0];
+      expect(callArg).toBe("good-token");
+      // Step 2: invoke the echo tool. The resolved agent id flows
+      // through the middleware into req.auth, which the SDK surfaces
+      // as MessageExtraInfo.authInfo — the tool echoes it back so we
+      // can assert the wire end-to-end.
+      const call = await postRequest(
+        port,
+        "/mcp",
+        {
+          Authorization: "Bearer good-token",
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 2,
+          method: "tools/call",
+          params: { name: "whoami", arguments: {} },
+        }),
+      );
+      expect(call.status).toBe(200);
+      expect(parseSsePayload(call.body)).toContain("spy-agent");
+    });
+
+    it("maps TokenInvalidError to 401 with a sanitized JSON-RPC body (no token, no agent id)", async () => {
+      // GIVEN an authority that throws TokenInvalidError
+      // WHEN a request arrives with a bearer
+      // THEN the middleware maps the error to 401 with the same
+      //      audit-safe envelope used by the v1 path. The token and
+      //      the resolved agent id MUST NOT appear in the body.
+      const authority: TokenAuthority = {
+        verify: async () => {
+          throw new TokenInvalidError("upstream says no");
+        },
+      };
+      const { handle, port } = await startServer(makeOptions({ authority }));
+      stopHandle = handle;
+      const res = await postRequest(
+        port,
+        "/mcp",
+        {
+          Authorization: "Bearer some-bogus-token-12345",
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "x", version: "0" },
+          },
+        }),
+      );
+      expect(res.status).toBe(401);
+      const parsed = JSON.parse(res.body) as { error?: { message?: string } };
+      expect(parsed.error?.message).toBe("unauthorized");
+      // The supplied token MUST NOT appear in the body.
+      expect(res.body).not.toContain("some-bogus-token-12345");
+      // The internal "upstream says no" message MUST NOT appear.
+      expect(res.body).not.toContain("upstream says no");
+    });
+
+    it("maps AuthorityUnavailableError to 503 with a sanitized JSON-RPC body", async () => {
+      // GIVEN an authority that throws AuthorityUnavailableError
+      //      (simulating a JWKS fetch failure or an unreachable
+      //      authority in production)
+      // WHEN a request arrives with a bearer
+      // THEN the middleware maps the error to 503 — the audit-safe
+      //      fail-closed posture: the resource server refuses the
+      //      request rather than granting implicit access.
+      const authority: TokenAuthority = {
+        verify: async () => {
+          throw new AuthorityUnavailableError("JWKS fetch failed");
+        },
+      };
+      const { handle, port } = await startServer(makeOptions({ authority }));
+      stopHandle = handle;
+      const res = await postRequest(
+        port,
+        "/mcp",
+        {
+          Authorization: "Bearer any-token",
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "x", version: "0" },
+          },
+        }),
+      );
+      expect(res.status).toBe(503);
+      const parsed = JSON.parse(res.body) as { error?: { message?: string } };
+      // 503 body MUST be a sanitized service-unavailable error. The
+      // exact message in the body is the closed `unavailable` envelope
+      // (per the existing `serviceUnavailableError` factory), NOT
+      // "JWKS fetch failed" — internal error context MUST NOT leak.
+      expect(parsed.error?.message).not.toBe("JWKS fetch failed");
+      // The body MUST contain a JSON-RPC error envelope.
+      expect(parsed.error?.message).toBeTruthy();
+      // The 503 envelope is a service-unavailable-style message (it
+      // was already used for the shutting-down path in v1; the
+      // resource-server-on-unreachable-authority case reuses the
+      // same audit-safe shape).
+      expect(["shutting-down", "unavailable", "service-unavailable"]).toContain(
+        parsed.error?.message,
+      );
+    });
+
+    it("an authority that throws a non-typed Error is treated as 503 (fail-closed default)", async () => {
+      // GIVEN an authority that throws a plain Error (not a typed
+      //      TokenInvalidError or AuthorityUnavailableError) — e.g. a
+      //      programming bug, a misconfigured JWKS path, or an
+      //      unexpected runtime failure inside the authority itself
+      // WHEN a request arrives
+      // THEN the middleware fails closed (503) rather than 500: the
+      //      audit-safe posture is "if we cannot verify, we do not
+      //      serve", and the client sees a service-unavailable
+      //      response instead of a stack trace.
+      const authority: TokenAuthority = {
+        verify: async () => {
+          throw new Error("something exploded inside the authority");
+        },
+      };
+      const { handle, port } = await startServer(makeOptions({ authority }));
+      stopHandle = handle;
+      const res = await postRequest(
+        port,
+        "/mcp",
+        {
+          Authorization: "Bearer whatever",
+          "Content-Type": "application/json",
+          Accept: "application/json, text/event-stream",
+        },
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "x", version: "0" },
+          },
+        }),
+      );
+      expect(res.status).toBe(503);
+      // The internal error message MUST NOT leak.
+      expect(res.body).not.toContain("something exploded");
     });
   });
 });
