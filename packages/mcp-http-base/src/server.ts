@@ -31,7 +31,14 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { validateBearer, type AgentRecord } from "./auth.js";
+import { type AgentRecord } from "./auth.js";
+import {
+  AuthorityUnavailableError,
+  LocalRosterAuthority,
+  TokenInvalidError,
+  type TokenAuthority,
+  type VerifiedToken,
+} from "./authority/index.js";
 import {
   sendJsonError,
   unauthorizedError,
@@ -50,8 +57,47 @@ export type HttpMcpServerOptions = {
   host: string;
   port: number;
   path: string;
-  agents: readonly AgentRecord[];
-  hmacSecret: string;
+  /**
+   * The `TokenAuthority` the middleware delegates to. Phase 1a of
+   * `external-token-authority-verification` introduces this as the
+   * single source of truth for token verification. If `authority`
+   * is provided, `agents` and `hmacSecret` are ignored — the
+   * middleware calls `authority.verify(token)` directly.
+   *
+   * If `authority` is NOT provided, the shared base builds a
+   * `LocalRosterAuthority` from `agents` + `hmacSecret` so the
+   * pre-Phase-1a caller pattern (existing v1 tests, the
+   * `mcp-readonly-sql` app's HTTP config loader) keeps working
+   * unchanged. New callers SHOULD pass `authority` directly so the
+   * app-side glue does not have to reach into the shared base's
+   * `LocalRosterAuthority` shape.
+   *
+   * The middleware MUST NOT call `validateBearer` directly; the
+   * `LocalRosterAuthority` is the implementation detail that
+   * wraps the HMAC compare. This contract is what
+   * `mcp-agent-authorization` and `mcp-token-authority` assert
+   * for the `external-token-authority-verification` change.
+   */
+  authority?: TokenAuthority;
+  /**
+   * @deprecated Prefer `authority`. Kept so the v1 caller pattern
+   * (existing app code, existing tests) keeps compiling and
+   * running. The shared base builds a `LocalRosterAuthority` from
+   * these two fields when `authority` is absent. Production
+   * callers SHOULD migrate to `authority` so the wire contract
+   * matches the resource-server-side `mcp-token-authority` spec.
+   * `readonly` because the constructor copies them into a
+   * `LocalRosterAuthority`; mutating the array after construction
+   * is not supported.
+   */
+  agents?: readonly AgentRecord[];
+  /**
+   * @deprecated Prefer `authority`. The shared HMAC secret for
+   * the local backend. Used only when `authority` is absent;
+   * ignored when `authority` is provided. Minimum 32 bytes of
+   * entropy (enforced by `LocalRosterAuthority`'s constructor).
+   */
+  hmacSecret?: string;
   sessionMode: SessionMode;
   logger: Logger;
   shutdownTimeoutMs: number;
@@ -104,6 +150,44 @@ const STATUS_PAYLOAD_TOO_LARGE = 413;
 /** HTTP status returned for an invalid Content-Length. 400 Bad Request. */
 const STATUS_BAD_REQUEST = 400;
 
+/**
+ * Resolve the `TokenAuthority` the middleware delegates to.
+ *
+ * Phase 1a adds `authority` to `HttpMcpServerOptions` as the
+ * preferred wire contract. The legacy `agents` + `hmacSecret`
+ * fields are still accepted for back-compat (existing v1 tests
+ * and the `mcp-readonly-sql` app's HTTP config loader) — they
+ * are wrapped in a `LocalRosterAuthority` internally so the
+ * middleware calls `authority.verify(token)` either way.
+ *
+ * The function throws if neither pattern is provided (fail
+ * closed: the shared base MUST NOT start without a verification
+ * backend) or if the legacy pattern is partially provided
+ * (either `agents` or `hmacSecret` without the other).
+ */
+function resolveAuthority(options: HttpMcpServerOptions): TokenAuthority {
+  if (options.authority) return options.authority;
+  if (options.agents && options.hmacSecret) {
+    return new LocalRosterAuthority({
+      agents: [...options.agents],
+      hmacSecret: options.hmacSecret,
+      logger: options.logger,
+    });
+  }
+  // Neither pattern is fully configured. This is a programming
+  // error in the caller: the v1 contract required
+  // `agents` + `hmacSecret`; Phase 1a's new contract requires
+  // `authority`. Refusing to start is the safe default — the
+  // alternative (an implicit permissive default) would be a
+  // silent misconfiguration leak. The error message names both
+  // options so the operator can fix it.
+  throw new Error(
+    "createHttpMcpServer: either `authority` (TokenAuthority) or `agents` + `hmacSecret` " +
+      "(local backend inputs) must be provided. See " +
+      "@customized-mcps/mcp-http-base `HttpMcpServerOptions` for the contract.",
+  );
+}
+
 export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServerHandle {
   let server: Server | undefined;
   let statefulTransport: StreamableHTTPServerTransport | undefined;
@@ -121,6 +205,13 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
   let unhealthy = false;
   const maxBodyBytes = options.maxBodyBytes ?? 1024 * 1024; // 1 MiB
   const allowUnboundedBody = options.allowUnboundedBody ?? false;
+  // Phase 1a: resolve the `TokenAuthority` once at construction time.
+  // If the caller passed `authority` directly, use it. Otherwise build
+  // a `LocalRosterAuthority` from the legacy `agents` + `hmacSecret`
+  // fields so the v1 caller pattern keeps working. Exactly one of the
+  // two paths is exercised per server; this matches the
+  // resource-server-side contract in `mcp-token-authority`.
+  const authority: TokenAuthority = resolveAuthority(options);
   // One-shot warning so operators see exactly one log line the first
   // time a chunked request (no Content-Length) reaches the shared base
   // when `allowUnboundedBody` is true. The operator should confirm a
@@ -399,12 +490,48 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
       return;
     }
     const token = authHeader.slice("Bearer ".length).trim();
-    const result = validateBearer(token, options.hmacSecret, options.agents);
-    if (!result.ok) {
-      respond(unauthorizedError());
+    // Phase 1a: the middleware delegates to the resolved
+    // `TokenAuthority`. The typed errors thrown by `verify` map to
+    // 401 (`TokenInvalidError`) or 503 (`AuthorityUnavailableError`)
+    // via the catch block below. The middleware MUST NOT call
+    // `validateBearer` directly — that path is now an implementation
+    // detail of `LocalRosterAuthority` per the
+    // `external-token-authority-verification` change.
+    let verified: VerifiedToken;
+    try {
+      verified = await authority.verify(token);
+    } catch (err) {
+      // 401 on `TokenInvalidError` (the expected "unknown / expired
+      // / malformed token" path). 503 on
+      // `AuthorityUnavailableError` (the JWKS fetch failed, the
+      // authority is unreachable, etc.). Any other thrown error is
+      // treated as 503 too — the audit-safe posture is "if we
+      // cannot verify, we do not serve" and the client sees a
+      // service-unavailable response rather than a stack trace.
+      if (err instanceof TokenInvalidError) {
+        respond(unauthorizedError());
+        return;
+      }
+      // Authority unavailable (typed) or any other failure (e.g. a
+      // programming bug inside the authority implementation) →
+      // fail closed with 503. The error message is redacted by
+      // `sendJsonError`'s envelope factory (the body is fixed); we
+      // also log a sanitized operator-visible line.
+      const reason =
+        err instanceof AuthorityUnavailableError
+          ? "authority unavailable"
+          : err instanceof Error
+            ? err.message
+            : String(err);
+      markUnhealthy(reason);
+      options.logger.error(
+        `token verify failed; returning 503: ${redactSensitive(reason)}`,
+        {},
+      );
+      respond(serviceUnavailableError());
       return;
     }
-    const agentId = result.agent.id;
+    const agentId = verified.agentId;
 
     // Enforce a hard body-size limit BEFORE the SDK transport reads
     // anything from the request stream. The transport would otherwise
@@ -451,8 +578,8 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
       // Attach auth context so the SDK forwards the agent identity into
       // `MessageExtraInfo` (used by the app to enforce per-call scope checks).
       (req as { auth?: { clientId: string; scopes: string[] } }).auth = {
-        clientId: result.agent.id,
-        scopes: result.agent.scopes,
+        clientId: verified.agentId,
+        scopes: verified.scopes,
       };
 
       await activeTransport.handleRequest(req, res);

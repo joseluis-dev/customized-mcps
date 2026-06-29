@@ -39,6 +39,23 @@ export {
   type Scope,
 } from "./auth.js";
 
+/**
+ * Phase 1a of `external-token-authority-verification` introduces the
+ * `TokenAuthority` interface and the `LocalRosterAuthority`
+ * implementation. `JwksAuthority` (Phase 1b) will be added to the
+ * same module. The middleware in `server.ts` calls
+ * `authority.verify(token)`; apps configure the backend in
+ * `config/http.ts` and pass the result into `createHttpMcpServer`.
+ */
+export {
+  LocalRosterAuthority,
+  AuthorityUnavailableError,
+  TokenInvalidError,
+  type LocalRosterAuthorityOptions,
+  type TokenAuthority,
+  type VerifiedToken,
+} from "./authority/index.js";
+
 export {
   createLogger,
   redactSensitive,
