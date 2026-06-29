@@ -3,30 +3,30 @@
  * verification.
  *
  * The shared base (`@customized-mcps/mcp-http-base`) is the single source of
- * truth for this contract. Two implementations live in this package:
+ * truth for this contract. Two production-shaped implementations live in
+ * this package:
  *
- * - `LocalRosterAuthority` (dev/offline fallback) — wraps the v1
- *   `loadAgents` + `validateBearer` HMAC path. The local backend is the
- *   unset-env default; the recommended default for production and
- *   shared deployments is the JWKS-backed authority (Phase 1b).
  * - `JwksAuthority` (Phase 1b) — verifies RS256/ES256 JWTs against
  *   the authority's JWKS, with 60s cache, `kid`-miss refetch, and
  *   fail-closed 503 on authority unreachable.
+ * - `OAuthAdminAuthority` (PR 1 of oauth-sqlite-admin-authorization) —
+ *   extends `JwksAuthority` with a startup probe against
+ *   `/oauth/introspect` so a misconfigured authority URL fails fast.
  *
  * Every `verify` implementation MUST:
- * - return `{ agentId, scopes }` on success (all scopes match
- *   `SCOPE_PATTERN`; `LocalRosterAuthority` filters out invalid
- *   entries as a defense-in-depth step).
+ * - return `{ agentId, scopes }` on success. The `scopes` array is
+ *   filtered against `SCOPE_PATTERN`; entries that do not match are
+ *   dropped.
  * - throw `TokenInvalidError` for malformed, expired, revoked, or
  *   unknown tokens. The middleware maps this to `401`.
  * - throw `AuthorityUnavailableError` for fetch / network / timeout
  *   failures. The middleware maps this to `503`.
  *
  * Implementations MUST NOT include the supplied token, the resolved
- * agentId, the keyHash, the `kid`, the authority URL, or the JWKS
- * URL in any thrown error message. The middleware's `sanitizeError`
- * path strips whatever leaks, but the authority itself is the
- * primary defense.
+ * agentId, the `kid`, the authority URL, or the JWKS URL in any
+ * thrown error message. The middleware's `sanitizeError` path
+ * strips whatever leaks, but the authority itself is the primary
+ * defense.
  *
  * Lifecycle:
  * - `verify` is the only required method.
@@ -39,15 +39,14 @@
  */
 
 import type { Logger } from "../logging.js";
-import type { AgentRecord } from "../auth.js";
 
 /**
  * A verified agent identity, as returned by `TokenAuthority.verify`.
  *
  * The shape is intentionally narrow: `agentId` is the stable id
- * (local roster's `id` field, or the JWT `sub` claim on the JWKS
- * backend) and `scopes` is the granted set, already filtered
- * against `SCOPE_PATTERN`.
+ * (the JWT `sub` claim on the JWKS / OAuth admin backend) and
+ * `scopes` is the granted set, already filtered against
+ * `SCOPE_PATTERN`.
  */
 export type VerifiedToken = {
   agentId: string;
@@ -57,12 +56,10 @@ export type VerifiedToken = {
 /**
  * Optional per-request context passed to `TokenAuthority.verify`.
  *
- * Phase 1b's `JwksAuthority` uses this to attach the X-Request-Id
- * (sanitized by the shared base's `sanitizeRequestId`) to the
- * second-miss WARN log line, so an operator can correlate a
- * kid-miss WARN with the request that triggered it. The
- * `LocalRosterAuthority` ignores the context (the local backend
- * has no per-request WARN scenario). Future backends (e.g.
+ * `JwksAuthority` uses this to attach the X-Request-Id (sanitized by
+ * the shared base's `sanitizeRequestId`) to the second-miss WARN log
+ * line, so an operator can correlate a kid-miss WARN with the
+ * request that triggered it. Future backends (e.g. an
  * `IntrospectionAuthority`) may use additional fields.
  *
  * The field is intentionally narrow: only the values the spec
@@ -116,17 +113,6 @@ export class AuthorityUnavailableError extends Error {
     this.name = "AuthorityUnavailableError";
   }
 }
-
-/**
- * Constructor options for `LocalRosterAuthority`. Re-exported as
- * `LocalRosterAuthorityOptions` so callers do not have to import
- * the internal field shape.
- */
-export type LocalRosterAuthorityOptions = {
-  agents: AgentRecord[];
-  hmacSecret: string;
-  logger: Logger;
-};
 
 /**
  * Re-export `Logger` here so callers can import the full authority

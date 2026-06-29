@@ -8,8 +8,10 @@
  * Canonical types:
  * - `LogFormat` is defined in `./config.ts` and re-exported by `./logging.ts`
  *   so the public surface has a single source of truth.
- * - `AgentRecord` is defined in `./auth.ts` and used by `./server.ts` so
- *   the public surface has a single source of truth.
+ * - `Scope` / `SCOPE_PATTERN` / `isValidScope` / `matchScope` are defined
+ *   in `./auth.ts` and consumed by the authority implementations
+ *   (`./authority/jwks.ts` and the OAuth admin apps) so the public
+ *   surface has a single source of truth on the scope grammar.
  *
  * Application error codes (named JSON-RPC -3200x) live on `JSON_RPC_ERROR_CODES`
  * in `./errors.ts` so the envelope factories and any consumer code share
@@ -25,36 +27,27 @@ export {
 } from "./config.js";
 
 export {
-  loadAgents,
-  validateBearer,
-  constantTimeEqualString,
   matchScope,
-  isValidKeyHash,
   isValidScope,
-  KEY_HASH_PATTERN,
   SCOPE_PATTERN,
-  type AgentRecord,
-  type AuthorizedAgent,
-  type ValidateBearerResult,
   type Scope,
 } from "./auth.js";
 
 /**
  * Phase 1a of `external-token-authority-verification` introduces the
- * `TokenAuthority` interface and the `LocalRosterAuthority`
- * implementation. `JwksAuthority` (Phase 1b) will be added to the
- * same module. The middleware in `server.ts` calls
- * `authority.verify(token)`; apps configure the backend in
- * `config/http.ts` and pass the result into `createHttpMcpServer`.
+ * `TokenAuthority` interface. The shared base ships the production
+ * backends: `JwksAuthority` (Phase 1b) and `OAuthAdminAuthority`
+ * (PR 1 of `oauth-sqlite-admin-authorization`). The local HMAC
+ * roster backend was removed when the OAuth admin authority became
+ * the only token-verify surface; the resource server is now required
+ * to wire `MCP_AUTHORITY_URL` against an external authority.
  */
 export {
-  LocalRosterAuthority,
   JwksAuthority,
   OAuthAdminAuthority,
   AuthorityUnavailableError,
   TokenInvalidError,
   type JwksAuthorityOptions,
-  type LocalRosterAuthorityOptions,
   type OAuthAdminAuthorityOptions,
   type TokenAuthority,
   type VerifiedToken,

@@ -165,7 +165,7 @@ async function runHttpServer(): Promise<void> {
   await transport.start();
   log(
     `HTTP server listening on ${transport.url} ` +
-      `(sessionMode=${config.sessionMode}, agents=${config.agents.length})`,
+      `(sessionMode=${config.sessionMode}, authorityBackend=${config.authorityBackend})`,
   );
 
   // 5. The shared base installs its own SIGTERM/SIGINT handlers during

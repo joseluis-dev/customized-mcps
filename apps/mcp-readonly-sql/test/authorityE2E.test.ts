@@ -357,14 +357,11 @@ async function startResourceServer(env: Record<string, string>): Promise<Started
     DB_SQLITE_DEMO_ALLOWED_DATABASES: "main",
     ...env,
   };
-  // Explicitly clear the local-roster env vars so
-  // the resource server picks the OAuth admin
-  // backend (not the local HMAC roster). The
-  // shared config layer treats an empty string as
-  // "unset" (see `nonEmpty` in
-  // packages/mcp-http-base/src/config.ts).
-  fullEnv.MCP_AGENTS_JSON = "";
-  fullEnv.MCP_AGENTS_INLINE = "";
+  // The local HMAC roster was removed; the resource
+  // server only accepts the OAuth admin backend, so
+  // no local-roster env vars need to be cleared here.
+  // (MCP_AGENTS_JSON / MCP_AGENTS_INLINE no longer exist
+  // in the shared config layer.)
 
   const proc = spawn(process.execPath, [distIndex], {
     env: fullEnv,

@@ -47,6 +47,22 @@ import { createLogger } from "@customized-mcps/mcp-http-base";
  * The HTTP transport config — host, port, path, etc.
  * Read from the env on the production path; the test
  * path passes a `HttpConfigInput` directly.
+ *
+ * Note: the `MCP_AUTHORITY_*` env vars (URL, JWKS URL, audience,
+ * cache TTL, leeway, fetch timeout) are intentionally forwarded
+ * as `undefined` rather than read from `process.env`. The
+ * `mcp-oauth-admin` app is the authority, not a resource-server
+ * client of one — those vars are verifier-side configuration and
+ * have no meaning on the issuer side. Reading them from the env
+ * would let an operator set `MCP_AUTHORITY_URL` on the authority
+ * host and trigger a fail-closed startup error in the shared
+ * `parseHttpConfig` audience check (the audience-required rule
+ * only fires when the URL is set, but the audience is irrelevant
+ * for an issuer). The `HttpConfigInput` type requires every key,
+ * so we list them explicitly with `undefined` values: the type
+ * is satisfied, the values are guaranteed to be `undefined`, and
+ * a future maintainer who copies one of these lines sees the
+ * "intentionally undefined" comment in context.
  */
 function readHttpConfig(): ReturnType<typeof parseHttpConfig> {
   return parseHttpConfig({
@@ -57,18 +73,16 @@ function readHttpConfig(): ReturnType<typeof parseHttpConfig> {
     MCP_HTTP_STATELESS: process.env.MCP_HTTP_STATELESS,
     MCP_HTTP_SHUTDOWN_TIMEOUT_MS: process.env.MCP_HTTP_SHUTDOWN_TIMEOUT_MS,
     MCP_LOG_FORMAT: process.env.MCP_LOG_FORMAT,
-    MCP_AGENT_HMAC_SECRET: process.env.MCP_AGENT_HMAC_SECRET,
-    MCP_AGENTS_JSON: process.env.MCP_AGENTS_JSON,
-    MCP_AGENTS_INLINE: process.env.MCP_AGENTS_INLINE,
     MCP_HTTP_BEHIND_PROXY: process.env.MCP_HTTP_BEHIND_PROXY,
     MCP_HTTP_ALLOW_INSECURE_BIND: process.env.MCP_HTTP_ALLOW_INSECURE_BIND,
     MCP_HTTP_ALLOW_INSECURE_LOOPBACK: process.env.MCP_HTTP_ALLOW_INSECURE_LOOPBACK,
-    MCP_AUTHORITY_URL: process.env.MCP_AUTHORITY_URL,
-    MCP_AUTHORITY_JWKS_URL: process.env.MCP_AUTHORITY_JWKS_URL,
-    MCP_AUTHORITY_AUDIENCE: process.env.MCP_AUTHORITY_AUDIENCE,
-    MCP_AUTHORITY_JWKS_TTL_S: process.env.MCP_AUTHORITY_JWKS_TTL_S,
-    MCP_AUTHORITY_LEEWAY_S: process.env.MCP_AUTHORITY_LEEWAY_S,
-    MCP_AUTHORITY_FETCH_TIMEOUT_MS: process.env.MCP_AUTHORITY_FETCH_TIMEOUT_MS,
+    // Verifier-side env vars; the authority does not use them.
+    MCP_AUTHORITY_URL: undefined,
+    MCP_AUTHORITY_JWKS_URL: undefined,
+    MCP_AUTHORITY_AUDIENCE: undefined,
+    MCP_AUTHORITY_JWKS_TTL_S: undefined,
+    MCP_AUTHORITY_LEEWAY_S: undefined,
+    MCP_AUTHORITY_FETCH_TIMEOUT_MS: undefined,
   });
 }
 

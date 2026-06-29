@@ -9,8 +9,13 @@
  * In HTTP mode, log lines are written to stderr ONLY. stdout is reserved
  * for the transport stream and MUST NOT contain any diagnostic output.
  *
- * Sensitive fragments (bearer tokens, keyHash values, HMAC secret values)
- * are redacted from every log line regardless of format.
+ * Sensitive fragments (bearer tokens, 64-character hex strings shaped
+ * like the legacy `keyHash` field) are redacted from every log line
+ * regardless of format. The local HMAC backend was retired; no code
+ * path on the resource server reads an HMAC secret at runtime, but
+ * the 64-hex redaction stays in place to catch any operator-supplied
+ * 64-character hex value that may appear in a log line (e.g. a
+ * diagnostic dump from a downstream tool).
  */
 
 import type { LogFormat } from "./config.js";
@@ -61,16 +66,12 @@ export function redactSensitive(message: string): string {
   // The token is whatever non-whitespace sequence follows the keyword.
   out = out.replace(/Bearer\s+[^\s,;"'`]+/gi, "Bearer [REDACTED]");
 
-  // Hex-shaped 64-char keyHash values (the SHA-256 of the agent token).
-  // Use a negative lookahead so we don't break on a longer run of hex
-  // characters that happens to contain a 64-char substring.
+  // 64-character hex strings (the shape of the retired
+  // `keyHash` field on the local-roster agent record, and the
+  // shape of any SHA-256 digest an operator might log). The
+  // negative lookahead keeps a longer run of hex characters
+  // that happens to contain a 64-char substring intact.
   out = out.replace(/[a-fA-F0-9]{64}(?![a-fA-F0-9])/g, "[REDACTED]");
-
-  // MCP_AGENT_HMAC_SECRET values: "name: value" pairs.
-  out = out.replace(
-    /(MCP_AGENT_HMAC_SECRET\s*[:=]\s*)([^\s,;]+)/gi,
-    "$1[REDACTED]",
-  );
 
   return out;
 }

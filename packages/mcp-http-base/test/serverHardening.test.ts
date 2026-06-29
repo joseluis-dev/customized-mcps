@@ -19,28 +19,28 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { createHmac } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import {
   createHttpMcpServer,
   type HttpMcpServerOptions,
-  type AgentRecord,
   type McpServerFactory,
 } from "../src/server.js";
 import { createLogger } from "../src/logging.js";
+import { TokenInvalidError, type TokenAuthority, type VerifiedToken } from "../src/authority/index.js";
 
-const SECRET = "super-secret-test-key-32-bytes!!";
-
-function hmacOf(token: string): string {
-  return createHmac("sha256", SECRET).update(token).digest("hex");
-}
-
-function makeAgent(overrides: Partial<AgentRecord> = {}): AgentRecord {
+/**
+ * The hardening tests use a hand-rolled `TokenAuthority` that maps a
+ * single known token to a fixed verified identity. The local HMAC
+ * roster was removed; the unit tests no longer exercise that backend.
+ */
+function knownAgentAuthority(): TokenAuthority {
   return {
-    id: "agent-a",
-    keyHash: hmacOf("tok-a"),
-    scopes: ["read:*"],
-    ...overrides,
+    verify: async (token: string): Promise<VerifiedToken> => {
+      if (token === "tok-a") {
+        return { agentId: "agent-a", scopes: ["read:*"] };
+      }
+      throw new TokenInvalidError("not a known token");
+    },
   };
 }
 
@@ -51,8 +51,7 @@ function makeOptions(
     host: "127.0.0.1",
     port: 0,
     path: "/mcp",
-    agents: [makeAgent()],
-    hmacSecret: SECRET,
+    authority: knownAgentAuthority(),
     sessionMode: "stateful",
     logger: createLogger({ format: "text" }),
     shutdownTimeoutMs: 1000,
@@ -162,7 +161,7 @@ describe("createHttpMcpServer — PR1 remediation", () => {
       expect(res.status).toBe(503);
       const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
       expect(body.status).toBe("shutting-down");
-      expect(body.authorityBackend).toBe("local");
+      expect(body.authorityBackend).toBe("oauth");
     });
 
     it("actually emits SIGTERM through the wired handler and marks the controller shutting-down", async () => {
@@ -508,7 +507,7 @@ describe("createHttpMcpServer — PR1 remediation", () => {
       expect(res.status).toBe(503);
       const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
       expect(body.status).toBe("unhealthy");
-      expect(body.authorityBackend).toBe("local");
+      expect(body.authorityBackend).toBe("oauth");
     });
 
     it("clears the unhealthy flag and returns /healthz to 200 after a subsequent successful request", async () => {
@@ -583,7 +582,7 @@ describe("createHttpMcpServer — PR1 remediation", () => {
       // `authorityBackend` field (per the mcp-token-authority spec).
       const healthyBody = JSON.parse(healthyRes.body) as { status?: string; authorityBackend?: string };
       expect(healthyBody.status).toBe("ok");
-      expect(healthyBody.authorityBackend).toBe("local");
+      expect(healthyBody.authorityBackend).toBe("oauth");
     });
 
     it("closes the half-built McpServer and transport on a failed factory (no leak)", async () => {

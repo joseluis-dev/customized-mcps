@@ -25,12 +25,6 @@ describe("redactSensitive", () => {
     expect(out).toContain("[REDACTED]");
   });
 
-  it("redacts an HMAC secret value passed by name", () => {
-    const out = redactSensitive("MCP_AGENT_HMAC_SECRET: super-secret-value");
-    expect(out).not.toContain("super-secret-value");
-    expect(out).toContain("[REDACTED]");
-  });
-
   it("does not redact arbitrary non-sensitive text", () => {
     const out = redactSensitive("Server started on port 3000");
     expect(out).toBe("Server started on port 3000");

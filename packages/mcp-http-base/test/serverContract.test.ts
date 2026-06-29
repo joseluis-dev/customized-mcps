@@ -18,12 +18,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { createHmac } from "node:crypto";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import {
   createHttpMcpServer,
   type HttpMcpServerOptions,
-  type AgentRecord,
   type McpServerFactory,
 } from "../src/server.js";
 import { createLogger } from "../src/logging.js";
@@ -34,18 +32,25 @@ import {
   type VerifiedToken,
 } from "../src/authority/index.js";
 
-const SECRET = "super-secret-test-key-32-bytes!!";
+/**
+ * The tests in this file exercise the SDK transport end-to-end. The
+ * resource server is wired against an external OAuth / JWKS authority
+ * in production; the unit tests use a hand-rolled `TokenAuthority` that
+ * maps a single known token ("good-token") to a fixed verified
+ * identity. The shape is what the contract needs; the values are
+ * arbitrary.
+ */
+const KNOWN_AGENT_ID = "agent-a";
+const KNOWN_SCOPES: string[] = ["read:*"];
 
-function hmacOf(token: string): string {
-  return createHmac("sha256", SECRET).update(token).digest("hex");
-}
-
-function makeAgent(overrides: Partial<AgentRecord> = {}): AgentRecord {
+function knownAgentAuthority(): TokenAuthority {
   return {
-    id: "agent-a",
-    keyHash: hmacOf("tok-a"),
-    scopes: ["read:*"],
-    ...overrides,
+    verify: async (token: string): Promise<VerifiedToken> => {
+      if (token === "tok-a") {
+        return { agentId: KNOWN_AGENT_ID, scopes: KNOWN_SCOPES };
+      }
+      throw new TokenInvalidError("not a known token");
+    },
   };
 }
 
@@ -72,8 +77,7 @@ function makeOptions(
     host: "127.0.0.1",
     port: 0,
     path: "/mcp",
-    agents: [makeAgent()],
-    hmacSecret: SECRET,
+    authority: knownAgentAuthority(),
     sessionMode: "stateful",
     logger: createLogger({ format: "text" }),
     shutdownTimeoutMs: 1000,
@@ -608,17 +612,18 @@ describe("createHttpMcpServer — end-to-end contract (real McpServer)", () => {
       // Wait a tick for the tool to have observed the call.
       await new Promise((r) => setTimeout(r, 50));
       expect(seen.length).toBeGreaterThan(0);
-      expect(seen[0]?.clientId).toBe("agent-a");
-      expect(seen[0]?.scopes).toEqual(["read:*"]);
+      expect(seen[0]?.clientId).toBe(KNOWN_AGENT_ID);
+      expect(seen[0]?.scopes).toEqual(KNOWN_SCOPES);
     });
   });
 
   describe("TokenAuthority middleware wiring (Phase 1a)", () => {
-    // Phase 1a replaces the middleware's direct `validateBearer(...)` call
-    // with `await authority.verify(token)`. The middleware MUST still
-    // produce the same 401 / 503 / 200 mapping — only the verification
-    // surface has changed. These tests use a hand-rolled `TokenAuthority`
-    // implementation (a spy) to assert the contract end-to-end.
+    // Phase 1a replaces the middleware's direct verify path with
+    // `await authority.verify(token)`. The middleware MUST still
+    // produce the same 401 / 503 / 200 mapping — only the
+    // verification surface has changed. These tests use a
+    // hand-rolled `TokenAuthority` implementation (a spy) to
+    // assert the contract end-to-end.
     it("the middleware calls authority.verify with the bearer token", async () => {
       // GIVEN a TokenAuthority spy AND a tool that echoes back the
       // auth context the SDK observed via `MessageExtraInfo.authInfo`

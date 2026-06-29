@@ -10,8 +10,10 @@ import {
 
 /**
  * Build a complete, valid env object for the happy path, then let each test
- * override the specific field under examination. Default HMAC secret is
- * 32+ bytes so the "min length" check never fires accidentally.
+ * override the specific field under examination. The OAuth / JWKS
+ * authority env vars are intentionally left undefined so the tests can
+ * assert the "unset" defaults; tests that exercise the audience-required
+ * behavior set `MCP_AUTHORITY_URL` + `MCP_AUTHORITY_AUDIENCE` together.
  */
 function baseEnv(overrides: Partial<HttpConfigInput> = {}): HttpConfigInput {
   return {
@@ -25,11 +27,6 @@ function baseEnv(overrides: Partial<HttpConfigInput> = {}): HttpConfigInput {
     MCP_HTTP_STATELESS: undefined,
     MCP_HTTP_SHUTDOWN_TIMEOUT_MS: "10000",
     MCP_LOG_FORMAT: "text",
-    MCP_AGENT_HMAC_SECRET: "x".repeat(48),
-    MCP_AGENTS_JSON: undefined,
-    MCP_AGENTS_INLINE: JSON.stringify([
-      { id: "agent-a", keyHash: "0".repeat(64), scopes: ["read:*"] },
-    ]),
     MCP_HTTP_BEHIND_PROXY: "false",
     MCP_HTTP_ALLOW_INSECURE_BIND: "false",
     MCP_HTTP_ALLOW_INSECURE_LOOPBACK: "false",
@@ -204,62 +201,6 @@ describe("parseHttpConfig", () => {
       expect(() =>
         parseHttpConfig(baseEnv({ MCP_HTTP_SHUTDOWN_TIMEOUT_MS: "-1" })),
       ).toThrow(HttpConfigError);
-    });
-  });
-
-  describe("agent configuration source", () => {
-    it("prefers MCP_AGENTS_JSON when both are set", () => {
-      const cfg = parseHttpConfig(
-        baseEnv({
-          MCP_AGENTS_JSON: "/etc/mcp/agents.json",
-          MCP_AGENTS_INLINE: JSON.stringify([{ id: "x", keyHash: "y", scopes: [] }]),
-        }),
-      );
-      expect(cfg.agentsJsonPath).toBe("/etc/mcp/agents.json");
-      expect(cfg.agentsInline).toBeDefined();
-    });
-
-    it("uses MCP_AGENTS_INLINE when MCP_AGENTS_JSON is absent", () => {
-      const cfg = parseHttpConfig(
-        baseEnv({ MCP_AGENTS_JSON: undefined, MCP_AGENTS_INLINE: "[{}]" }),
-      );
-      expect(cfg.agentsJsonPath).toBeUndefined();
-      expect(cfg.agentsInline).toBe("[{}]");
-    });
-
-    it("reports agentConfig when no source is configured (caller decides fail-closed)", () => {
-      const cfg = parseHttpConfig(
-        baseEnv({ MCP_AGENTS_JSON: undefined, MCP_AGENTS_INLINE: undefined }),
-      );
-      expect(cfg.agentsJsonPath).toBeUndefined();
-      expect(cfg.agentsInline).toBeUndefined();
-    });
-  });
-
-  describe("HMAC secret length", () => {
-    it("rejects a missing HMAC secret", () => {
-      expect(() =>
-        parseHttpConfig(baseEnv({ MCP_AGENT_HMAC_SECRET: "" })),
-      ).toThrow(HttpConfigError);
-    });
-
-    it("rejects an HMAC secret shorter than 32 bytes", () => {
-      expect(() =>
-        parseHttpConfig(baseEnv({ MCP_AGENT_HMAC_SECRET: "short" })),
-      ).toThrow(HttpConfigError);
-      try {
-        parseHttpConfig(baseEnv({ MCP_AGENT_HMAC_SECRET: "short" }));
-      } catch (e) {
-        const err = e as HttpConfigError;
-        expect(err.message).toContain("32");
-      }
-    });
-
-    it("accepts a 32-byte HMAC secret", () => {
-      const cfg = parseHttpConfig(
-        baseEnv({ MCP_AGENT_HMAC_SECRET: "x".repeat(32) }),
-      );
-      expect(cfg.hmacSecret).toBe("x".repeat(32));
     });
   });
 
@@ -458,11 +399,13 @@ describe("parseHttpConfig", () => {
       expect(cfg.authorityJwksUrl).toBeUndefined();
     });
 
-    it("does not require MCP_AUTHORITY_AUDIENCE when MCP_AUTHORITY_URL is unset (local backend path)", () => {
-      // The local-roster backend does not need an audience — the
-      // middleware calls validateBearer() directly, and there is no
-      // JWT to validate. The audience requirement is bound to the
-      // external (JWKS) path only.
+    it("does not require MCP_AUTHORITY_AUDIENCE when MCP_AUTHORITY_URL is unset (the app-side loader handles the fail-closed case)", () => {
+      // The shared config layer is permissive when MCP_AUTHORITY_URL
+      // is unset — the audience check is bound to the
+      // (URL, audience) pair. The app-side loader (`loadHttpRuntimeConfig`)
+      // rejects the unset-URL state so the resource server cannot
+      // start without an authority. The shared layer does NOT
+      // duplicate that fail-closed check.
       const cfg = parseHttpConfig(baseEnv());
       expect(cfg.authorityUrl).toBeUndefined();
       expect(cfg.authorityAudience).toBeUndefined();

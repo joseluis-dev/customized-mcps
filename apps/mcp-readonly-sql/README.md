@@ -292,14 +292,15 @@ Three details matter for the host wiring:
 
 The app exposes the same five read-only tools over Streamable HTTP
 when `MCP_TRANSPORT=streamableHttp`. Multiple agents can then share a
-single process behind a reverse proxy, each identified by an opaque
-HMAC bearer token. The wire contract is:
+single process behind a reverse proxy, each authenticated against the
+external OAuth authority (`apps/mcp-oauth-admin` on port 3002 by
+default). The wire contract is:
 
 | Concern | Behavior |
 |---|---|
 | Endpoint | `POST /mcp` (JSON-RPC) and `GET /mcp` (SSE stream) |
 | Health | `GET /healthz` (unauthenticated, `200 ok` / `503 shutting-down`) |
-| Auth | `Authorization: Bearer <token>` per request, validated as `HMAC(secret, token) === keyHash` in constant time |
+| Auth | `Authorization: Bearer <token>` per request, validated as an RS256 JWT against the authority's JWKS |
 | Scopes | Per-agent `read|list|call:<resource>` matching; `*` wildcard per resource (v1 does not wildcard verbs) |
 | Session mode | Per-request stateless by default (`MCP_HTTP_STATELESS=true`); stateful is the single-agent opt-in |
 | Body cap | `Content-Length > MCP_HTTP_MAX_BODY_BYTES` → 413; chunked bodies → 411 unless `MCP_HTTP_ALLOW_UNBOUNDED_BODY=true` |
@@ -309,24 +310,25 @@ HMAC bearer token. The wire contract is:
 ### Quick start (dev/staging, loopback only)
 
 ```bash
-# 1. Generate a 32-byte HMAC secret
-export MCP_AGENT_HMAC_SECRET="$(openssl rand -hex 32)"
+# 1. Start the OAuth admin authority (port 3002 by default).
+#    See apps/mcp-oauth-admin/README.md for setup.
 
-# 2. Create an agents file
-cat > /tmp/agents.json <<'EOF'
-[
-  { "id": "agent-a", "keyHash": "<hmac-of-token>", "scopes": ["read:*"] }
-]
-EOF
-export MCP_AGENTS_JSON=/tmp/agents.json
+# 2. Mint a token via the authority's /oauth/token endpoint
+#    (client_credentials grant). The token's `aud` claim MUST equal
+#    MCP_AUTHORITY_AUDIENCE (set on the resource server below).
 
-# 3. Start the HTTP server (loopback only — no opt-in needed)
-MCP_TRANSPORT=streamableHttp pnpm --filter mcp-readonly-sql start:http
+# 3. Start the HTTP server wired to the authority (loopback only —
+#    no opt-in needed for non-TLS dev binding)
+MCP_TRANSPORT=streamableHttp \
+MCP_AUTHORITY_URL=http://127.0.0.1:3002 \
+MCP_AUTHORITY_AUDIENCE=mcp-readonly-sql \
+pnpm --filter mcp-readonly-sql start:http
 ```
 
 The app binds `127.0.0.1:3001` by default. Hit `/healthz` to confirm it
-is up; the spec scenarios in `openspec/changes/dedicated-mcp-server-deployment/specs/`
-are the canonical contract.
+is up; the spec scenarios in `openspec/changes/oauth-sqlite-admin-authorization/specs/`
+are the canonical contract. A missing `MCP_AUTHORITY_URL` fails the
+resource server closed at startup with a stderr message.
 
 ### Production behind a reverse proxy
 

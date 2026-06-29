@@ -1,27 +1,32 @@
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { createHmac, randomUUID } from "node:crypto";
 import {
   createHttpMcpServer,
   type HttpMcpServerOptions,
-  type AgentRecord,
   type McpServerFactory,
+  type TokenAuthority,
+  type VerifiedToken,
 } from "../src/server.js";
 import { createLogger } from "../src/logging.js";
 
-const SECRET = "super-secret-test-key-32-bytes!!";
-
-function hmacOf(token: string): string {
-  return createHmac("sha256", SECRET).update(token).digest("hex");
-}
-
-function makeAgent(overrides: Partial<AgentRecord> = {}): AgentRecord {
+/**
+ * A hand-rolled `TokenAuthority` for the unit tests in this file. The
+ * resource server is wired against an external OAuth / JWKS authority
+ * in production; the unit tests use a spy so the wire contract
+ * (TokenInvalidError → 401, AuthorityUnavailableError → 503) can be
+ * exercised without spinning up a real authority.
+ */
+function makeSpyAuthority(
+  verifier: (token: string) => Promise<VerifiedToken>,
+): TokenAuthority & { calls: string[] } {
+  const calls: string[] = [];
   return {
-    id: "agent-a",
-    keyHash: hmacOf("tok-a"),
-    scopes: ["read:*"],
-    ...overrides,
+    calls,
+    verify: async (token: string): Promise<VerifiedToken> => {
+      calls.push(token);
+      return verifier(token);
+    },
   };
 }
 
@@ -32,8 +37,12 @@ function makeOptions(
     host: "127.0.0.1",
     port: 0, // OS-assigned ephemeral port
     path: "/mcp",
-    agents: [makeAgent()],
-    hmacSecret: SECRET,
+    authority: makeSpyAuthority(async (token) => {
+      if (token === "tok-a") {
+        return { agentId: "agent-a", scopes: ["read:*"] };
+      }
+      throw new (await import("../src/authority/index.js")).TokenInvalidError("nope");
+    }),
     sessionMode: "stateful",
     logger: createLogger({ format: "text" }),
     shutdownTimeoutMs: 1000,
@@ -115,18 +124,20 @@ describe("createHttpMcpServer", () => {
   });
 
   describe("/healthz (unauthenticated)", () => {
-    it("returns 200 with status=ok and authorityBackend=local while healthy", async () => {
+    it("returns 200 with status=ok and authorityBackend=oauth while healthy", async () => {
       // Phase 1b: the health endpoint returns JSON so it can carry
       // the `authorityBackend` field per the mcp-token-authority spec.
       // The body MUST NOT include tokens, `kid`, JWKS URL, or
-      // authority URL.
+      // authority URL. The default backend label is "oauth" (the only
+      // production-shape backend after the local HMAC roster was
+      // removed).
       const { handle, port } = await startServer(makeOptions());
       stopHandle = handle;
       const res = await http(port, "GET", "/healthz");
       expect(res.status).toBe(200);
       const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
       expect(body.status).toBe("ok");
-      expect(body.authorityBackend).toBe("local");
+      expect(body.authorityBackend).toBe("oauth");
     });
 
     it("returns 503 with status=shutting-down once the controller has been signaled", async () => {
@@ -138,7 +149,7 @@ describe("createHttpMcpServer", () => {
       expect(res.status).toBe(503);
       const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
       expect(body.status).toBe("shutting-down");
-      expect(body.authorityBackend).toBe("local");
+      expect(body.authorityBackend).toBe("oauth");
     });
   });
 
@@ -154,7 +165,7 @@ describe("createHttpMcpServer", () => {
       expect(res.body).not.toContain("agent-a");
     });
 
-    it("returns 401 for a malformed bearer token (not in agent list)", async () => {
+    it("returns 401 for a malformed bearer token (not accepted by the authority)", async () => {
       const { handle, port } = await startServer(makeOptions());
       stopHandle = handle;
       const res = await http(

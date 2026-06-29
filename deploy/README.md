@@ -44,9 +44,10 @@ the contract is in
 - **Rollback** (resource server): set `MCP_TRANSPORT=stdio` in the
   env file and restart.
 - **Rollback** (authority): stop the unit, restore the SQLite file
-  from a backup, and unset `MCP_AUTHORITY_URL` on every resource
-  server. The local HMAC roster is preserved as the
-  dev/offline fallback.
+  from a backup, and rewire every resource server to a reachable
+  authority. The resource server now requires
+  `MCP_AUTHORITY_URL` to be set; a missing authority URL fails
+  closed at startup.
 
 ## Quick path (production)
 
@@ -74,8 +75,7 @@ the contract is in
    ```
 7. Validate:
    - `curl -sS http://127.0.0.1:3001/healthz` → `200`
-     `{"status":"ok","authorityBackend":"oauth"}` (or
-     `"local"` when the local backend is in use).
+     `{"status":"ok","authorityBackend":"oauth"}`.
    - `curl -sS http://127.0.0.1:3002/healthz` → `200`
      `{"status":"ok"}` (the authority's `/healthz`).
 8. Front them with the proxy in
@@ -89,10 +89,9 @@ the contract is in
 
 The read-only MCP resource server. Binds port **3001** by default
 (mcp-http-transport Port Allocation Convention). Validates bearer
-tokens (HMAC for the local backend; RS256/ES256 JWT for the
-JWKS or OAuth admin backend). Surfaces five read-only tools
-(`list_profiles`, `test_connection`, `list_databases`,
-`execute_read_query`, `describe_schema`).
+tokens against the external OAuth authority (RS256 JWT via JWKS).
+Surfaces five read-only tools (`list_profiles`, `test_connection`,
+`list_databases`, `execute_read_query`, `describe_schema`).
 
 | Surface | Path | Default |
 | --- | --- | --- |
@@ -132,29 +131,6 @@ MCP_HTTP_ALLOW_INSECURE_BIND=true
   (the path the unit reads; mirrors the app's own dotenv path).
 - Override to `/etc/mcp/mcp-readonly-sql.env` if you prefer the
   per-app env location; the runbook documents the convention.
-
-#### Rotate agent keys (HMAC)
-
-The local backend is the dev/offline fallback only; production
-deployments use the OAuth admin authority. When the local
-backend IS in use:
-
-1. Generate a new `MCP_AGENT_HMAC_SECRET` (32+ bytes):
-   `openssl rand -hex 32`.
-2. For every agent in `MCP_AGENTS_JSON`, recompute the
-   `keyHash` with the new secret:
-   ```bash
-   echo -n "<new-bearer-token>" | openssl dgst -sha256 -hmac "<new-secret>" | awk '{print $2}'
-   ```
-3. Replace the `keyHash` field in the roster file.
-4. Restart the service: `systemctl restart mcp-readonly-sql.service`.
-5. Hand the new bearer token to the corresponding agent out of
-   band.
-
-Old bearer tokens are immediately invalid. Operators that want
-zero downtime can pre-provision the new keyHashes before rotating
-the secret (use `MCP_AGENTS_INLINE` as a staging path, then
-promote to `MCP_AGENTS_JSON` once verified).
 
 #### Roll back to stdio
 
@@ -305,7 +281,7 @@ The proxy MUST:
    the first chunked request to make the missing cap visible.
 2. **Preserve the Authorization / Cookie headers**
    (`proxy_set_header Authorization $http_authorization;` in
-   nginx). The shared base does HMAC / JWT validation on the
+   nginx). The shared base does JWT validation on the
    bearer token; the header MUST reach the app verbatim.
    Removing this line breaks auth; setting it to a static
    value breaks multi-agent isolation. The admin UI uses a
@@ -375,7 +351,6 @@ http://127.0.0.1:<app-port>;` (3001 for the resource server;
 | --- | --- | --- |
 | Transport (resource server) | `MCP_TRANSPORT` | `.env` (or `.env.example` for defaults) |
 | HTTP listener (every app) | `MCP_HTTP_HOST`, `MCP_HTTP_PORT`, `MCP_HTTP_PATH`, `MCP_HTTP_STATELESS`, `MCP_HTTP_SHUTDOWN_TIMEOUT_MS`, `MCP_HTTP_MAX_BODY_BYTES`, `MCP_HTTP_ALLOW_UNBOUNDED_BODY`, `MCP_LOG_FORMAT`, `MCP_HTTP_BEHIND_PROXY`, `MCP_HTTP_ALLOW_INSECURE_BIND` | `.env` |
-| Agent auth (local backend) | `MCP_AGENT_HMAC_SECRET`, `MCP_AGENTS_JSON` or `MCP_AGENTS_INLINE` | `.env` (HMAC secret) + JSON file or inline string |
 | Agent auth (authority) | `MCP_AUTHORITY_URL`, `MCP_AUTHORITY_AUDIENCE`, `MCP_AUTHORITY_JWKS_URL`, `MCP_AUTHORITY_JWKS_TTL_S`, `MCP_AUTHORITY_LEEWAY_S`, `MCP_AUTHORITY_FETCH_TIMEOUT_MS` | `.env` |
 | Authority storage | `MCP_OAUTH_DB_PATH`, `MCP_OAUTH_BACKUP_TARGET`, `MCP_OAUTH_BACKUP_INTERVAL_S`, `MCP_OAUTH_DISABLE_RETENTION_SWEEP` | `.env` (per-app) |
 | Authority bootstrap | `MCP_OAUTH_ADMIN_USERNAME`, `MCP_OAUTH_ADMIN_PASSWORD` | `.env` (per-app; unset after first rotation) |
@@ -385,42 +360,34 @@ http://127.0.0.1:<app-port>;` (3001 for the resource server;
 
 ## Choose your backend
 
-The resource server (`mcp-readonly-sql`) supports two
-token-verification backends. The selection is driven by
-`MCP_AUTHORITY_URL`; the local backend is the unset-env
-default (dev/offline only), the OAuth admin authority is the
-recommended default for production.
+The resource server (`mcp-readonly-sql`) is wired against an
+external OAuth authority. The local HMAC roster backend was
+removed; the resource server MUST be configured with
+`MCP_AUTHORITY_URL` against the `mcp-oauth-admin` authority
+(or any OIDC-compliant authority that issues RS256 JWTs).
 
 | Backend | Selected when | When to use | Token shape | Roster |
 | --- | --- | --- | --- | --- |
-| **Local HMAC roster** (`LocalRosterAuthority`) | `MCP_AUTHORITY_URL` is **unset** | Dev / offline / single-host deployments without a shared authority | Opaque bearer (HMAC compared against `MCP_AGENTS_JSON`) | `MCP_AGENTS_JSON` or `MCP_AGENTS_INLINE` |
 | **OAuth admin authority** (`OAuthAdminAuthority`) | `MCP_AUTHORITY_URL` is **set** | Production / shared deployments with the `mcp-oauth-admin` authority | RS256 JWT (signature verified against the authority's JWKS) | Owned by the authority; no roster on the resource-server side |
 
-The selection is deterministic and is reflected in
-`GET /healthz` via the `authorityBackend` field (`"local"` or
-`"oauth"`). Switch backends by setting or unsetting
-`MCP_AUTHORITY_URL` and restarting the service — no other
-config change is required. The same MCP tools, the same
-scopes, and the same `SCOPE_PATTERN` apply to both backends;
-the wire contract on the resource-server side is unchanged.
-
-The local backend is **dev/offline only** and is deprecated.
-The resource server emits a one-shot `WARN` at startup naming
-`MCP_AGENTS_JSON`, `MCP_AGENTS_INLINE`, and
-`MCP_AGENT_HMAC_SECRET` as deprecated when the local backend
-is active. Operators deploying a shared or production
-environment MUST use the OAuth admin authority.
+A missing `MCP_AUTHORITY_URL` is an explicit fail-closed
+error: the app exits non-zero at startup with a stderr
+message naming `MCP_AUTHORITY_URL`. Operators deploying a
+shared or production environment MUST point
+`MCP_AUTHORITY_URL` at the authority. The selection is
+deterministic and is reflected in `GET /healthz` via the
+`authorityBackend` field (`"oauth"`).
 
 ## Health probe and graceful shutdown
 
 - `GET /healthz` (resource server, port 3001) returns `200`
-  with body `{"status":"ok","authorityBackend":"local"}`
+  with body `{"status":"ok","authorityBackend":"oauth"}`
   when the app is ready to serve (the `authorityBackend` field
-  is `"oauth"` when `MCP_AUTHORITY_URL` is set, per the
-  mcp-token-authority spec). On shutdown or factory failure
-  the response is `503` with body
-  `{"status":"shutting-down"|"unhealthy","authorityBackend":
-  "local"}`. The endpoint is unauthenticated; the reverse
+  reports the active backend; with the local HMAC roster
+  removed the only production-shape backend is `"oauth"`).
+  On shutdown or factory failure the response is `503` with
+  body `{"status":"shutting-down"|"unhealthy","authorityBackend":
+  "oauth"}`. The endpoint is unauthenticated; the reverse
   proxy MUST allow it through.
 - `GET /auth/healthz` (authority, port 3002 via the proxy) is
   the upstream path; the authority exposes `/healthz` on
@@ -452,14 +419,9 @@ app in `apps/<app-name>/` MUST pick a distinct port (3003,
 
 ## Rotate keys
 
-### Resource server (HMAC local backend)
-
-The local backend is deprecated; production deployments use
-the OAuth admin authority. When the local backend IS in use,
-see [Rotate agent keys (HMAC)](#rotate-agent-keys-hmac) under
-[mcp-readonly-sql](#mcp-readonly-sql).
-
-### Authority (admin password + signing key)
+The resource server is wired against the OAuth admin authority;
+there is no separate HMAC key to rotate on the resource-server
+side. The rotation flow lives on the authority:
 
 - **Bootstrap admin password**: see
   [Rotate the bootstrap admin password](#rotate-the-bootstrap-admin-password)
@@ -511,12 +473,10 @@ changes. No data is lost.
    returning 503 on the next `verify` call (the JWKS fetch
    fails). This is the correct fail-closed behavior; the
    spec requires 503 on authority unreachable.
-3. To restore the resource server on the local backend,
-   unset `MCP_AUTHORITY_URL` on the resource server and
-   restart. The local HMAC roster is preserved as a
-   fallback; restore `mcp-readonly-sql.agents.json` from
-   the operator's secret store (the spec does NOT ship a
-   sample roster file any more).
+3. To restore the resource server, point
+   `MCP_AUTHORITY_URL` at a reachable authority and restart.
+   The local HMAC roster backend was removed; the resource
+   server will NOT serve traffic without an authority.
 
 ### Authority (full restoration from backup)
 
@@ -539,17 +499,14 @@ changes. No data is lost.
 
 - [ ] `systemctl status mcp-readonly-sql.service` is `active
   (running)`.
-- [ ] `curl -sS http://127.0.0.1:3001/healthz` returns `200`
-  with body `{"status":"ok","authorityBackend":"oauth"}` (or
-  `"local"` when the local backend is in use).
+  - [ ] `curl -sS http://127.0.0.1:3001/healthz` returns `200`
+    with body `{"status":"ok","authorityBackend":"oauth"}`.
 - [ ] `journalctl -u mcp-readonly-sql -n 50 -o cat` shows
   the listening address and the bound port.
 - [ ] The reverse proxy returns a bearer-intact JSON-RPC
   response to an authorized agent.
 - [ ] A POST to `/mcp` with no `Authorization` header
   returns `401` (no JSON-RPC body).
-- [ ] A POST to `/mcp` with a valid bearer but out-of-scope
-  returns `403`.
 - [ ] The deploy-template lint test passes (it greps the
   runbook for common secret patterns — JWT-style prefixes,
   SHA-256 keyHash literals, database connection-string

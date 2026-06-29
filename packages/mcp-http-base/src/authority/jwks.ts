@@ -4,10 +4,12 @@
  *
  * Phase 1b of the external-token-authority-verification change adds the
  * `JwksAuthority` on top of the Phase 1a `TokenAuthority` abstraction.
- * The local backend (`LocalRosterAuthority`) stays the dev/offline
- * fallback; the JWKS backend is the recommended default for production
- * and shared deployments, activated by setting `MCP_AUTHORITY_URL` in
- * the env (per the mcp-agent-authorization spec).
+ * The OAuth / JWKS backend is the only token-verify path on the
+ * resource server: the local HMAC roster backend was removed, and
+ * the resource server is required to wire `MCP_AUTHORITY_URL` against
+ * an external authority (per the mcp-agent-authorization spec).
+ * The app-side `loadHttpRuntimeConfig` fails closed when
+ * `MCP_AUTHORITY_URL` is unset.
  *
  * Wire contract (per the mcp-token-authority spec):
  * - The `iss` claim MUST equal `MCP_AUTHORITY_URL`.

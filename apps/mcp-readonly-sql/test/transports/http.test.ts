@@ -1,19 +1,35 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { request as httpRequest } from "node:http";
 import type { AddressInfo } from "node:net";
-import { createHmac } from "node:crypto";
 import { runHttpTransport } from "../../src/transports/http.js";
 import { buildReadOnlyMcpServer } from "../../src/serverFactory.js";
 import type { Profile, SafetyLimits } from "../../src/types.js";
-import type { HttpRuntimeConfig } from "../../src/config/http.js";
 import {
-  LocalRosterAuthority,
+  type HttpRuntimeConfig,
+} from "../../src/config/http.js";
+import {
+  TokenInvalidError,
   type Logger,
+  type TokenAuthority,
+  type VerifiedToken,
 } from "@customized-mcps/mcp-http-base";
 
-const HMAC_SECRET = "x".repeat(32);
-const TOKEN = "tok-a";
-const KEY_HASH = createHmac("sha256", HMAC_SECRET).update(TOKEN).digest("hex");
+/**
+ * The local HMAC roster backend was removed. The transport unit
+ * tests use a hand-rolled `TokenAuthority` (spy) that maps a single
+ * known token to a fixed verified identity. The wire contract is
+ * the same; the values are arbitrary.
+ */
+function knownAgentAuthority(): TokenAuthority {
+  return {
+    verify: async (token: string): Promise<VerifiedToken> => {
+      if (token === "tok-a") {
+        return { agentId: "agent-a", scopes: ["read:*"] };
+      }
+      throw new TokenInvalidError("not a known token");
+    },
+  };
+}
 
 const TEST_LIMITS: SafetyLimits = {
   maxRowsDefault: 100,
@@ -54,39 +70,17 @@ function makeConfig(overrides: Partial<HttpRuntimeConfig> = {}): HttpRuntimeConf
     sessionMode: "stateless",
     shutdownTimeoutMs: 1000,
     logFormat: "text",
-    hmacSecret: HMAC_SECRET,
-    agentsJsonPath: undefined,
-    agentsInline: undefined,
     behindProxy: false,
     allowInsecureBind: false,
-    agents: [
-      {
-        id: "agent-a",
-        keyHash: KEY_HASH,
-        scopes: ["read:*"],
-      },
-    ],
     allowUnboundedBody: false,
-    // Phase 1b: defaults for the new authority fields. The legacy
-    // tests use the local backend; the explicit
-    // LocalRosterAuthority construction here keeps the existing
-    // HMAC + scope behavior unchanged.
-    authority: new LocalRosterAuthority({
-      agents: [
-        {
-          id: "agent-a",
-          keyHash: KEY_HASH,
-          scopes: ["read:*"],
-        },
-      ],
-      hmacSecret: HMAC_SECRET,
-      logger: silentLogger(),
-    }),
-    authorityBackend: "local",
-    // Phase 1b env vars: defaults (undefined for unset).
-    authorityUrl: undefined,
+    // The resource server is wired against an external authority;
+    // the unit tests inject a known-token spy so the wire contract
+    // is exercised without spinning up a real authority.
+    authority: knownAgentAuthority(),
+    authorityBackend: "oauth",
+    authorityUrl: "https://auth.example.com",
     authorityJwksUrl: undefined,
-    authorityAudience: undefined,
+    authorityAudience: "mcp-readonly-sql",
     authorityJwksTtlSeconds: 60,
     authorityLeewaySeconds: 30,
     authorityFetchTimeoutMs: 5000,
@@ -166,9 +160,11 @@ describe("transports/http", () => {
       expect(res.status).toBe(200);
       // Phase 1b: the health endpoint returns JSON with the
       // `authorityBackend` field (per the mcp-token-authority spec).
+      // The default is "oauth" now that the local HMAC backend was
+      // removed.
       const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
       expect(body.status).toBe("ok");
-      expect(body.authorityBackend).toBe("local");
+      expect(body.authorityBackend).toBe("oauth");
     });
 
     it("returns 401 when a request to /mcp has no Authorization header", async () => {
@@ -190,7 +186,9 @@ describe("transports/http", () => {
     it("returns 401 when a request to /mcp has a wrong bearer token", async () => {
       // GIVEN the server is up
       // WHEN a POST /mcp is sent with an invalid bearer token
-      // THEN the response is 401 (constant-time HMAC compare, no token fragment in body)
+      // THEN the response is 401 (the authority rejected the token; the
+      //      middleware sanitizes the body to avoid leaking the token
+      //      fragment).
       const cfg = makeConfig({ port: 0 });
       const handle = runHttpTransport({ config: cfg, serverFactory: () => buildReadOnlyMcpServer({ profiles: [FAKE_SQLITE_PROFILE], limits: TEST_LIMITS }).server });
       await handle.start();
@@ -208,7 +206,7 @@ describe("transports/http", () => {
     it("exposes /healthz outside the authenticated path (no Authorization required)", async () => {
       // GIVEN the server is up
       // WHEN an unauthenticated GET /healthz is sent
-      // THEN the response is 200 with body { status: "ok", authorityBackend: "local" }
+      // THEN the response is 200 with body { status: "ok", authorityBackend: "oauth" }
       const cfg = makeConfig({ port: 0 });
       const handle = runHttpTransport({ config: cfg, serverFactory: () => buildReadOnlyMcpServer({ profiles: [FAKE_SQLITE_PROFILE], limits: TEST_LIMITS }).server });
       await handle.start();
@@ -218,7 +216,7 @@ describe("transports/http", () => {
       expect(res.status).toBe(200);
       const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
       expect(body.status).toBe("ok");
-      expect(body.authorityBackend).toBe("local");
+      expect(body.authorityBackend).toBe("oauth");
     });
 
     it("stop() closes the listener (subsequent /healthz attempts fail with ECONNREFUSED)", async () => {

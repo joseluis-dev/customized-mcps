@@ -6,6 +6,12 @@
  * responsible for reading the env, calling this function, and exiting
  * non-zero with a stderr message on `HttpConfigError`.
  *
+ * The shared base now only knows about the OAuth / JWKS authority
+ * backends. The local HMAC roster (and its `MCP_AGENT_HMAC_SECRET` /
+ * `MCP_AGENTS_JSON` / `MCP_AGENTS_INLINE` env vars) was removed; the
+ * resource server is required to wire `MCP_AUTHORITY_URL` against an
+ * external authority (`apps/mcp-oauth-admin` is the canonical target).
+ *
  * Phase 1b of `external-token-authority-verification` adds six authority
  * env vars (MCP_AUTHORITY_URL, MCP_AUTHORITY_JWKS_URL, MCP_AUTHORITY_AUDIENCE,
  * MCP_AUTHORITY_JWKS_TTL_S, MCP_AUTHORITY_LEEWAY_S, MCP_AUTHORITY_FETCH_TIMEOUT_MS).
@@ -26,9 +32,6 @@ export type HttpConfigInput = {
   MCP_HTTP_STATELESS: string | undefined;
   MCP_HTTP_SHUTDOWN_TIMEOUT_MS: string | undefined;
   MCP_LOG_FORMAT: string | undefined;
-  MCP_AGENT_HMAC_SECRET: string | undefined;
-  MCP_AGENTS_JSON: string | undefined;
-  MCP_AGENTS_INLINE: string | undefined;
   MCP_HTTP_BEHIND_PROXY: string | undefined;
   /** Preferred opt-in: explicitly acknowledges that no TLS is in the app. */
   MCP_HTTP_ALLOW_INSECURE_BIND: string | undefined;
@@ -50,15 +53,15 @@ export type HttpConfig = {
   stateless: boolean;
   shutdownTimeoutMs: number;
   logFormat: LogFormat;
-  hmacSecret: string;
-  agentsJsonPath: string | undefined;
-  agentsInline: string | undefined;
   behindProxy: boolean;
   allowInsecureBind: boolean;
   // Phase 1b (external-token-authority-verification): the six
-  // authority env vars. When `authorityUrl` is `undefined`, the
-  // app uses the local-roster backend; when set, the app uses
-  // the JWKS backend. The integer fields have the documented
+  // authority env vars. The OAuth admin / JWKS backend is the
+  // only token-verify path on the resource server. When
+  // `authorityUrl` is `undefined`, the app-side loader rejects
+  // the configuration (the resource server MUST be wired to an
+  // external authority). When set, the app uses the OAuth admin
+  // / JWKS backend. The integer fields have the documented
   // defaults (60/30/5000). The audience is REQUIRED when the
   // URL is set.
   authorityUrl: string | undefined;
@@ -141,14 +144,6 @@ export function parseHttpConfig(input: HttpConfigInput): HttpConfig {
     );
   }
 
-  const hmacSecret = input.MCP_AGENT_HMAC_SECRET ?? "";
-  if (hmacSecret.length < 32) {
-    throw new HttpConfigError(
-      `MCP_AGENT_HMAC_SECRET must be at least 32 bytes of entropy; got ${hmacSecret.length}. ` +
-        `Generate one with: openssl rand -hex 32`,
-    );
-  }
-
   // Phase 1b (external-token-authority-verification): the six
   // authority env vars. The integer fields have documented
   // defaults (60/30/5000). When MCP_AUTHORITY_URL is set,
@@ -196,9 +191,6 @@ export function parseHttpConfig(input: HttpConfigInput): HttpConfig {
     stateless,
     shutdownTimeoutMs,
     logFormat: logFormatRaw,
-    hmacSecret,
-    agentsJsonPath: nonEmpty(input.MCP_AGENTS_JSON),
-    agentsInline: nonEmpty(input.MCP_AGENTS_INLINE),
     behindProxy,
     allowInsecureBind,
     authorityUrl,

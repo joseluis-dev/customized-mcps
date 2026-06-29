@@ -7,7 +7,7 @@
  *
  * Value-level exports (functions, constants) are checked at runtime by
  * importing the package and inspecting the namespace. Type-level exports
- * (LogFormat, AgentRecord) are erased at runtime, so the .d.ts file is
+ * (LogFormat, Scope) are erased at runtime, so the .d.ts file is
  * read and checked instead — this is exactly what downstream TypeScript
  * consumers see, so it is the right place to assert the public surface.
  */
@@ -69,10 +69,27 @@ describe("public API surface (value-level exports)", () => {
     expect(typeof PublicApi.createShutdownController).toBe("function");
     expect(typeof PublicApi.createLogger).toBe("function");
     expect(typeof PublicApi.parseHttpConfig).toBe("function");
-    expect(typeof PublicApi.loadAgents).toBe("function");
-    expect(typeof PublicApi.validateBearer).toBe("function");
     expect(typeof PublicApi.matchScope).toBe("function");
     expect(typeof PublicApi.redactSensitive).toBe("function");
+  });
+
+  it("does NOT re-export the removed local HMAC helpers (loadAgents, validateBearer, constantTimeEqualString)", () => {
+    // The local HMAC roster backend was removed when the OAuth admin
+    // authority became the only token-verify surface. These helpers
+    // are implementation details of the deleted backend and MUST NOT
+    // come back via the public surface.
+    expect((PublicApi as Record<string, unknown>).loadAgents).toBeUndefined();
+    expect((PublicApi as Record<string, unknown>).validateBearer).toBeUndefined();
+    expect((PublicApi as Record<string, unknown>).constantTimeEqualString).toBeUndefined();
+    expect((PublicApi as Record<string, unknown>).isValidKeyHash).toBeUndefined();
+    expect((PublicApi as Record<string, unknown>).KEY_HASH_PATTERN).toBeUndefined();
+  });
+
+  it("does NOT re-export the removed LocalRosterAuthority class", () => {
+    // The local-roster authority was deleted along with the HMAC
+    // backend. Only the OAuth / JWKS authorities remain.
+    expect((PublicApi as Record<string, unknown>).LocalRosterAuthority).toBeUndefined();
+    expect((PublicApi as Record<string, unknown>).LocalRosterAuthorityOptions).toBeUndefined();
   });
 });
 
@@ -98,14 +115,17 @@ describe("public API surface (type-level exports via declaration source)", () =>
     expect(logFormatExports.length).toBe(1);
   });
 
-  it("declares AgentRecord exactly once (no duplicate alias)", () => {
+  it("does not re-export the removed AgentRecord type from the shared base", () => {
+    // The shared base's AgentRecord (the local HMAC roster record)
+    // was removed along with the local backend. A future maintainer
+    // re-introducing it would fail this test.
     const here = packageRoot();
     const raw = readFileSync(join(here, "src", "index.ts"), "utf8");
     const code = raw
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .replace(/^\s*\/\/.*$/gm, "");
     const agentRecordExports = code.match(/\bAgentRecord\b/g) ?? [];
-    expect(agentRecordExports.length).toBe(1);
+    expect(agentRecordExports.length).toBe(0);
   });
 
   it("does not re-export confusing duplicate type aliases", () => {
@@ -119,7 +139,6 @@ describe("public API surface (type-level exports via declaration source)", () =>
     const here = packageRoot();
     const indexSrc = readFileSync(join(here, "src", "index.ts"), "utf8");
     expect(indexSrc).toMatch(/JSON_RPC_ERROR_CODES/);
-    expect(indexSrc).toMatch(/isValidKeyHash/);
     expect(indexSrc).toMatch(/isValidScope/);
   });
 
@@ -134,4 +153,8 @@ describe("public API surface (type-level exports via declaration source)", () =>
     }
     expect(distFile).toBeDefined();
   });
+
+  // Reference `dts` to keep the variable (the symbol is read by
+  // future maintainers to confirm the file was loaded).
+  void dts;
 });

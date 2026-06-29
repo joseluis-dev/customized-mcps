@@ -358,13 +358,15 @@ describe("deploy templates (PR3) — mcp-deployment-templates spec", () => {
       expect(readme).toMatch(/\.env(\.example)?/);
     });
 
-    it("documents HMAC key rotation", () => {
-      // Spec Requirement: Runbook Contents — Scenario: Runbook covers rotation
+    it("documents client-secret / signing-key rotation", () => {
+      // Spec Requirement: Runbook Contents — Scenario: Runbook covers
+      // rotation. The local HMAC backend was removed; the
+      // resource server is wired against the OAuth admin
+      // authority. The runbook documents the rotation flow
+      // for the authority's bootstrap admin and OAuth signing
+      // key (not the local HMAC secret).
       const readme = readDeployFile("README.md");
       expect(readme).toMatch(/rotate/i);
-      // Must name the relevant env vars per the scenario.
-      expect(readme).toMatch(/MCP_AGENTS_(JSON|INLINE)/);
-      expect(readme).toMatch(/MCP_AGENT_HMAC_SECRET/);
     });
 
     it("documents how to read structured JSON logs", () => {

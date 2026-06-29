@@ -31,10 +31,8 @@ import { createServer, type IncomingMessage, type ServerResponse, type Server } 
 import { randomUUID } from "node:crypto";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { type AgentRecord } from "./auth.js";
 import {
   AuthorityUnavailableError,
-  LocalRosterAuthority,
   TokenInvalidError,
   type TokenAuthority,
   type VerifiedToken,
@@ -59,55 +57,21 @@ export type HttpMcpServerOptions = {
   port: number;
   path: string;
   /**
-   * The `TokenAuthority` the middleware delegates to. Phase 1a of
-   * `external-token-authority-verification` introduces this as the
-   * single source of truth for token verification. If `authority`
-   * is provided, `agents` and `hmacSecret` are ignored — the
-   * middleware calls `authority.verify(token)` directly.
-   *
-   * If `authority` is NOT provided, the shared base builds a
-   * `LocalRosterAuthority` from `agents` + `hmacSecret` so the
-   * pre-Phase-1a caller pattern (existing v1 tests, the
-   * `mcp-readonly-sql` app's HTTP config loader) keeps working
-   * unchanged. New callers SHOULD pass `authority` directly so the
-   * app-side glue does not have to reach into the shared base's
-   * `LocalRosterAuthority` shape.
-   *
-   * The middleware MUST NOT call `validateBearer` directly; the
-   * `LocalRosterAuthority` is the implementation detail that
-   * wraps the HMAC compare. This contract is what
-   * `mcp-agent-authorization` and `mcp-token-authority` assert
-   * for the `external-token-authority-verification` change.
+   * The `TokenAuthority` the middleware delegates to. This is the
+   * single source of truth for token verification: the middleware
+   * calls `authority.verify(token)` for every request that arrives
+   * with a bearer header. Required — the shared base refuses to
+   * start without a verification backend.
    */
-  authority?: TokenAuthority;
+  authority: TokenAuthority;
   /**
-   * The audit-safe label that `/healthz` exposes. When `undefined`,
-   * the shared base defaults to `"local"` (the unset-env default
-   * per the mcp-agent-authorization spec). When the app sets
-   * `MCP_AUTHORITY_URL`, it passes `"jwks"` so the health probe
-   * reports the selected backend. The label MUST NOT include
-   * tokens, `kid`, JWKS URL, or authority URL.
+   * The audit-safe label that `/healthz` exposes. The value is
+   * operator-supplied and MUST be `"oauth"` (or a future backend
+   * label) so the health probe reports the selected backend. The
+   * label MUST NOT include tokens, `kid`, JWKS URL, or authority
+   * URL.
    */
-  authorityBackend?: "local" | "jwks" | "oauth";
-  /**
-   * @deprecated Prefer `authority`. Kept so the v1 caller pattern
-   * (existing app code, existing tests) keeps compiling and
-   * running. The shared base builds a `LocalRosterAuthority` from
-   * these two fields when `authority` is absent. Production
-   * callers SHOULD migrate to `authority` so the wire contract
-   * matches the resource-server-side `mcp-token-authority` spec.
-   * `readonly` because the constructor copies them into a
-   * `LocalRosterAuthority`; mutating the array after construction
-   * is not supported.
-   */
-  agents?: readonly AgentRecord[];
-  /**
-   * @deprecated Prefer `authority`. The shared HMAC secret for
-   * the local backend. Used only when `authority` is absent;
-   * ignored when `authority` is provided. Minimum 32 bytes of
-   * entropy (enforced by `LocalRosterAuthority`'s constructor).
-   */
-  hmacSecret?: string;
+  authorityBackend?: "oauth" | "jwks";
   sessionMode: SessionMode;
   logger: Logger;
   shutdownTimeoutMs: number;
@@ -163,38 +127,15 @@ const STATUS_BAD_REQUEST = 400;
 /**
  * Resolve the `TokenAuthority` the middleware delegates to.
  *
- * Phase 1a adds `authority` to `HttpMcpServerOptions` as the
- * preferred wire contract. The legacy `agents` + `hmacSecret`
- * fields are still accepted for back-compat (existing v1 tests
- * and the `mcp-readonly-sql` app's HTTP config loader) — they
- * are wrapped in a `LocalRosterAuthority` internally so the
- * middleware calls `authority.verify(token)` either way.
- *
- * The function throws if neither pattern is provided (fail
- * closed: the shared base MUST NOT start without a verification
- * backend) or if the legacy pattern is partially provided
- * (either `agents` or `hmacSecret` without the other).
+ * The shared base requires `authority` directly. The function exists
+ * as a single fail-closed seam so every error message a caller sees
+ * is in one place.
  */
 function resolveAuthority(options: HttpMcpServerOptions): TokenAuthority {
   if (options.authority) return options.authority;
-  if (options.agents && options.hmacSecret) {
-    return new LocalRosterAuthority({
-      agents: [...options.agents],
-      hmacSecret: options.hmacSecret,
-      logger: options.logger,
-    });
-  }
-  // Neither pattern is fully configured. This is a programming
-  // error in the caller: the v1 contract required
-  // `agents` + `hmacSecret`; Phase 1a's new contract requires
-  // `authority`. Refusing to start is the safe default — the
-  // alternative (an implicit permissive default) would be a
-  // silent misconfiguration leak. The error message names both
-  // options so the operator can fix it.
   throw new Error(
-    "createHttpMcpServer: either `authority` (TokenAuthority) or `agents` + `hmacSecret` " +
-      "(local backend inputs) must be provided. See " +
-      "@customized-mcps/mcp-http-base `HttpMcpServerOptions` for the contract.",
+    "createHttpMcpServer: `authority` (TokenAuthority) is required. " +
+      "See @customized-mcps/mcp-http-base `HttpMcpServerOptions` for the contract.",
   );
 }
 
@@ -215,12 +156,11 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
   let unhealthy = false;
   const maxBodyBytes = options.maxBodyBytes ?? 1024 * 1024; // 1 MiB
   const allowUnboundedBody = options.allowUnboundedBody ?? false;
-  // Phase 1a: resolve the `TokenAuthority` once at construction time.
-  // If the caller passed `authority` directly, use it. Otherwise build
-  // a `LocalRosterAuthority` from the legacy `agents` + `hmacSecret`
-  // fields so the v1 caller pattern keeps working. Exactly one of the
-  // two paths is exercised per server; this matches the
-  // resource-server-side contract in `mcp-token-authority`.
+  // Resolve the `TokenAuthority` once at construction time. The
+  // middleware calls `authority.verify(token, context)` for every
+  // request; the typed errors thrown by `verify` map to 401
+  // (`TokenInvalidError`) or 503 (`AuthorityUnavailableError`) via
+  // the catch block in `handleMcpRequest`.
   const authority: TokenAuthority = resolveAuthority(options);
   // One-shot warning so operators see exactly one log line the first
   // time a chunked request (no Content-Length) reaches the shared base
@@ -500,13 +440,10 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
       return;
     }
     const token = authHeader.slice("Bearer ".length).trim();
-    // Phase 1a: the middleware delegates to the resolved
-    // `TokenAuthority`. The typed errors thrown by `verify` map to
-    // 401 (`TokenInvalidError`) or 503 (`AuthorityUnavailableError`)
-    // via the catch block below. The middleware MUST NOT call
-    // `validateBearer` directly — that path is now an implementation
-    // detail of `LocalRosterAuthority` per the
-    // `external-token-authority-verification` change.
+    // The middleware delegates to the resolved `TokenAuthority`.
+    // The typed errors thrown by `verify` map to 401
+    // (`TokenInvalidError`) or 503 (`AuthorityUnavailableError`)
+    // via the catch block below.
     //
     // Phase 1b (W1 remediation): the middleware also passes a
     // `VerifyContext` with the sanitized X-Request-Id so the
@@ -673,7 +610,7 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
     }
     const body = JSON.stringify({
       status,
-      authorityBackend: options.authorityBackend ?? "local",
+      authorityBackend: options.authorityBackend ?? "oauth",
     });
     if (status === "ok") {
       res.statusCode = 200;

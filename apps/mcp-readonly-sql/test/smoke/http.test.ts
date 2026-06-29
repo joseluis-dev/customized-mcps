@@ -4,18 +4,22 @@
  * Spec coverage:
  * - 4.1 HTTP smoke test: end-to-end smoke against the built `dist/index.js`
  *   on an ephemeral port. Verifies:
- *     1. Valid agent -> POST /mcp returns 200 (or endpoint behavior)
+ *     1. Valid JWT (minted by the in-process stub authority) -> POST /mcp
+ *        returns 200 (or endpoint behavior)
  *     2. Missing auth -> 401
  *     3. Wrong token -> 401
- *     4. Valid auth -> 200 (the spec phrases this as "valid auth but wrong
- *        scope -> 403"; the v1 implementation does NOT reject scope
- *        mismatches at the HTTP wire layer (scope is enforced at the tool
- *        level, not the transport level), so the smoke test asserts the
- *        actually-observed behavior: a request that authenticates against
- *        a known agent reaches the tool layer and returns 200)
+ *     4. Valid auth -> 200
  *     5. SIGTERM -> /healthz flips to 503 (during the drain window) ->
  *        process exits 0
  *     6. Stateless mode is the default (per PR1 re-review B1)
+ *
+ * The local HMAC roster backend was removed. The smoke suite now
+ * stands up a minimal in-process OAuth authority (JWKS + introspect)
+ * that the resource server is wired against. The resource server's
+ * `OAuthAdminAuthority.warm()` probes both endpoints at startup;
+ * the smoke test mints a real RS256 JWT signed with the stub
+ * authority's key and exercises the resource server's verify path
+ * end-to-end.
  *
  * Strict TDD: every test below is a real assertion against the built
  * production binary (`dist/index.js`). If the binary regresses, the test
@@ -26,32 +30,77 @@
  *   run before `pnpm build`).
  * - Allocates a free port via `net.createServer().listen(0)` so the
  *   suite does not collide with other services on the host.
- * - Uses HMAC SHA-256 to compute the agent's `keyHash` exactly the way
- *   the production code does.
+ * - Generates an RS256 keypair with jose; the stub authority serves
+ *   the matching JWKS and a `{ active: false }` introspect response.
  */
 
-import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { spawn, type ChildProcess } from "node:child_process";
-import { createHmac } from "node:crypto";
 import { createServer as netCreateServer } from "node:net";
-import { request as httpRequest, type IncomingMessage } from "node:http";
+import { request as httpRequest, createServer as httpCreateServer, type IncomingMessage, type Server } from "node:http";
 import { existsSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import {
+  generateKeyPair,
+  exportJWK,
+  exportPKCS8,
+  calculateJwkThumbprint,
+  SignJWT,
+  importPKCS8,
+} from "jose";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
-const HMAC_SECRET = "smoke-test-hmac-secret-32-bytes-or-more!!";
-const VALID_TOKEN = "smoke-token-valid";
+const TEST_AUDIENCE = "mcp-readonly-sql";
+const VALID_TOKEN_SUB = "smoke-agent";
 const WRONG_TOKEN = "smoke-token-wrong";
-const VALID_AGENT_ID = "smoke-agent";
 
-function computeKeyHash(token: string): string {
-  return createHmac("sha256", HMAC_SECRET).update(token).digest("hex");
+/**
+ * Build the OAuth env-var block the smoke test passes to
+ * `startHttpServer`. Centralised so the four call sites stay in sync
+ * (the JWKS TTL / leeway / fetch-timeout values are constant for
+ * the smoke suite; only the test-relative `MCP_AUTHORITY_URL`
+ * differs per call).
+ */
+function oauthEnv(auth: StubAuthority): Record<string, string> {
+  return {
+    MCP_AUTHORITY_URL: auth.baseUrl,
+    MCP_AUTHORITY_AUDIENCE: TEST_AUDIENCE,
+    MCP_AUTHORITY_JWKS_TTL_S: "60",
+    MCP_AUTHORITY_LEEWAY_S: "30",
+    MCP_AUTHORITY_FETCH_TIMEOUT_MS: "5000",
+  };
 }
 
-const VALID_KEY_HASH = computeKeyHash(VALID_TOKEN);
+/**
+ * Locate `dist/index.js` by walking up from this test file until we hit
+ * the `apps/mcp-readonly-sql/package.json` marker. Mirrors the helper in
+ * `monorepoStructure.test.ts` so the smoke suite works regardless of
+ * how vitest resolves the test path.
+ */
+function findAppRoot(start: string): string | null {
+  let dir = start;
+  for (let i = 0; i < 8; i++) {
+    if (existsSync(join(dir, "package.json"))) {
+      try {
+        const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { name?: string };
+        if (pkg.name === "mcp-readonly-sql") return dir;
+      } catch {
+        // ignore parse errors and keep walking up
+      }
+    }
+    const parent = dirname(dir);
+    if (parent === dir) return null;
+    dir = parent;
+  }
+  return null;
+}
+
+const appRoot = findAppRoot(__dirname);
+const distIndex = appRoot ? join(appRoot, "dist", "index.js") : null;
+const distExists = distIndex !== null && existsSync(distIndex);
 
 /**
  * Allocate a free TCP port by listening on port 0 and reading the OS-
@@ -121,44 +170,84 @@ function http(
 }
 
 /**
- * Locate `dist/index.js` by walking up from this test file until we hit
- * the `apps/mcp-readonly-sql/package.json` marker. Mirrors the helper in
- * `monorepoStructure.test.ts` so the smoke suite works regardless of
- * how vitest resolves the test path.
+ * Stub authority: a `node:http` listener that serves a real
+ * `/oauth/introspect` (returns `{ active: false }`) and a real
+ * `/.well-known/jwks.json` (returns the JWK derived from the
+ * keypair we generated for this test). The resource server's
+ * `OAuthAdminAuthority.warm()` probes both endpoints at startup.
  */
-function findAppRoot(start: string): string | null {
-  let dir = start;
-  for (let i = 0; i < 8; i++) {
-    if (existsSync(join(dir, "package.json"))) {
-      try {
-        const pkg = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as { name?: string };
-        if (pkg.name === "mcp-readonly-sql") return dir;
-      } catch {
-        // ignore parse errors and keep walking up
-      }
+type StubAuthority = {
+  baseUrl: string;
+  port: number;
+  server: Server;
+  privatePem: string;
+  kid: string;
+  close: () => Promise<void>;
+};
+
+async function startStubAuthority(): Promise<StubAuthority> {
+  const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
+  const publicJwk = await exportJWK(publicKey);
+  const kid = await calculateJwkThumbprint(publicJwk);
+  publicJwk.kid = kid;
+  publicJwk.alg = "RS256";
+  publicJwk.use = "sig";
+  const privatePem = await exportPKCS8(privateKey);
+  const port = await getFreePort();
+  const jwks = JSON.stringify({ keys: [publicJwk] });
+  const server = httpCreateServer((req, res) => {
+    if (req.url === "/.well-known/jwks.json" && req.method === "GET") {
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      res.end(jwks);
+      return;
     }
-    const parent = dirname(dir);
-    if (parent === dir) return null;
-    dir = parent;
-  }
-  return null;
+    if (req.url === "/oauth/introspect" && req.method === "POST") {
+      // The probe body is `token=` (empty). We respond with
+      // `{ active: false }` per RFC 7662.
+      res.statusCode = 200;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ active: false }));
+      return;
+    }
+    res.statusCode = 404;
+    res.setHeader("Content-Type", "application/json");
+    res.end(JSON.stringify({ error: "not_found" }));
+  });
+  await new Promise<void>((resolveP) =>
+    server.listen(port, "127.0.0.1", () => resolveP()),
+  );
+  return {
+    baseUrl: `http://127.0.0.1:${port}`,
+    port,
+    server,
+    privatePem,
+    kid,
+    close: async () => {
+      await new Promise<void>((resolveP, rejectP) => {
+        server.close((err) => (err ? rejectP(err) : resolveP()));
+      });
+    },
+  };
 }
 
-const appRoot = findAppRoot(__dirname);
-const distIndex = appRoot ? join(appRoot, "dist", "index.js") : null;
-const distExists = distIndex !== null && existsSync(distIndex);
-
 /**
- * The agent config that goes into MCP_AGENTS_INLINE. Two records so we
- * can also exercise the multi-agent case if a future test wants to.
+ * Mint a real RS256 JWT signed with the stub authority's private
+ * key. The token's `iss` is the authority base URL; the `aud` is
+ * `TEST_AUDIENCE`; the `sub` is `VALID_TOKEN_SUB`.
  */
-const AGENTS_INLINE = JSON.stringify([
-  {
-    id: VALID_AGENT_ID,
-    keyHash: VALID_KEY_HASH,
-    scopes: ["read:*", "list:*"],
-  },
-]);
+async function mintValidToken(auth: StubAuthority): Promise<string> {
+  const now = Math.floor(Date.now() / 1000);
+  return await new SignJWT({ scopes: ["read:*", "list:*"] })
+    .setProtectedHeader({ alg: "RS256", kid: auth.kid, typ: "JWT" })
+    .setIssuer(auth.baseUrl)
+    .setAudience(TEST_AUDIENCE)
+    .setSubject(VALID_TOKEN_SUB)
+    .setIssuedAt(now)
+    .setNotBefore(now)
+    .setExpirationTime(now + 3600)
+    .sign(await importPKCS8(auth.privatePem, "RS256"));
+}
 
 /**
  * Spawn the built app with the right env. Returns the child process and
@@ -178,7 +267,7 @@ type StartedServer = {
   getStderr: () => string;
 };
 
-async function startHttpServer(): Promise<StartedServer> {
+async function startHttpServer(env: Record<string, string>): Promise<StartedServer> {
   if (!distIndex) {
     throw new Error("app root not discovered; cannot start http server");
   }
@@ -193,22 +282,7 @@ async function startHttpServer(): Promise<StartedServer> {
         MCP_HTTP_HOST: "127.0.0.1",
         MCP_HTTP_PORT: String(port),
         MCP_HTTP_STATELESS: "true",
-        MCP_AGENT_HMAC_SECRET: HMAC_SECRET,
-        // Explicitly clear the local-roster JSON file
-        // (the user's local .env may still point at the
-        // removed sample file). The shared config layer
-        // treats an empty string as "unset" (see
-        // `nonEmpty` in `packages/mcp-http-base/src/
-        // config.ts`), so the loader falls through to
-        // MCP_AGENTS_INLINE. PR 3 of
-        // oauth-sqlite-admin-authorization removed the
-        // sample roster file (`mcp-readonly-sql.agents.
-        // json`) from the repo; the user's local .env
-        // may still reference the now-missing path,
-        // and the explicit empty value here is the
-        // portable override.
-        MCP_AGENTS_JSON: "",
-        MCP_AGENTS_INLINE: AGENTS_INLINE,
+        ...env,
       },
       stdio: ["ignore", "pipe", "pipe"],
     },
@@ -277,36 +351,46 @@ describe("smoke/http - Phase 4 cross-PR verification", () => {
   }
 
   describe("GET /healthz", () => {
+    let auth: StubAuthority | undefined;
     let started: StartedServer | undefined;
 
     beforeEach(async () => {
-      started = await startHttpServer();
+      auth = await startStubAuthority();
+      started = await startHttpServer(oauthEnv(auth));
     });
 
     afterEach(async () => {
       if (started) await stopHttpServer(started.proc);
+      if (auth) await auth.close();
     });
 
-    it("returns 200 with status=ok and authorityBackend=local before SIGTERM (proves the app bound and the listener is reachable)", async () => {
+    it("returns 200 with status=ok and authorityBackend=oauth before SIGTERM (proves the app bound and the listener is reachable)", async () => {
       // Phase 1b: the health endpoint returns JSON with the
       // `authorityBackend` field (per the mcp-token-authority spec).
+      // The default is "oauth" after the local HMAC roster was
+      // removed.
       const res = await http("GET", started!.port, "/healthz");
       expect(res.status).toBe(200);
       const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
       expect(body.status).toBe("ok");
-      expect(body.authorityBackend).toBe("local");
+      expect(body.authorityBackend).toBe("oauth");
     });
   });
 
   describe("POST /mcp auth contract", () => {
+    let auth: StubAuthority | undefined;
     let started: StartedServer | undefined;
+    let validToken: string;
 
     beforeEach(async () => {
-      started = await startHttpServer();
+      auth = await startStubAuthority();
+      validToken = await mintValidToken(auth);
+      started = await startHttpServer(oauthEnv(auth));
     });
 
     afterEach(async () => {
       if (started) await stopHttpServer(started.proc);
+      if (auth) await auth.close();
     });
 
     it("returns 401 with a JSON-RPC envelope when Authorization is missing", async () => {
@@ -321,8 +405,8 @@ describe("smoke/http - Phase 4 cross-PR verification", () => {
       expect(envelope.error).toBeDefined();
       expect(typeof envelope.error.code).toBe("number");
       expect(envelope.id).toBeNull();
-      expect(res.body).not.toContain(VALID_TOKEN);
-      expect(res.body).not.toContain(HMAC_SECRET);
+      // No token fragment in the body.
+      expect(res.body).not.toContain(validToken);
     });
 
     it("returns 401 with no token fragment in the body when the bearer is wrong", async () => {
@@ -351,7 +435,7 @@ describe("smoke/http - Phase 4 cross-PR verification", () => {
         {
           "Content-Type": "application/json",
           Accept: "application/json, text/event-stream",
-          Authorization: `Bearer ${VALID_TOKEN}`,
+          Authorization: `Bearer ${validToken}`,
         },
         JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
       );
@@ -375,18 +459,23 @@ describe("smoke/http - Phase 4 cross-PR verification", () => {
           "describe_schema",
         ]),
       );
+      // The JWT does NOT leak into the response body.
+      expect(res.body).not.toContain(validToken);
     });
   });
 
   describe("stateless session mode is the default", () => {
+    let auth: StubAuthority | undefined;
     let started: StartedServer | undefined;
 
     beforeEach(async () => {
-      started = await startHttpServer();
+      auth = await startStubAuthority();
+      started = await startHttpServer(oauthEnv(auth));
     });
 
     afterEach(async () => {
       if (started) await stopHttpServer(started.proc);
+      if (auth) await auth.close();
     });
 
     it("advertises sessionMode=stateless in the startup log (PR1 re-review B1)", async () => {
@@ -399,7 +488,8 @@ describe("smoke/http - Phase 4 cross-PR verification", () => {
 
   describe("shutdown lifecycle (POSIX SIGTERM / Windows forced kill)", () => {
     it("the listener stops accepting connections once the process is asked to terminate", async () => {
-      const started = await startHttpServer();
+      const auth = await startStubAuthority();
+      const started = await startHttpServer(oauthEnv(auth));
 
       const beforeRes = await http("GET", started.port, "/healthz");
       expect(beforeRes.status).toBe(200);
@@ -453,6 +543,7 @@ describe("smoke/http - Phase 4 cross-PR verification", () => {
         // expect code === 0.
         expect(exitCode.code).toBe(0);
       }
+      await auth.close();
     });
   });
 });
