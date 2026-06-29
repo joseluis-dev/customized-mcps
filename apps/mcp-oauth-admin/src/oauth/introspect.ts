@@ -54,9 +54,21 @@ export function createIntrospectHandler(
     }
     const params = await readFormBody(req);
     const token = params.get("token") ?? "";
-    if (!token) {
-      return writeJson(res, 400, { error: "invalid_request" });
-    }
+    // Empty / missing `token` is a valid RFC 7662 request:
+    // the spec says the server MUST return
+    // `{ active: false }` (NOT 400). The resource
+    // server's `OAuthAdminAuthority.warm()` probe
+    // sends `token=` to confirm the endpoint is
+    // alive; a 400 here would fail the probe (the
+    // wrapper expects a 200 + `{active: false}`).
+    //
+    // This is the canonical RFC 7662 behavior: the
+    // `introspect()` function already handles an
+    // empty token by returning `{ active: false }`;
+    // the previous short-circuit was a defense-in-
+    // depth that was too aggressive. The fix is to
+    // delegate the empty-token case to `introspect()`
+    // so the response shape is uniform.
     const result = await introspect(deps, token);
     return writeJson(res, 200, result);
   };

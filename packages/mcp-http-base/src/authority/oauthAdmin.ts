@@ -82,9 +82,15 @@ export class OAuthAdminAuthority extends JwksAuthority {
     // empty value — the authority MUST accept the empty
     // string and return `{ active: false }`; this is the
     // documented "is the authority alive?" check).
-    const issuer = (this as unknown as { issuer: string }).issuer;
+    //
+    // PR 3 W4: the `issuer` and `fetchTimeoutMs` fields are
+    // now `protected readonly` on `JwksAuthority` so the
+    // wrapper reads them directly (no TypeScript cast to
+    // `unknown`). The cast was a PR 1 footgun: any rename
+    // of the parent field would silently break the wrapper.
+    const issuer = this.issuer;
     const introspectUrl = new URL("/oauth/introspect", issuer).toString();
-    const fetchTimeoutMs = (this as unknown as { fetchTimeoutMs: number }).fetchTimeoutMs;
+    const fetchTimeoutMs = this.fetchTimeoutMs;
     let res: Response;
     try {
       res = await fetchWithTimeout(introspectUrl, fetchTimeoutMs, {

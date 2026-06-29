@@ -44,12 +44,12 @@ Chain strategy: stacked-to-main
 - [x] 3.5 Test audit viewer paginate, filter, redact; 91d row swept; implement + refactor templates.
 
 ## Phase 4: Migrate readonly-sql (PR 3)
-- [ ] 4.1 Test: `MCP_AUTHORITY_URL` set, verified JWT scopes authorize only; missing scope denies.
-- [ ] 4.2 Wire `apps/mcp-readonly-sql/src/{config/http,transports/http}.ts`; local roster fallback.
-- [ ] 4.3 Test `Authority Isolation`: no import/symlink/workspace-dep on `apps/mcp-oauth-admin`.
+- [x] 4.1 Test: `MCP_AUTHORITY_URL` set, verified JWT scopes authorize only; missing scope denies.
+- [x] 4.2 Wire `apps/mcp-readonly-sql/src/{config/http,transports/http}.ts`; local roster fallback.
+- [x] 4.3 Test `Authority Isolation`: no import/symlink/workspace-dep on `apps/mcp-oauth-admin`.
 
 ## Phase 5: Remove local roster + deploy (PR 3)
-- [ ] 5.1 Test one-shot WARN naming `MCP_AGENTS_JSON`/`MCP_AGENTS_INLINE`/`MCP_AGENT_HMAC_SECRET`; implement.
-- [ ] 5.2 Test `mcp-agent-authorization` deltas: no env widening; remove `mcp-readonly-sql.agents.json`; update `.env.example`.
-- [ ] 5.3 Test port 3002 default; reserve 3002; ship systemd + Dockerfile for authority; update nginx + README; verify.
-- [ ] 5.4 E2E: authority (3002) + readonly-sql (3001); JWT works, missing scope 401, authority down 503.
+- [x] 5.1 Test one-shot WARN naming `MCP_AGENTS_JSON`/`MCP_AGENTS_INLINE`/`MCP_AGENT_HMAC_SECRET`; implement.
+- [x] 5.2 Test `mcp-agent-authorization` deltas: no env widening; remove `mcp-readonly-sql.agents.json`; update `.env.example`.
+- [x] 5.3 Test port 3002 default; reserve 3002; ship systemd + Dockerfile for authority; update nginx + README; verify.
+- [x] 5.4 E2E: authority (3002) + readonly-sql (3001); JWT works, missing scope 401, authority down 503.

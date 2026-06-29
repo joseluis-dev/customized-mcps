@@ -1,0 +1,99 @@
+[Unit]
+Description=mcp-oauth-admin (OAuth2 AS + SQLite identity store + web admin UI)
+Documentation=https://modelcontextprotocol.io
+After=network-online.target
+Wants=network-online.target
+
+# mcp-oauth-admin is the OAuth2 authority for the customized-mcps
+# workspace. It MUST be the only writer of the SQLite file at
+# `${MCP_OAUTH_DB_PATH:-/var/lib/mcp/oauth.sqlite}`. The unit reads
+# its env from the per-app env file (the same file dotenv loads at
+# startup), binds 127.0.0.1 by default, and lets the existing
+# reverse proxy handle TLS termination (see deploy/nginx/mcp.conf).
+#
+# The shared @customized-mcps/mcp-http-base installs SIGTERM/SIGINT
+# handlers in start() and drains in-flight requests before exiting.
+# The audit-log retention sweep + online backup run inside the
+# process; no cron is required.
+#
+# Per the mcp-deployment-templates spec, the unit runs as the
+# dedicated unprivileged `mcp` user, restarts on failure with a
+# backoff, hardens the process namespace, and uses
+# `WantedBy=multi-user.target` for `systemctl enable`.
+
+[Service]
+Type=simple
+
+# Run as the dedicated unprivileged user. The `mcp` user MUST exist
+# and have no interactive shell:
+#   useradd --system --no-create-home --shell /sbin/nologin mcp
+# The runbook (deploy/README.md) documents the exact bootstrap commands.
+User=mcp
+Group=mcp
+
+# App install path. Override the path here for staged deployments;
+# the app is single-process, so each host runs ONE instance per app
+# per port. The mcp-oauth-admin unit runs on port 3002 by convention
+# (the mcp-http-transport spec reserves 3002 for the authority).
+WorkingDirectory=/opt/mcp/oauth/apps/mcp-oauth-admin
+
+# Per-app env file. The operator mounts /etc/mcp/mcp-oauth-admin.env
+# at install time; the same file the app loads via dotenv at startup.
+# Operators that prefer to keep the env in the app directory can
+# adjust this directive; the runbook documents the convention.
+EnvironmentFile=/etc/mcp/mcp-oauth-admin.env
+
+# node is the LTS line installed at /usr/bin/node on standard
+# Debian/Ubuntu hosts. Operators using nvm or a version manager
+# should adjust this to their absolute node path.
+ExecStart=/usr/bin/node dist/index.js
+
+# Restart on failure with a backoff. Successful stops (exit 0) do
+# NOT trigger a restart; only non-zero exits do. RestartSec=5 is
+# the minimum sensible backoff; raise it for noisy environments.
+Restart=on-failure
+RestartSec=5
+
+# Allow up to 15s for the graceful drain to complete
+# (MCP_HTTP_SHUTDOWN_TIMEOUT_MS default 10000 plus a small buffer).
+# After this, systemd force-kills the process.
+TimeoutStopSec=15
+KillMode=mixed
+KillSignal=SIGTERM
+
+# ---- Hardening ----
+# Defense-in-depth on top of the unprivileged user. These directives
+# follow the systemd.service(5) hardening checklist; each one is a
+# well-known footgun mitigator. The directory-mode flags let the
+# process write to its install path (the SQLite file + backup target
+# live there); /tmp and /home stay protected.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+# The app writes the SQLite file + backup target + session secret
+# under its install path. Narrow ReadWritePaths to that path only
+# so a code-execution bug cannot exfiltrate to /etc, /var, or other
+# privileged locations.
+ReadWritePaths=/opt/mcp/oauth/apps/mcp-oauth-admin
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+RestrictRealtime=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+
+# stdout/stderr to journal. In HTTP mode the app writes logs to
+# stderr only (stdout is reserved for the transport stream);
+# journalctl is the operator's view. See deploy/README.md →
+# "Read the structured logs".
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=mcp-oauth-admin
+
+[Install]
+WantedBy=multi-user.target

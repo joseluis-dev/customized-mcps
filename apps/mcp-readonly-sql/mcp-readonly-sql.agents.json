@@ -1,7 +1,0 @@
-[
-  {
-    "id": "local-agent",
-    "keyHash": "1d313484e2091c459ca464b74d67679990a30431b4911155fff5979650c0ed88",
-    "scopes": ["read:bi_catastro", "list:*"]
-  }
-]

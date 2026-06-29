@@ -203,7 +203,7 @@ export function createAdminRouter(
         return serveDashboard(deps, res, session);
       }
       if (url === ADMIN_PATHS.CHANGE_PASSWORD && req.method === "GET") {
-        return serveChangePassword(res, session);
+        return serveChangePassword(deps, res, session);
       }
       if (url === ADMIN_PATHS.CHANGE_PASSWORD && req.method === "POST") {
         return handleChangePassword(deps, body, req, res, session);
@@ -447,23 +447,32 @@ async function handleLogout(
   return redirect(res, "/admin/login");
 }
 
-function serveChangePassword(res: ServerResponse, session: AdminSession): void {
+async function serveChangePassword(
+  deps: AdminRouterDeps,
+  res: ServerResponse,
+  session: AdminSession,
+): Promise<void> {
+  // The current password is required UNLESS the
+  // session is for a bootstrap admin in the rotation
+  // flow. We re-read the flag from the DB on every
+  // page render so a future admin's
+  // `changeOwnPassword` call (which clears the flag)
+  // is reflected on the next GET without requiring
+  // a re-login. PR 3 of
+  // `oauth-sqlite-admin-authorization` refactored
+  // this away from the previous "currentRequired:
+  // true" hardcode (W7) so the form is rendered
+  // correctly for the bootstrap-rotation case.
+  const agent = await getAgentById(deps.db, session.userId);
+  const currentRequired = agent === null
+    ? true
+    : !agent.requireChangeOnFirstLogin;
   writeHtml(
     res,
     200,
     renderChangePasswordPage({
       csrfToken: session.csrfToken,
-      // The current password is required UNLESS the
-      // session is for a bootstrap admin in the rotation
-      // flow. The router's `session.requireChangeOnFirstLogin`
-      // does not exist; the flag is read from the DB
-      // row on every page render. We keep the GET
-      // handler simple and look up the row.
-      // For the GET path, the caller is expected to
-      // have just logged in; the redirect from
-      // /admin/login already confirmed the flag is set.
-      // We re-read the flag here for correctness.
-      currentRequired: true, // updated by the handler
+      currentRequired,
       error: null,
     }),
   );

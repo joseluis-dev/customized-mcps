@@ -194,6 +194,20 @@ async function startHttpServer(): Promise<StartedServer> {
         MCP_HTTP_PORT: String(port),
         MCP_HTTP_STATELESS: "true",
         MCP_AGENT_HMAC_SECRET: HMAC_SECRET,
+        // Explicitly clear the local-roster JSON file
+        // (the user's local .env may still point at the
+        // removed sample file). The shared config layer
+        // treats an empty string as "unset" (see
+        // `nonEmpty` in `packages/mcp-http-base/src/
+        // config.ts`), so the loader falls through to
+        // MCP_AGENTS_INLINE. PR 3 of
+        // oauth-sqlite-admin-authorization removed the
+        // sample roster file (`mcp-readonly-sql.agents.
+        // json`) from the repo; the user's local .env
+        // may still reference the now-missing path,
+        // and the explicit empty value here is the
+        // portable override.
+        MCP_AGENTS_JSON: "",
         MCP_AGENTS_INLINE: AGENTS_INLINE,
       },
       stdio: ["ignore", "pipe", "pipe"],

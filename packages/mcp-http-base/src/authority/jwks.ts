@@ -106,13 +106,23 @@ export type JwksAuthorityOptions = {
  * middleware cannot be wired against a permissive default.
  */
 export class JwksAuthority implements TokenAuthority {
-  private readonly issuer: string;
-  private readonly jwksUrl: URL;
-  private readonly audience: string;
-  private readonly ttlMs: number;
-  private readonly leewaySeconds: number;
-  private readonly fetchTimeoutMs: number;
-  private readonly logger: Logger;
+  // `protected` (not `private`) so the `OAuthAdminAuthority` wrapper
+  // can read `issuer` and `fetchTimeoutMs` without a TypeScript cast
+  // to `unknown`. The cast was a PR 1 W4 footgun: any future rename
+  // of these fields would silently break the wrapper. The values
+  // are configuration-derived (not secret-bearing), so widening the
+  // visibility to subclasses is safe. The wrapper is the only
+  // subclass in the package; if a future third party subclasses
+  // `JwksAuthority`, the same field surface is exposed (a public
+  // getter would be over-broad — these are internal contract values
+  // for the override path, not a public API).
+  protected readonly issuer: string;
+  protected readonly jwksUrl: URL;
+  protected readonly audience: string;
+  protected readonly ttlMs: number;
+  protected readonly leewaySeconds: number;
+  protected readonly fetchTimeoutMs: number;
+  protected readonly logger: Logger;
   // jose's resolver. The `reload()` method clears the cache so the
   // next call re-fetches. We use it to implement the kid-miss
   // refetch flow.

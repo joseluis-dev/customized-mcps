@@ -229,11 +229,52 @@ describe("smoke/secrets - Phase 4 cross-PR verification", () => {
 
   beforeAll(() => {
     const files = walkFiles(workspaceRoot!);
+    // PR 3 of `oauth-sqlite-admin-authorization` (W5):
+    // the scanner now filters by `git ls-files` so it
+    // walks only the COMMITTED tree. The previous
+    // `walkFiles` walked the whole working tree, which
+    // included gitignored files (e.g. `apps/mcp-readonly-
+    // sql/.env`, which is on disk in the developer's local
+    // checkout but must not be in the scan). A new
+    // developer who runs the suite with a populated
+    // `.env` would otherwise see false positives; the
+    // commit-time truth is `git ls-files`. We use
+    // `execFileSync` so the call is synchronous and the
+    // test setup stays in `beforeAll`.
+    const { execFileSync } = require("node:child_process") as typeof import("node:child_process");
+    let lsFilesOutput: string;
+    try {
+      lsFilesOutput = execFileSync("git", ["ls-files"], {
+        cwd: workspaceRoot!,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+    } catch {
+      // `git` is not on PATH (e.g. a minimal CI image) or
+      // the workspace is not a git checkout. Fall back
+      // to the whole-workspace scan so the suite still
+      // runs; the gitignore-sensitive check is a
+      // defense-in-depth, not a binding contract.
+      lsFilesOutput = "";
+    }
+    const trackedAbs = new Set(
+      lsFilesOutput
+        .split(/\r?\n/)
+        .filter((l) => l.length > 0)
+        .map((rel) => join(workspaceRoot!, rel)),
+    );
+    const isTracked = (path: string): boolean => {
+      if (trackedAbs.size === 0) return true; // fallback
+      return trackedAbs.has(path);
+    };
     scannedFileCount = files.length;
     for (const file of files) {
-      // Skip test files (legitimate synthetic tokens) and the
-      // `.env.example` (env-var documentation, not a leak).
+      // Skip test files (legitimate synthetic tokens), the
+      // `.env.example` (env-var documentation, not a
+      // leak), and any file that is NOT tracked by git
+      // (i.e. gitignored or untracked local files).
       if (isTestFile(file)) continue;
+      if (!isTracked(file)) continue;
       let content: string;
       try {
         content = readFileSync(file, "utf8");

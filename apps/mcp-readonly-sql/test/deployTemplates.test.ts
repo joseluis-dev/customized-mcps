@@ -455,18 +455,35 @@ describe("deploy templates (PR3) — mcp-deployment-templates spec", () => {
     }
 
     function extractEnvExampleNames(): Set<string> {
-      if (!existsSync(envExamplePath)) {
-        throw new Error(`.env.example not found at ${envExamplePath}`);
-      }
-      const text = readFileSync(envExamplePath, "utf8");
+      // PR 3 of `oauth-sqlite-admin-authorization` makes
+      // the runbook a multi-app document; the union of
+      // env vars from BOTH apps' .env.example files is
+      // the "documented" set. The per-app .env.example
+      // is the env-var source of truth; the runbook
+      // documents the workspace as a whole.
       const names = new Set<string>();
-      // Match both active lines (`MCP_FOO=bar`) and commented examples
-      // (`# MCP_FOO=bar`). A commented line in `.env.example` is still a
-      // documented var — the operator uncomments it to enable the value.
-      for (const m of text.matchAll(
-        /^\s*#?\s*(MCP_[A-Z0-9_]+|DB_[A-Z0-9_]+)=/gm,
-      )) {
-        names.add(m[1]);
+      const paths = [
+        envExamplePath,
+        // The authority's .env.example lives in a
+        // different directory; include it so the
+        // runbook's authority-side env references
+        // (`MCP_OAUTH_*`, `MCP_AUTHORITY_AUDIENCE`)
+        // are recognised as documented.
+        join(workspaceRoot, "apps", "mcp-oauth-admin", ".env.example"),
+      ];
+      for (const p of paths) {
+        if (!existsSync(p)) continue;
+        const text = readFileSync(p, "utf8");
+        // Match both active lines (`MCP_FOO=bar`) and
+        // commented examples (`# MCP_FOO=bar`). A
+        // commented line in `.env.example` is still a
+        // documented var — the operator uncomments it
+        // to enable the value.
+        for (const m of text.matchAll(
+          /^\s*#?\s*(MCP_[A-Z0-9_]+|DB_[A-Z0-9_]+)=/gm,
+        )) {
+          names.add(m[1]);
+        }
       }
       return names;
     }

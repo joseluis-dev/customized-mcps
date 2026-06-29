@@ -230,6 +230,90 @@ function sentinelLocalAuthority(): TokenAuthority {
     },
   };
 }
+
+/**
+ * The one-shot local-roster deprecation WARN text.
+ *
+ * The `mcp-agent-authorization` spec (PR 3 of
+ * `oauth-sqlite-admin-authorization`) requires the resource
+ * server to log a one-shot WARN at startup naming the three
+ * local-roster env vars when the local backend is active. The
+ * WARN points operators at the migration path
+ * (`deploy/README.md` and `mcp-oauth-admin` / the OAuth
+ * authority).
+ *
+ * The text is a pure constant so the helper below can be
+ * unit-tested in isolation; the constant lives in a function
+ * (not a top-level `const`) so a future maintainer can
+ * localise it without changing the test surface.
+ */
+export function localRosterDeprecationWarnMessage(): string {
+  return (
+    "WARN: the local HMAC roster is deprecated and will be removed in a future version. " +
+    "MCP_AGENTS_JSON, MCP_AGENTS_INLINE, and MCP_AGENT_HMAC_SECRET are the deprecated env vars. " +
+    "Migrate to the OAuth admin authority (`mcp-oauth-admin` on port 3002); see deploy/README.md " +
+    "and openspec/changes/oauth-sqlite-admin-authorization/specs/mcp-oauth-authority/spec.md for the migration path."
+  );
+}
+
+/**
+ * Module-level one-shot flag. The spec requires "exactly
+ * once per process"; the lifetime is the module's lifetime
+ * (which IS the process lifetime in production — vitest
+ * tests reset the flag explicitly via
+ * `_resetLocalRosterWarnState`).
+ */
+let _localRosterWarnedThisProcess = false;
+
+/**
+ * Test-only: clear the one-shot flag so a fresh emit is
+ * possible. Production code MUST NOT call this (the spec
+ * forbids re-emitting in a process). The leading underscore
+ * is the convention for "private / test-only" exports.
+ */
+export function _resetLocalRosterWarnState(): void {
+  _localRosterWarnedThisProcess = false;
+}
+
+/**
+ * Test-only: returns the current value of the one-shot
+ * flag. Production code MUST NOT depend on this; it exists
+ * so the test suite can assert the flag flipped after the
+ * first emit and reset after `_resetLocalRosterWarnState`.
+ */
+export function _hasEmittedLocalRosterWarn(): boolean {
+  return _localRosterWarnedThisProcess;
+}
+
+/**
+ * Emit the one-shot local-roster deprecation WARN. The
+ * function is a no-op when the backend is NOT local
+ * (the spec scenario: "the line is not emitted" when
+ * `MCP_AUTHORITY_URL` is set). The function is a no-op on
+ * subsequent calls within the same process (the spec
+ * scenario: "Emitted exactly once per process").
+ *
+ * Returns `true` when the WARN was emitted, `false`
+ * otherwise. The boolean is the test surface; production
+ * callers ignore it.
+ *
+ * The logger argument is a minimal `{ warn(msg: string): void }`
+ * shape so the helper does not depend on the
+ * `@customized-mcps/mcp-http-base` `Logger` interface (the
+ * resource server's stderr-logger in `loadHttpRuntimeConfig`
+ * matches the shape structurally; we keep the helper
+ * dependency-free to make it trivial to unit-test).
+ */
+export function emitLocalRosterDeprecationWarn(
+  backend: AuthorityBackend,
+  logger: { warn: (msg: string) => void },
+): boolean {
+  if (backend !== "local") return false;
+  if (_localRosterWarnedThisProcess) return false;
+  _localRosterWarnedThisProcess = true;
+  logger.warn(localRosterDeprecationWarnMessage());
+  return true;
+}
 /**
  * Pure-from-the-outside function that reads the relevant env vars and
  * returns a validated `HttpRuntimeConfig`. Throws on any constraint
@@ -288,6 +372,12 @@ export async function loadHttpRuntimeConfig(): Promise<HttpRuntimeConfig> {
   // roster is needed). The local backend still needs the
   // agents.
   if (backend === "oauth") {
+    // The local-roster deprecation WARN is suppressed on the
+    // OAuth admin backend (the spec scenario: "the line is
+    // not emitted" when `MCP_AUTHORITY_URL` is set). The
+    // helper is a no-op on non-local backends; the call is
+    // explicit so the wiring is greppable in PR review.
+    emitLocalRosterDeprecationWarn(backend, stderrLogger);
     return {
       ...http,
       agents: [],
@@ -344,6 +434,18 @@ export async function loadHttpRuntimeConfig(): Promise<HttpRuntimeConfig> {
     hmacSecret: http.hmacSecret,
     logger: stderrLogger,
   });
+
+  // Local-roster deprecation WARN (PR 3 of
+  // oauth-sqlite-admin-authorization, Phase 5.1). The spec
+  // mandates: "When the local backend is active, the
+  // resource server MUST log a one-shot WARN at startup
+  // naming MCP_AGENTS_JSON, MCP_AGENTS_INLINE, and
+  // MCP_AGENT_HMAC_SECRET as deprecated. Emitted exactly
+  // once per process; points to deploy/README.md and
+  // mcp-oauth-authority." The helper is one-shot at the
+  // module level so a fresh `loadHttpRuntimeConfig` call
+  // within the same process does NOT re-emit.
+  emitLocalRosterDeprecationWarn(backend, stderrLogger);
 
   return {
     ...http,

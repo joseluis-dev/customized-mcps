@@ -217,4 +217,68 @@ describe("OAuthAdminAuthority", () => {
       });
     }
   });
+
+  // PR 3 W4 regression: the wrapper used to read `issuer` and
+  // `fetchTimeoutMs` via `(this as unknown as { ... })` casts.
+  // The fields are now `protected readonly` on `JwksAuthority`,
+  // so the wrapper reads them directly. This test pins both the
+  // type-safety (the test would not compile if the fields were
+  // `private` again) and the runtime values (the wrapper's
+  // introspect probe must hit the right host with the right
+  // timeout).
+  it("W4 regression: subclass reads protected issuer + fetchTimeoutMs without a cast and uses them in the probe", async () => {
+    // Subclass that exposes the protected fields via public
+    // accessors. If the parent fields were `private`, this
+    // would not compile. If a future maintainer reverts them
+    // to `private`, the test file would fail to type-check
+    // and the regression would be caught at the build step.
+    class ProbeAuthority extends OAuthAdminAuthority {
+      public exposedIssuer(): string {
+        return this.issuer;
+      }
+      public exposedFetchTimeoutMs(): number {
+        return this.fetchTimeoutMs;
+      }
+    }
+    const auth = new ProbeAuthority({
+      issuer: baseUrl,
+      jwksUrl: `${baseUrl}/.well-known/jwks.json`,
+      audience: "mcp:readonly-sql",
+      ttlSeconds: 60,
+      leewaySeconds: 30,
+      fetchTimeoutMs: 5000,
+      logger: silentLogger(),
+    });
+    // The exposed values match the constructor options (no
+    // mutation). This is the binding contract: the probe
+    // must use the same issuer / timeout the operator wired.
+    expect(auth.exposedIssuer()).toBe(baseUrl);
+    expect(auth.exposedFetchTimeoutMs()).toBe(5000);
+    // And the probe still works end-to-end.
+    await expect(auth.warm()).resolves.toBeUndefined();
+    expect(captured.url).toBe("/oauth/introspect");
+  });
+
+  // PR 3 W4 regression: the source of `OAuthAdminAuthority`
+  // MUST NOT contain a TypeScript cast to `unknown` to read
+  // the parent's `issuer` or `fetchTimeoutMs`. The cast was
+  // the original footgun; this lint pins the new design.
+  it("W4 regression: the source of OAuthAdminAuthority contains no 'as unknown as' cast for parent fields", async () => {
+    const { readFileSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const { resolve, dirname } = await import("node:path");
+    const here = dirname(fileURLToPath(import.meta.url));
+    // Walk up to the package root (test/authority/ -> package root).
+    const pkgRoot = resolve(here, "..", "..");
+    const source = readFileSync(
+      resolve(pkgRoot, "src", "authority", "oauthAdmin.ts"),
+      "utf8",
+    );
+    // The specific forbidden pattern: a cast to access a
+    // parent's private field. Future maintainers that need
+    // a value from the parent should either (a) widen the
+    // parent field to `protected`, or (b) add a `protected
+    // getter` on the parent.
+    expect(source).not.toMatch(/\(\s*this\s+as\s+unknown\s+as\s*\{/);
+  });
 });
