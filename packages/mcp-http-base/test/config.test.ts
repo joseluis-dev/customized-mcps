@@ -4,6 +4,7 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   parseHttpConfig,
+  resolveResourceServerBaseUrl,
   HttpConfigError,
   type HttpConfigInput,
 } from "../src/config.js";
@@ -21,24 +22,25 @@ function baseEnv(overrides: Partial<HttpConfigInput> = {}): HttpConfigInput {
     MCP_HTTP_HOST: "127.0.0.1",
     MCP_HTTP_PORT: "3000",
     MCP_HTTP_PATH: "/mcp",
-    // MCP_HTTP_STATELESS is intentionally left undefined in the default
-    // helper so we can assert the documented default of "stateless=true".
-    // Tests that need to flip the mode set the field explicitly.
+    // Left undefined in the default helper so we can assert the
+    // documented default of `stateless=true`; tests that need to
+    // flip the mode set the field explicitly.
     MCP_HTTP_STATELESS: undefined,
     MCP_HTTP_SHUTDOWN_TIMEOUT_MS: "10000",
     MCP_LOG_FORMAT: "text",
     MCP_HTTP_BEHIND_PROXY: "false",
     MCP_HTTP_ALLOW_INSECURE_BIND: "false",
     MCP_HTTP_ALLOW_INSECURE_LOOPBACK: "false",
-    // Phase 1b (external-token-authority-verification): 6 new authority
-    // env vars. The baseEnv helper leaves them undefined so tests can
-    // assert the "unset" defaults and the "set" overrides independently.
     MCP_AUTHORITY_URL: undefined,
     MCP_AUTHORITY_JWKS_URL: undefined,
     MCP_AUTHORITY_AUDIENCE: undefined,
     MCP_AUTHORITY_JWKS_TTL_S: undefined,
     MCP_AUTHORITY_LEEWAY_S: undefined,
     MCP_AUTHORITY_FETCH_TIMEOUT_MS: undefined,
+    // The resource server's own public base URL. Defaults to undefined
+    // so tests can assert the "unset" path; tests that need a
+    // configured value set it explicitly.
+    MCP_RESOURCE_SERVER_URL: undefined,
     ...overrides,
   };
 }
@@ -155,10 +157,6 @@ describe("parseHttpConfig", () => {
 
   describe("stateless mode and shutdown timeout", () => {
     it("defaults to STATELESS sessions (stateless=true) so the multi-agent transport cache cannot leak sessions across agents", () => {
-      // PR1 review finding: a single cached StreamableHTTPServerTransport
-      // shared its sessionId across all agents. The safe default in v1 is
-      // per-request stateless transport; the stateful cache is the opt-in
-      // and is documented as single-agent only.
       const cfg = parseHttpConfig(baseEnv());
       expect(cfg.stateless).toBe(true);
     });
@@ -409,6 +407,132 @@ describe("parseHttpConfig", () => {
       const cfg = parseHttpConfig(baseEnv());
       expect(cfg.authorityUrl).toBeUndefined();
       expect(cfg.authorityAudience).toBeUndefined();
+    });
+  });
+
+  describe("resource server base URL", () => {
+    // The 401 `WWW-Authenticate` header and the
+    // `/.well-known/oauth-protected-resource` body MUST point at the
+    // resource server's own base URL — NOT at the authority issuer.
+    // The default is the request `Host` header (with `x-forwarded-proto`);
+    // an explicit `MCP_RESOURCE_SERVER_URL` overrides the fallback.
+    // The function is exported as `resolveResourceServerBaseUrl` so
+    // the resource server can re-evaluate it per request (the fallback
+    // uses request headers, which is per-request data).
+
+    it("parses MCP_RESOURCE_SERVER_URL verbatim when set", () => {
+      const cfg = parseHttpConfig(
+        baseEnv({ MCP_RESOURCE_SERVER_URL: "https://mcp.example.com" }),
+      );
+      expect(cfg.resourceServerUrl).toBe("https://mcp.example.com");
+    });
+
+    it("returns undefined for resourceServerUrl when MCP_RESOURCE_SERVER_URL is unset (host fallback is per-request)", () => {
+      // The host-fallback lives in `resolveResourceServerBaseUrl` (it
+      // depends on request headers). The shared config layer is
+      // transparent: the value flows through to the config object
+      // unchanged. The app-side loader / server wire the value
+      // through to `createHttpMcpServer`'s options.
+      const cfg = parseHttpConfig(baseEnv());
+      expect(cfg.resourceServerUrl).toBeUndefined();
+    });
+
+    it("treats whitespace-only MCP_RESOURCE_SERVER_URL as unset (no silent transformation)", () => {
+      // Same posture as MCP_AUTHORITY_URL: a stray space in the .env
+      // file MUST NOT silently produce an unusable base URL. The
+      // `nonEmpty` helper already handles this — we assert the
+      // behavior here so the contract is locked.
+      const cfg = parseHttpConfig(
+        baseEnv({ MCP_RESOURCE_SERVER_URL: "   " }),
+      );
+      expect(cfg.resourceServerUrl).toBeUndefined();
+    });
+
+    it("resolveResourceServerBaseUrl returns the config URL when set, ignoring the request Host", () => {
+      // The env-driven URL is the single source of truth when set;
+      // the per-request Host header is a fallback, never an override.
+      // This matters for loopback dev: without this rule, every
+      // request would resolve to `http://127.0.0.1:<ephemeral>` and
+      // break the operator's explicitly-configured public URL.
+      const url = resolveResourceServerBaseUrl(
+        { resourceServerUrl: "https://mcp.example.com" },
+        { headers: { host: "127.0.0.1:54321" } },
+      );
+      expect(url).toBe("https://mcp.example.com");
+    });
+
+    it("resolveResourceServerBaseUrl falls back to request Host with http:// when config is unset", () => {
+      // The fallback uses the request's `Host` header verbatim
+      // (port included). The scheme defaults to `http` because the
+      // resource server itself terminates plain HTTP and is typically
+      // fronted by a TLS-terminating proxy in production.
+      const url = resolveResourceServerBaseUrl(
+        { resourceServerUrl: undefined },
+        { headers: { host: "127.0.0.1:4000" } },
+      );
+      expect(url).toBe("http://127.0.0.1:4000");
+    });
+
+    it("resolveResourceServerBaseUrl prefers x-forwarded-proto over the default scheme", () => {
+      // The spec explicitly mentions `x-forwarded-proto` for the
+      // behind-proxy case. When a TLS-terminating proxy is in front
+      // of the resource server, the proxy sets `x-forwarded-proto:
+      // https` so the fallback URL advertises the right scheme to
+      // clients.
+      const url = resolveResourceServerBaseUrl(
+        { resourceServerUrl: undefined },
+        {
+          headers: {
+            host: "mcp.example.com",
+            "x-forwarded-proto": "https",
+          },
+        },
+      );
+      expect(url).toBe("https://mcp.example.com");
+    });
+
+    it("resolveResourceServerBaseUrl uses the first value of x-forwarded-proto when it's a list", () => {
+      // RFC 7239 / the de-facto behavior is to send a comma-separated
+      // list when multiple proxies are chained. The first value is
+      // the one closest to the client.
+      const url = resolveResourceServerBaseUrl(
+        { resourceServerUrl: undefined },
+        {
+          headers: {
+            host: "mcp.example.com",
+            "x-forwarded-proto": ["https", "http"],
+          },
+        },
+      );
+      expect(url).toBe("https://mcp.example.com");
+    });
+
+    it("resolveResourceServerBaseUrl strips trailing slashes from the config URL so well-known path concatenation is clean", () => {
+      // A trailing slash in the env var would produce
+      // `https://mcp.example.com//.well-known/...` — double slashes
+      // are valid in URLs but break path normalization in some
+      // clients. We normalize at the resolver.
+      const url = resolveResourceServerBaseUrl(
+        { resourceServerUrl: "https://mcp.example.com/" },
+        { headers: {} },
+      );
+      expect(url).toBe("https://mcp.example.com");
+    });
+
+    it("resolveResourceServerBaseUrl throws when config is unset AND no Host header is present (fail-closed on missing data)", () => {
+      // HTTP/1.1 requires a Host header; in practice the server
+      // never sees a request without one. But a defensive posture is
+      // still required: if we cannot build a base URL, we MUST NOT
+      // silently produce an empty string (which would later be
+      // concatenated with `/.well-known/...` to produce
+      // `/.well-known/...` — a relative URL that 404s against any
+      // resource server).
+      expect(() =>
+        resolveResourceServerBaseUrl(
+          { resourceServerUrl: undefined },
+          { headers: {} },
+        ),
+      ).toThrow(/Host header/);
     });
   });
 });

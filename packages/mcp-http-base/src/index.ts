@@ -20,10 +20,13 @@
 
 export {
   parseHttpConfig,
+  resolveResourceServerBaseUrl,
   HttpConfigError,
   type HttpConfig,
   type HttpConfigInput,
   type LogFormat,
+  type ProtectedResourceMetadata,
+  type ResourceServerRequestLike,
 } from "./config.js";
 
 export {

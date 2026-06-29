@@ -78,6 +78,7 @@ function makeOptions(
     port: 0,
     path: "/mcp",
     authority: knownAgentAuthority(),
+    authorityUrl: "http://127.0.0.1:3002",
     sessionMode: "stateful",
     logger: createLogger({ format: "text" }),
     shutdownTimeoutMs: 1000,

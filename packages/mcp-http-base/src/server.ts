@@ -47,6 +47,13 @@ import {
 } from "./errors.js";
 import { createShutdownController, type ShutdownController } from "./shutdown.js";
 import { redactSensitive, type Logger } from "./logging.js";
+import {
+  resolveResourceServerBaseUrl,
+  type ProtectedResourceMetadata,
+} from "./config.js";
+
+/** RFC 9728 well-known path for protected resource metadata. */
+const WELL_KNOWN_OAUTH_PROTECTED_RESOURCE = "/.well-known/oauth-protected-resource";
 
 export type McpServerFactory = () => McpServer | Promise<McpServer>;
 
@@ -98,6 +105,27 @@ export type HttpMcpServerOptions = {
    * (testing). Defaults to the global `process`.
    */
   process?: NodeJS.EventEmitter;
+  /**
+   * The public URL of the OAuth authority (`MCP_AUTHORITY_URL`).
+   * Used as the sole entry of `authorization_servers` in the
+   * `/.well-known/oauth-protected-resource` document per RFC 9728.
+   * Required so the well-known route can advertise a non-empty list.
+   */
+  authorityUrl: string;
+  /**
+   * Optional override for the resource server's own public base URL
+   * (`MCP_RESOURCE_SERVER_URL`). When unset, the per-request `Host`
+   * header (with `x-forwarded-proto`) is the source of truth. The 401
+   * `WWW-Authenticate` header and the well-known `resource` field both
+   * derive from this value.
+   */
+  resourceServerUrl?: string;
+  /**
+   * Optional scope catalog. The well-known handler invokes this on
+   * every request so the value is always fresh; defaults to `() => []`
+   * when unset.
+   */
+  scopeCatalog?: () => string[];
 };
 
 export type HttpMcpServerHandle = {
@@ -218,6 +246,18 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
         if (t) await t.close();
       },
     } as unknown as StreamableHTTPServerTransport;
+  }
+
+  /**
+   * Resolve the resource server's public base URL for a single request.
+   * Used by the 401 `respond()` path and the well-known handler so the
+   * `headers` cast lives in one place.
+   */
+  function resolveBaseUrlFor(req: IncomingMessage): string {
+    return resolveResourceServerBaseUrl(
+      { resourceServerUrl: options.resourceServerUrl },
+      { headers: req.headers as Record<string, string | string[] | undefined> },
+    );
   }
 
   function markUnhealthy(reason: string): void {
@@ -421,7 +461,21 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
 
   async function handleMcpRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const startedAt = Date.now();
+    // Resolved once per request (the fallback uses request data, so the
+    // value can change between requests). The 401 `respond()` path uses
+    // this to build the `WWW-Authenticate` header.
+    const resourceServerBaseUrl = resolveBaseUrlFor(req);
     const respond = (envelope: ErrorEnvelope, agentId?: string): void => {
+      // RFC 6750 §3 + RFC 9728 §5.1: a 401 response MUST include
+      // `WWW-Authenticate: Bearer resource_metadata="<url>"` so clients
+      // can discover the authority. The header is set ONLY for 401 —
+      // a 503 is a transport-level problem, not an auth challenge.
+      if (envelope.status === 401) {
+        res.setHeader(
+          "WWW-Authenticate",
+          `Bearer resource_metadata="${resourceServerBaseUrl}${WELL_KNOWN_OAUTH_PROTECTED_RESOURCE}"`,
+        );
+      }
       const latencyMs = Date.now() - startedAt;
       sendJsonError(res, envelope);
       const level: "info" | "warn" | "error" =
@@ -621,10 +675,44 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
     res.end(body);
   }
 
+  /**
+   * RFC 9728 §3.1 protected-resource metadata handler. Unauthenticated
+   * by design (the metadata is public); the route is matched in
+   * `requestHandler` BEFORE `/mcp` so the bearer middleware never sees it.
+   *
+   * `resource` is the resource server's own public base URL (per-request
+   * `Host` fallback applies); `authorization_servers` is the authority's
+   * issuer URL; `bearer_methods_supported` is `["header"]`; `scopes_supported`
+   * is the optional `scopeCatalog` result (defaulting to `[]`).
+   */
+  function handleProtectedResourceMetadata(req: IncomingMessage, res: ServerResponse): void {
+    const baseUrl = resolveBaseUrlFor(req);
+    const scopes = options.scopeCatalog?.() ?? [];
+    const body: ProtectedResourceMetadata = {
+      resource: baseUrl,
+      authorization_servers: [options.authorityUrl],
+      bearer_methods_supported: ["header"],
+      scopes_supported: scopes,
+    };
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    // The metadata is dynamic (per-request `Host` fallback + per-request
+    // catalog). `no-store` prevents a stale `resource` from leaking
+    // after a deployment that flips the env var.
+    res.setHeader("Cache-Control", "no-store");
+    res.end(JSON.stringify(body));
+  }
+
   function requestHandler(req: IncomingMessage, res: ServerResponse): void {
     const url = req.url ?? "/";
     if (req.method === "GET" && url === "/healthz") {
       handleHealth(res);
+      return;
+    }
+    // Matched BEFORE the `/mcp` route so the bearer middleware never
+    // sees the well-known request.
+    if (req.method === "GET" && url === WELL_KNOWN_OAUTH_PROTECTED_RESOURCE) {
+      handleProtectedResourceMetadata(req, res);
       return;
     }
     if (url === options.path || url.startsWith(`${options.path}/`)) {
