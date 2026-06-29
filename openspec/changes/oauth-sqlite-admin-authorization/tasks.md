@@ -20,21 +20,21 @@ Chain strategy: stacked-to-main
 - No `MCP_MIN_DEFAULT_SCOPES` on resource servers.
 
 ## Phase 0: Prerequisite
-- [ ] 0.1 BLOCKED — Phase 1b `JwksAuthority` is now implemented, verified, and archived locally in `external-token-authority-verification` (2026-06-29), but it is not committed/merged yet. Evidence now exists in `packages/mcp-http-base/src/authority/jwks.ts`, `packages/mcp-http-base/test/authority/jwks.test.ts`, and `openspec/changes/archive/2026-06-29-external-token-authority-verification/verify-report.md`. PR 1 must not start until this prerequisite is committed and merged.
+- [x] 0.1 Phase 1b `JwksAuthority` is implemented, verified, archived, and committed on `main` as `b85ae37`. Evidence exists in `packages/mcp-http-base/src/authority/jwks.ts`, `packages/mcp-http-base/test/authority/jwks.test.ts`, and `openspec/changes/archive/2026-06-29-external-token-authority-verification/verify-report.md`. PR 1 is unblocked.
 
 ## Phase 1: App skeleton + SQLite (PR 1)
-- [ ] 1.1 Test 7 tables, audit `actor` free-text, FKs ON; knex schema + idempotent migrations.
-- [ ] 1.2 Test WAL, single-writer mutex, 5-retry SQLITE_BUSY, `MCP_OAUTH_DB_PATH`; implement.
-- [ ] 1.3 Test online backup atomic + `MCP_OAUTH_BACKUP_INTERVAL_S`; implement `backup.ts`.
-- [ ] 1.4 Test sweep `audit_log >90d` + revoked `refresh_tokens >30d`; implement `sweep.ts`.
+- [x] 1.1 Test 7 tables, audit `actor` free-text, FKs ON; knex schema + idempotent migrations.
+- [x] 1.2 Test WAL, single-writer mutex, 5-retry SQLITE_BUSY, `MCP_OAUTH_DB_PATH`; implement.
+- [x] 1.3 Test online backup atomic + `MCP_OAUTH_BACKUP_INTERVAL_S`; implement `backup.ts`.
+- [x] 1.4 Test sweep `audit_log >90d` + revoked `refresh_tokens >30d`; implement `sweep.ts`.
 
 ## Phase 2: OAuth2 + self-probe (PR 1)
-- [ ] 2.1 Test JWKS (public-only) + OIDC discovery; no `/oauth/authorize`; implement.
-- [ ] 2.2 Test RS256 JWT: `iss`, `aud=mcp:<app>`, `sub`, `scope`, `iat/nbf/exp`, `kid`, TTL 3600.
-- [ ] 2.3 Implement `oauth/token.ts`; refuse `*` mixed; default new client to `read:<bound-profile>`.
-- [ ] 2.4 Test introspect + refresh grant rejects `revokedAt != null`; implement.
-- [ ] 2.5 Test `OAuthAdminAuthority.warm()` POSTs introspect; exits non-zero on refuse/5xx; implement.
-- [ ] 2.6 Wire `apps/mcp-readonly-sql/src/config/http.ts` to use `OAuthAdminAuthority` when `MCP_AUTHORITY_URL` set.
+- [x] 2.1 Test JWKS (public-only) + OIDC discovery; no `/oauth/authorize`; implement.
+- [x] 2.2 Test RS256 JWT: `iss`, `aud=mcp:<app>`, `sub`, `scope`, `iat/nbf/exp`, `kid`, TTL 3600.
+- [x] 2.3 Implement `oauth/token.ts`; refuse `*` mixed; default new client to `read:<bound-profile>`.
+- [x] 2.4 Test introspect + refresh grant rejects `revokedAt != null`; implement.
+- [x] 2.5 Test `OAuthAdminAuthority.warm()` POSTs introspect; exits non-zero on refuse/5xx; implement.
+- [x] 2.6 Wire `apps/mcp-readonly-sql/src/config/http.ts` to use `OAuthAdminAuthority` when `MCP_AUTHORITY_URL` set.
 
 ## Phase 3: Admin UI (PR 2)
 - [ ] 3.1 Test session: signed cookie, 32-byte secret, CSRF double-submit 403; implement + rotation.

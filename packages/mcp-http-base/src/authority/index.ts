@@ -19,3 +19,4 @@ export {
 } from "./types.js";
 export { LocalRosterAuthority } from "./localRoster.js";
 export { JwksAuthority, type JwksAuthorityOptions } from "./jwks.js";
+export { OAuthAdminAuthority, type OAuthAdminAuthorityOptions } from "./oauthAdmin.js";

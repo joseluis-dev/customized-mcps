@@ -88,7 +88,7 @@ export type HttpMcpServerOptions = {
    * reports the selected backend. The label MUST NOT include
    * tokens, `kid`, JWKS URL, or authority URL.
    */
-  authorityBackend?: "local" | "jwks";
+  authorityBackend?: "local" | "jwks" | "oauth";
   /**
    * @deprecated Prefer `authority`. Kept so the v1 caller pattern
    * (existing app code, existing tests) keeps compiling and

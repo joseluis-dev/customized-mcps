@@ -27,11 +27,27 @@
  * Phase 1b (external-token-authority-verification) adds the
  * authority-backend selection: when MCP_AUTHORITY_URL is unset the
  * app uses the local roster (dev/offline fallback); when set, the
- * app uses the JWKS authority (production / shared deployment) and
- * the startup probe (`warm()`) is awaited before the config loader
- * returns. A probe failure throws an `HttpRuntimeConfigError` so the
- * entrypoint can exit non-zero with a stderr message that names the
- * authority host (not the JWKS path or any query string).
+ * app uses the OAuth admin authority (PR 1 of
+ * oauth-sqlite-admin-authorization) and the startup probe (`warm()`)
+ * is awaited before the config loader returns. A probe failure
+ * throws an `HttpRuntimeConfigError` so the entrypoint can exit
+ * non-zero with a stderr message that names the authority host
+ * (not the JWKS path or any query string).
+ *
+ * The local roster (HMAC) backend stays available as a dev/offline
+ * fallback until Phase 5 of oauth-sqlite-admin-authorization. The
+ * selected backend is exposed on `/healthz` via the
+ * `authorityBackend` field (audit-safe label, no tokens).
+ *
+ * Backend selection (mirrored by `authorityBackend`):
+ * - `MCP_AUTHORITY_URL` unset  → `LocalRosterAuthority`  (`"local"`)
+ * - `MCP_AUTHORITY_URL` set    → `OAuthAdminAuthority`   (`"oauth"`)
+ *
+ * The `OAuthAdminAuthority` extends `JwksAuthority` (it
+ * inherits the JWKS-based `verify()` and adds an introspect
+ * probe on `warm()`). The `verify` path is unchanged: each
+ * request still resolves the JWT against the authority's
+ * JWKS with a 60s cache + `kid`-miss refetch.
  */
 
 import { readFileSync } from "node:fs";
@@ -41,6 +57,7 @@ import {
   loadAgents,
   LocalRosterAuthority,
   JwksAuthority,
+  OAuthAdminAuthority,
   type AgentRecord,
   type HttpConfig,
   type SessionMode,
@@ -50,18 +67,18 @@ import {
 /**
  * The audit-safe label that `/healthz` exposes. The value is
  * deterministic given the env: `"local"` when MCP_AUTHORITY_URL is
- * unset, `"jwks"` when set. The label MUST NOT include tokens,
+ * unset, `"oauth"` when set. The label MUST NOT include tokens,
  * `kid`, JWKS URL, or authority URL.
  */
-export type AuthorityBackend = "local" | "jwks";
+export type AuthorityBackend = "local" | "oauth" | "jwks";
 
 /**
  * The runtime config the HTTP transport needs to start the shared server.
  * It is the union of the validated `HttpConfig` (from the shared base)
  * plus the loaded `AgentRecord[]`, the derived `sessionMode` literal
  * that the shared base expects on the wire, the resolved
- * `TokenAuthority` (Phase 1b), and the audit-safe `authorityBackend`
- * label for `/healthz`.
+ * `TokenAuthority` (Phase 1b + PR 1 of oauth-sqlite-admin-authorization),
+ * and the audit-safe `authorityBackend` label for `/healthz`.
  */
 export type HttpRuntimeConfig = HttpConfig & {
   agents: AgentRecord[];
@@ -76,15 +93,18 @@ export type HttpRuntimeConfig = HttpConfig & {
   allowUnboundedBody: boolean;
   /**
    * The resolved `TokenAuthority`. Phase 1a introduced the
-   * abstraction; Phase 1b adds the JWKS backend. The HTTP transport
-   * forwards this to `createHttpMcpServer`. The shared base's
-   * middleware calls `authority.verify(token)` for every request.
+   * abstraction; Phase 1b adds the JWKS backend; PR 1 of
+   * oauth-sqlite-admin-authorization adds the OAuth admin
+   * authority. The HTTP transport forwards this to
+   * `createHttpMcpServer`. The shared base's middleware calls
+   * `authority.verify(token)` for every request.
    */
   authority: TokenAuthority;
   /**
    * The audit-safe label for `/healthz`. `"local"` when
-   * MCP_AUTHORITY_URL is unset; `"jwks"` when set. The value
-   * MUST NOT include tokens, `kid`, JWKS URL, or authority URL.
+   * MCP_AUTHORITY_URL is unset; `"oauth"` when set (the
+   * `OAuthAdminAuthority` wrapper). The value MUST NOT
+   * include tokens, `kid`, JWKS URL, or authority URL.
    */
   authorityBackend: AuthorityBackend;
 };
@@ -95,7 +115,6 @@ export class HttpRuntimeConfigError extends Error {
     this.name = "HttpRuntimeConfigError";
   }
 }
-
 /**
  * Strict boolean parser that mirrors the shared base's `parseBoolean`
  * semantics: only the literal string "true" (trimmed, case-insensitive)
@@ -112,16 +131,23 @@ function parseBoolean(value: string | undefined): boolean {
 /**
  * Construct the `TokenAuthority` for the current env. When
  * MCP_AUTHORITY_URL is unset the local-roster backend is selected
- * (dev/offline fallback); when set, the JWKS backend is selected
- * (production / shared deployment). The local backend is
+ * (dev/offline fallback); when set, the OAuth admin authority is
+ * selected (production / shared deployment). The local backend is
  * constructed eagerly so any agent-config error surfaces here;
- * the JWKS backend is constructed and its `warm()` probe is
- * awaited so a misconfigured authority URL fails fast at startup.
+ * the OAuth admin authority is constructed and its `warm()` probe
+ * is awaited so a misconfigured authority URL fails fast at startup.
  *
- * Errors thrown by the JWKS `warm()` probe (or by the
- * `JwksAuthority` constructor) are wrapped in
+ * Errors thrown by the `warm()` probe (or by the
+ * `OAuthAdminAuthority` constructor) are wrapped in
  * `HttpRuntimeConfigError` so the entrypoint can exit non-zero
  * with a stderr message that names the authority host.
+ *
+ * PR 1 of oauth-sqlite-admin-authorization selects
+ * `OAuthAdminAuthority` (which is the production-shape class
+ * extending `JwksAuthority`). The `JwksAuthority` class is
+ * still imported so future test surfaces / fallback paths
+ * can construct it directly; the app-side loader prefers the
+ * `OAuthAdminAuthority` wrapper when MCP_AUTHORITY_URL is set.
  */
 async function buildAuthority(
   http: HttpConfig,
@@ -140,66 +166,20 @@ async function buildAuthority(
     // the local authority.
     return { authority: sentinelLocalAuthority(), backend: "local" };
   }
-  // JWKS backend. The shared base's `parseHttpConfig` already
-  // rejected the case where `authorityUrl` is set but
-  // `authorityAudience` is empty; we still assert for the
-  // TypeScript narrowing.
+  // OAuth admin authority (PR 1 of
+  // oauth-sqlite-admin-authorization). The shared base's
+  // `parseHttpConfig` already rejected the case where
+  // `authorityUrl` is set but `authorityAudience` is empty;
+  // we still assert for the TypeScript narrowing.
   if (http.authorityAudience === undefined) {
     throw new HttpRuntimeConfigError(
       "MCP_AUTHORITY_AUDIENCE is required when MCP_AUTHORITY_URL is set. " +
         "Set MCP_AUTHORITY_AUDIENCE to the value the authority issues tokens for.",
     );
   }
-  if (http.authorityJwksUrl === undefined) {
-    // Operator-friendly default: derive the JWKS URL from the
-    // authority URL using the OIDC well-known convention. This
-    // keeps the env file short for the common case (a sibling
-    // MCP that serves its JWKS at the standard path). Operators
-    // that need a non-standard JWKS path can still set
-    // MCP_AUTHORITY_JWKS_URL explicitly.
-    const url = new URL(http.authorityUrl);
-    const basePath = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
-    const defaultJwksUrl = `${url.protocol}//${url.host}${basePath}/.well-known/jwks.json`;
-    return buildJwksAuthorityWithUrl(http, logger, defaultJwksUrl);
-  }
-  return buildJwksAuthorityWithUrl(http, logger, http.authorityJwksUrl);
-}
-
-/**
- * Build a `JwksAuthority` from the resolved config and probe it.
- * Pulled out so the JWKS-URL default branch above can reuse it.
- *
- * Returns a Promise so the warm() probe can fail asynchronously
- * (e.g. on a network error during the first fetch). The caller
- * translates a probe failure into `HttpRuntimeConfigError` so
- * the entrypoint can exit non-zero with a stderr message that
- * names the authority host (per the mcp-token-authority spec:
- * "stderr names the authority host and base path only").
- */
-function buildJwksAuthorityWithUrl(
-  http: HttpConfig,
-  logger: {
-    info: (msg: string) => void;
-    warn: (msg: string) => void;
-    error: (msg: string) => void;
-  },
-  jwksUrl: string,
-): Promise<{ authority: TokenAuthority; backend: AuthorityBackend }> {
-  // The shared base's `parseHttpConfig` already rejected the case
-  // where `authorityUrl` is set but `authorityAudience` is empty;
-  // we still assert for the TypeScript narrowing. The `??` covers
-  // the noUncheckedIndexedAccess type checker (the audience is
-  // a string once parseHttpConfig returned).
-  if (http.authorityAudience === undefined) {
-    return Promise.reject(
-      new HttpRuntimeConfigError(
-        "MCP_AUTHORITY_AUDIENCE is required when MCP_AUTHORITY_URL is set. " +
-          "Set MCP_AUTHORITY_AUDIENCE to the value the authority issues tokens for.",
-      ),
-    );
-  }
-  const jwks = new JwksAuthority({
-    issuer: http.authorityUrl ?? "",
+  const jwksUrl = http.authorityJwksUrl ?? defaultJwksUrl(http.authorityUrl);
+  const auth = new OAuthAdminAuthority({
+    issuer: http.authorityUrl,
     jwksUrl,
     audience: http.authorityAudience,
     ttlSeconds: http.authorityJwksTtlSeconds,
@@ -207,22 +187,31 @@ function buildJwksAuthorityWithUrl(
     fetchTimeoutMs: http.authorityFetchTimeoutMs,
     logger,
   });
-  return jwks.warm?.()
-    .then(() => ({ authority: jwks, backend: "jwks" as const }))
-    .catch((e: unknown) => {
-      // Map the JWKS probe failure to a startup error. The spec
-      // says: "stderr names the authority host and base path only"
-      // — we extract just the host so the operator sees which
-      // authority is unreachable, not the JWKS path or any query
-      // string.
-      const url = new URL(http.authorityUrl ?? "");
-      const basePath = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
-      const message = e instanceof Error ? e.message : String(e);
-      throw new HttpRuntimeConfigError(
-        `Authority probe failed for ${url.host}${basePath}: ${message}. ` +
-          `Set MCP_AUTHORITY_URL (or unset it to use the local backend).`,
-      );
-    });
+  try {
+    await auth.warm?.();
+  } catch (e) {
+    const url = new URL(http.authorityUrl);
+    const basePath = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
+    const message = e instanceof Error ? e.message : String(e);
+    throw new HttpRuntimeConfigError(
+      `Authority probe failed for ${url.host}${basePath}: ${message}. ` +
+        `Set MCP_AUTHORITY_URL (or unset it to use the local backend).`,
+    );
+  }
+  return { authority: auth, backend: "oauth" };
+}
+
+/**
+ * Compute the default JWKS URL from the authority URL using the
+ * OIDC well-known convention. Keeps the env file short for the
+ * common case (a sibling MCP that serves its JWKS at the standard
+ * path). Operators that need a non-standard JWKS path can still
+ * set MCP_AUTHORITY_JWKS_URL explicitly.
+ */
+function defaultJwksUrl(authorityUrl: string): string {
+  const url = new URL(authorityUrl);
+  const basePath = url.pathname === "/" ? "" : url.pathname.replace(/\/$/, "");
+  return `${url.protocol}//${url.host}${basePath}/.well-known/jwks.json`;
 }
 
 /**
@@ -241,7 +230,6 @@ function sentinelLocalAuthority(): TokenAuthority {
     },
   };
 }
-
 /**
  * Pure-from-the-outside function that reads the relevant env vars and
  * returns a validated `HttpRuntimeConfig`. Throws on any constraint
@@ -284,9 +272,10 @@ export async function loadHttpRuntimeConfig(): Promise<HttpRuntimeConfig> {
     throw e;
   }
 
-  // Select the authority backend. The JWKS path awaits `warm()`
-  // so a misconfigured authority URL fails fast at startup; the
-  // local path is constructed lazily after the agents are loaded.
+  // Select the authority backend. The OAuth admin path awaits
+  // `warm()` so a misconfigured authority URL fails fast at
+  // startup; the local path is constructed lazily after the
+  // agents are loaded.
   const stderrLogger = {
     info: (msg: string) => process.stderr.write(`[mcp-readonly-sql] ${msg}\n`),
     warn: (msg: string) => process.stderr.write(`[mcp-readonly-sql] ${msg}\n`),
@@ -294,17 +283,18 @@ export async function loadHttpRuntimeConfig(): Promise<HttpRuntimeConfig> {
   };
   const { authority: builtAuthority, backend } = await buildAuthority(http, stderrLogger);
 
-  // For the local backend we still need to load the agents. For
-  // the JWKS backend the agents are NOT required (the authority
-  // issues and validates tokens; no local roster is needed).
-  if (backend === "jwks") {
+  // For the OAuth admin backend the agents are NOT required
+  // (the authority issues and validates tokens; no local
+  // roster is needed). The local backend still needs the
+  // agents.
+  if (backend === "oauth") {
     return {
       ...http,
       agents: [],
       sessionMode: http.stateless ? "stateless" : "stateful",
       allowUnboundedBody: parseBoolean(process.env.MCP_HTTP_ALLOW_UNBOUNDED_BODY),
       authority: builtAuthority,
-      authorityBackend: "jwks",
+      authorityBackend: "oauth",
     };
   }
 

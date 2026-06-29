@@ -327,34 +327,50 @@ describe("config/http", () => {
       expect(cfg.authorityBackend).toBe("local");
     });
 
-    it("selects the JWKS backend when MCP_AUTHORITY_URL is set and reachable (authorityBackend='jwks')", async () => {
+    it("selects the OAuth admin backend when MCP_AUTHORITY_URL is set and reachable (authorityBackend='oauth')", async () => {
       // GIVEN MCP_AUTHORITY_URL set, MCP_AUTHORITY_AUDIENCE set, and a
-      //      reachable JWKS endpoint (the stub returns a 200 + a minimal
-      //      JWKS document so the warm() probe succeeds)
+      //      reachable JWKS + introspect endpoint (the stub returns a
+      //      200 + a minimal JWKS document for the JWKS probe AND a
+      //      200 + { active: false } for the introspect probe; the
+      //      OAuthAdminAuthority.warm() needs both to succeed).
       // WHEN we load the runtime config
-      // THEN cfg.authority is a JwksAuthority (NOT a LocalRosterAuthority)
-      //      and cfg.authorityBackend is "jwks"
+      // THEN cfg.authority is an OAuthAdminAuthority (NOT a
+      //      LocalRosterAuthority) and cfg.authorityBackend is "oauth"
       const jwks = JSON.stringify({ keys: [] });
-      const fetchStub = vi.fn(async () =>
-        new Response(jwks, { status: 200, headers: { "Content-Type": "application/json" } }),
-      );
+      const introspect = JSON.stringify({ active: false });
+      const fetchStub = vi.fn(async (url: string | URL | Request) => {
+        const u = String(url);
+        if (u.endsWith("/.well-known/jwks.json")) {
+          return new Response(jwks, { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        if (u.endsWith("/oauth/introspect")) {
+          return new Response(introspect, { status: 200, headers: { "Content-Type": "application/json" } });
+        }
+        return new Response("not found", { status: 404 });
+      });
       vi.stubGlobal("fetch", fetchStub);
       try {
         process.env.MCP_AUTHORITY_URL = "https://auth.example.com";
         process.env.MCP_AUTHORITY_AUDIENCE = "mcp-readonly-sql";
-        // MCP_AGENTS_JSON is NOT required when the JWKS backend is selected
-        // (the authority issues and validates tokens; no local roster is
-        // needed). The local-roster path is the unset-env default.
+        // MCP_AGENTS_JSON is NOT required when the OAuth admin
+        // backend is selected (the authority issues and validates
+        // tokens; no local roster is needed). The local-roster
+        // path is the unset-env default.
         delete process.env.MCP_AGENTS_JSON;
         delete process.env.MCP_AGENTS_INLINE;
         const cfg = await loadHttpRuntimeConfig();
-        expect(cfg.authorityBackend).toBe("jwks");
+        expect(cfg.authorityBackend).toBe("oauth");
         // The class check is the assertion: the resolved authority is
-        // a JwksAuthority, not the local backend.
+        // an OAuthAdminAuthority (which extends JwksAuthority), not
+        // the local backend.
         const cls = cfg.authority.constructor.name;
-        expect(cls).toBe("JwksAuthority");
-        // The JWKS endpoint was probed at least once (the startup probe).
+        expect(cls).toBe("OAuthAdminAuthority");
+        // The JWKS + introspect endpoints were probed at least once
+        // (the OAuthAdminAuthority.warm() probe fires both).
         expect(fetchStub).toHaveBeenCalled();
+        const calledUrls = fetchStub.mock.calls.map((c) => String(c[0]));
+        expect(calledUrls.some((u) => u.includes("/.well-known/jwks.json"))).toBe(true);
+        expect(calledUrls.some((u) => u.includes("/oauth/introspect"))).toBe(true);
       } finally {
         vi.unstubAllGlobals();
       }

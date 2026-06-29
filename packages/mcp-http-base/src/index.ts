@@ -50,10 +50,12 @@ export {
 export {
   LocalRosterAuthority,
   JwksAuthority,
+  OAuthAdminAuthority,
   AuthorityUnavailableError,
   TokenInvalidError,
   type JwksAuthorityOptions,
   type LocalRosterAuthorityOptions,
+  type OAuthAdminAuthorityOptions,
   type TokenAuthority,
   type VerifiedToken,
   type VerifyContext,
