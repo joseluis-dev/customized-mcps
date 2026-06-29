@@ -38,6 +38,7 @@ import {
   TokenInvalidError,
   type TokenAuthority,
   type VerifiedToken,
+  type VerifyContext,
 } from "./authority/index.js";
 import {
   sendJsonError,
@@ -79,6 +80,15 @@ export type HttpMcpServerOptions = {
    * for the `external-token-authority-verification` change.
    */
   authority?: TokenAuthority;
+  /**
+   * The audit-safe label that `/healthz` exposes. When `undefined`,
+   * the shared base defaults to `"local"` (the unset-env default
+   * per the mcp-agent-authorization spec). When the app sets
+   * `MCP_AUTHORITY_URL`, it passes `"jwks"` so the health probe
+   * reports the selected backend. The label MUST NOT include
+   * tokens, `kid`, JWKS URL, or authority URL.
+   */
+  authorityBackend?: "local" | "jwks";
   /**
    * @deprecated Prefer `authority`. Kept so the v1 caller pattern
    * (existing app code, existing tests) keeps compiling and
@@ -497,9 +507,19 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
     // `validateBearer` directly — that path is now an implementation
     // detail of `LocalRosterAuthority` per the
     // `external-token-authority-verification` change.
+    //
+    // Phase 1b (W1 remediation): the middleware also passes a
+    // `VerifyContext` with the sanitized X-Request-Id so the
+    // JWKS authority can attach the request id to the second-miss
+    // WARN line (per the mcp-token-authority spec). The
+    // `sanitizeRequestId` helper rejects untrusted input
+    // (alphanumerics, dashes, underscores only) so the id is
+    // safe to embed in a log line.
+    const requestId = sanitizeRequestId(req.headers["x-request-id"]);
+    const verifyContext: VerifyContext | undefined = requestId ? { requestId } : undefined;
     let verified: VerifiedToken;
     try {
-      verified = await authority.verify(token);
+      verified = await authority.verify(token, verifyContext);
     } catch (err) {
       // 401 on `TokenInvalidError` (the expected "unknown / expired
       // / malformed token" path). 503 on
@@ -633,21 +653,35 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
   }
 
   function handleHealth(res: ServerResponse): void {
+    // Phase 1b (external-token-authority-verification): the
+    // health endpoint returns JSON so it can carry the
+    // `authorityBackend` field (per the mcp-token-authority spec).
+    // The body shape is intentionally minimal: status
+    // (`"ok"` / `"unhealthy"` / `"shutting-down"`) plus the
+    // backend label. The body MUST NOT include tokens, `kid`,
+    // JWKS URL, or authority URL — the middleware's
+    // `sanitizeError` path is the same one used for the 401/503
+    // JSON-RPC bodies, so the audit-safe contract is uniform
+    // across endpoints.
+    let status: "ok" | "unhealthy" | "shutting-down";
     if (shutdown.isShuttingDown()) {
-      res.statusCode = 503;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("shutting-down");
-      return;
+      status = "shutting-down";
+    } else if (unhealthy) {
+      status = "unhealthy";
+    } else {
+      status = "ok";
     }
-    if (unhealthy) {
+    const body = JSON.stringify({
+      status,
+      authorityBackend: options.authorityBackend ?? "local",
+    });
+    if (status === "ok") {
+      res.statusCode = 200;
+    } else {
       res.statusCode = 503;
-      res.setHeader("Content-Type", "text/plain; charset=utf-8");
-      res.end("unhealthy");
-      return;
     }
-    res.statusCode = 200;
-    res.setHeader("Content-Type", "text/plain; charset=utf-8");
-    res.end("ok");
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.end(body);
   }
 
   function requestHandler(req: IncomingMessage, res: ServerResponse): void {

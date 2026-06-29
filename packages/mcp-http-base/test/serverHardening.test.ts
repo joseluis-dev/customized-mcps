@@ -160,7 +160,9 @@ describe("createHttpMcpServer — PR1 remediation", () => {
         req.end();
       });
       expect(res.status).toBe(503);
-      expect(res.body).toBe("shutting-down");
+      const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
+      expect(body.status).toBe("shutting-down");
+      expect(body.authorityBackend).toBe("local");
     });
 
     it("actually emits SIGTERM through the wired handler and marks the controller shutting-down", async () => {
@@ -504,7 +506,9 @@ describe("createHttpMcpServer — PR1 remediation", () => {
         req.end();
       });
       expect(res.status).toBe(503);
-      expect(res.body).toBe("unhealthy");
+      const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
+      expect(body.status).toBe("unhealthy");
+      expect(body.authorityBackend).toBe("local");
     });
 
     it("clears the unhealthy flag and returns /healthz to 200 after a subsequent successful request", async () => {
@@ -575,7 +579,11 @@ describe("createHttpMcpServer — PR1 remediation", () => {
         },
       );
       expect(healthyRes.status).toBe(200);
-      expect(healthyRes.body).toBe("ok");
+      // Phase 1b: the health endpoint returns JSON with the
+      // `authorityBackend` field (per the mcp-token-authority spec).
+      const healthyBody = JSON.parse(healthyRes.body) as { status?: string; authorityBackend?: string };
+      expect(healthyBody.status).toBe("ok");
+      expect(healthyBody.authorityBackend).toBe("local");
     });
 
     it("closes the half-built McpServer and transport on a failed factory (no leak)", async () => {

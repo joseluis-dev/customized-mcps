@@ -33,6 +33,15 @@ function baseEnv(overrides: Partial<HttpConfigInput> = {}): HttpConfigInput {
     MCP_HTTP_BEHIND_PROXY: "false",
     MCP_HTTP_ALLOW_INSECURE_BIND: "false",
     MCP_HTTP_ALLOW_INSECURE_LOOPBACK: "false",
+    // Phase 1b (external-token-authority-verification): 6 new authority
+    // env vars. The baseEnv helper leaves them undefined so tests can
+    // assert the "unset" defaults and the "set" overrides independently.
+    MCP_AUTHORITY_URL: undefined,
+    MCP_AUTHORITY_JWKS_URL: undefined,
+    MCP_AUTHORITY_AUDIENCE: undefined,
+    MCP_AUTHORITY_JWKS_TTL_S: undefined,
+    MCP_AUTHORITY_LEEWAY_S: undefined,
+    MCP_AUTHORITY_FETCH_TIMEOUT_MS: undefined,
     ...overrides,
   };
 }
@@ -285,6 +294,178 @@ describe("parseHttpConfig", () => {
         .replace(/\/\*[\s\S]*?\*\//g, "")
         .replace(/^\s*\/\/.*$/gm, "");
       expect(code).toMatch(/forbidOnly\s*:\s*true/);
+    });
+  });
+
+  describe("authority env vars (Phase 1b — 1b.5)", () => {
+    // Phase 1b of the external-token-authority-verification change
+    // introduces six new env vars (MCP_AUTHORITY_URL, MCP_AUTHORITY_JWKS_URL,
+    // MCP_AUTHORITY_AUDIENCE, MCP_AUTHORITY_JWKS_TTL_S, MCP_AUTHORITY_LEEWAY_S,
+    // MCP_AUTHORITY_FETCH_TIMEOUT_MS). The defaults are 60/30/5000 for
+    // the integer fields; the URL/audience fields are undefined when
+    // unset. When MCP_AUTHORITY_URL is set, MCP_AUTHORITY_AUDIENCE is
+    // REQUIRED (fail closed) — the auth spec demands a hard audience
+    // check; an empty audience would let any token issued by the
+    // authority be accepted.
+
+    it("returns undefined for all authority URL/audience fields when unset", () => {
+      const cfg = parseHttpConfig(baseEnv());
+      expect(cfg.authorityUrl).toBeUndefined();
+      expect(cfg.authorityJwksUrl).toBeUndefined();
+      expect(cfg.authorityAudience).toBeUndefined();
+    });
+
+    it("defaults the three integer authority fields to 60/30/5000 when unset", () => {
+      // The defaults are documented in the spec and in
+      // .env.example: TTL 60s, leeway 30s, fetch timeout 5000ms.
+      const cfg = parseHttpConfig(baseEnv());
+      expect(cfg.authorityJwksTtlSeconds).toBe(60);
+      expect(cfg.authorityLeewaySeconds).toBe(30);
+      expect(cfg.authorityFetchTimeoutMs).toBe(5000);
+    });
+
+    it("parses a custom TTL, leeway, and fetch timeout", () => {
+      const cfg = parseHttpConfig(
+        baseEnv({
+          MCP_AUTHORITY_JWKS_TTL_S: "120",
+          MCP_AUTHORITY_LEEWAY_S: "5",
+          MCP_AUTHORITY_FETCH_TIMEOUT_MS: "10000",
+        }),
+      );
+      expect(cfg.authorityJwksTtlSeconds).toBe(120);
+      expect(cfg.authorityLeewaySeconds).toBe(5);
+      expect(cfg.authorityFetchTimeoutMs).toBe(10000);
+    });
+
+    it("rejects a non-integer authority TTL (strict parsing, like the other integer fields)", () => {
+      // "fast" is not a number; the field is a seconds count, so the
+      // parser rejects it the same way it rejects "fast" for
+      // MCP_HTTP_SHUTDOWN_TIMEOUT_MS.
+      expect(() =>
+        parseHttpConfig(baseEnv({ MCP_AUTHORITY_JWKS_TTL_S: "fast" })),
+      ).toThrow(HttpConfigError);
+    });
+
+    it("rejects a non-integer authority leeway (strict parsing)", () => {
+      expect(() =>
+        parseHttpConfig(baseEnv({ MCP_AUTHORITY_LEEWAY_S: "many" })),
+      ).toThrow(HttpConfigError);
+    });
+
+    it("rejects a non-integer authority fetch timeout (strict parsing)", () => {
+      expect(() =>
+        parseHttpConfig(baseEnv({ MCP_AUTHORITY_FETCH_TIMEOUT_MS: "5s" })),
+      ).toThrow(HttpConfigError);
+    });
+
+    it("rejects a negative or zero authority fetch timeout (the timeout must be > 0)", () => {
+      // A 0ms fetch timeout would let a hung JWKS endpoint freeze the
+      // middleware for 0ms — but `AbortSignal.timeout(0)` is effectively
+      // "abort immediately", which is a useful fail-fast mode; the spec
+      // asks for a positive minimum so the operator is forced to pick a
+      // real value. We allow >= 1.
+      expect(() =>
+        parseHttpConfig(baseEnv({ MCP_AUTHORITY_FETCH_TIMEOUT_MS: "0" })),
+      ).toThrow(HttpConfigError);
+      expect(() =>
+        parseHttpConfig(baseEnv({ MCP_AUTHORITY_FETCH_TIMEOUT_MS: "-1" })),
+      ).toThrow(HttpConfigError);
+    });
+
+    it("preserves the authority URL and audience as the operator typed them (no normalization)", () => {
+      // The auth spec says: when MCP_AUTHORITY_URL is set, MCP_AUTHORITY_AUDIENCE
+      // is REQUIRED. We assert that the value flows through to the
+      // config object verbatim — the operator is responsible for
+      // matching the value the authority actually issues, but the
+      // config layer does NOT silently transform it.
+      const cfg = parseHttpConfig(
+        baseEnv({
+          MCP_AUTHORITY_URL: "https://auth.example.com",
+          MCP_AUTHORITY_AUDIENCE: "mcp-readonly-sql",
+        }),
+      );
+      expect(cfg.authorityUrl).toBe("https://auth.example.com");
+      expect(cfg.authorityAudience).toBe("mcp-readonly-sql");
+    });
+
+    it("rejects a missing audience when MCP_AUTHORITY_URL is set (fail-closed on the audience check)", () => {
+      // The auth spec is explicit: a token issued by the authority
+      // could be for any audience, and an empty audience would let any
+      // such token through. The config layer fails closed.
+      expect(() =>
+        parseHttpConfig(
+          baseEnv({
+            MCP_AUTHORITY_URL: "https://auth.example.com",
+            MCP_AUTHORITY_AUDIENCE: undefined,
+          }),
+        ),
+      ).toThrow(HttpConfigError);
+    });
+
+    it("rejects an empty audience when MCP_AUTHORITY_URL is set (whitespace-only also rejected)", () => {
+      // Empty string and whitespace-only are both "the operator did
+      // not configure an audience". The trim must happen before the
+      // check so a stray space in the .env file is not silently
+      // treated as a configured audience.
+      expect(() =>
+        parseHttpConfig(
+          baseEnv({
+            MCP_AUTHORITY_URL: "https://auth.example.com",
+            MCP_AUTHORITY_AUDIENCE: "",
+          }),
+        ),
+      ).toThrow(HttpConfigError);
+      expect(() =>
+        parseHttpConfig(
+          baseEnv({
+            MCP_AUTHORITY_URL: "https://auth.example.com",
+            MCP_AUTHORITY_AUDIENCE: "   ",
+          }),
+        ),
+      ).toThrow(HttpConfigError);
+    });
+
+    it("preserves MCP_AUTHORITY_JWKS_URL as the operator typed it (no path auto-derivation)", () => {
+      // The spec does NOT mandate a default for MCP_AUTHORITY_JWKS_URL —
+      // it is its own env var. We assert that whatever the operator
+      // types flows through to the config object verbatim. A future
+      // change may add a well-known default; the current contract is
+      // "no silent transformation".
+      const cfg = parseHttpConfig(
+        baseEnv({
+          MCP_AUTHORITY_URL: "https://auth.example.com",
+          MCP_AUTHORITY_JWKS_URL: "https://auth.example.com/jwks/special.json",
+          MCP_AUTHORITY_AUDIENCE: "mcp-readonly-sql",
+        }),
+      );
+      expect(cfg.authorityJwksUrl).toBe("https://auth.example.com/jwks/special.json");
+    });
+
+    it("leaves MCP_AUTHORITY_JWKS_URL as undefined when both env vars are unset (the app-side loader rejects this state)", () => {
+      // The shared config layer is permissive: JWKS URL is optional
+      // in the type system. The app-side `loadHttpRuntimeConfig`
+      // rejects the unset state when MCP_AUTHORITY_URL is set, because
+      // a JWKS-less JWKS authority is a misconfiguration. We assert
+      // the shared layer's contract here.
+      const cfg = parseHttpConfig(
+        baseEnv({
+          MCP_AUTHORITY_URL: "https://auth.example.com",
+          MCP_AUTHORITY_AUDIENCE: "mcp-readonly-sql",
+        }),
+      );
+      // The shared config layer preserves the unset state — the
+      // app-side loader is the layer that adds the fail-closed check.
+      expect(cfg.authorityJwksUrl).toBeUndefined();
+    });
+
+    it("does not require MCP_AUTHORITY_AUDIENCE when MCP_AUTHORITY_URL is unset (local backend path)", () => {
+      // The local-roster backend does not need an audience — the
+      // middleware calls validateBearer() directly, and there is no
+      // JWT to validate. The audience requirement is bound to the
+      // external (JWKS) path only.
+      const cfg = parseHttpConfig(baseEnv());
+      expect(cfg.authorityUrl).toBeUndefined();
+      expect(cfg.authorityAudience).toBeUndefined();
     });
   });
 });

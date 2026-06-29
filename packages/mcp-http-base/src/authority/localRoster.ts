@@ -105,8 +105,13 @@ export class LocalRosterAuthority implements TokenAuthority {
    * typed error is exported from this package so a future
    * `IntrospectionAuthority` (out of scope for this change) can
    * throw it from the same surface.
+   *
+   * The `context` parameter is accepted for interface uniformity
+   * with `JwksAuthority.verify` (Phase 1b) but is ignored: the
+   * local backend has no per-request WARN scenario, and the
+   * HMAC validation is deterministic per token.
    */
-  async verify(token: string): Promise<VerifiedToken> {
+  async verify(token: string, _context?: import("./types.js").VerifyContext): Promise<VerifiedToken> {
     // v1's `validateBearer` returns a discriminated union; the
     // middleware used to translate that to the HTTP envelope. The
     // typed-error contract flattens the union into a single

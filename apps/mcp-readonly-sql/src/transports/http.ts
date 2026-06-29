@@ -66,6 +66,26 @@ export function runHttpTransport(options: RunHttpTransportOptions): HttpTranspor
     host: config.host,
     port: config.port,
     path: config.path,
+    // Phase 1b (external-token-authority-verification): the
+    // resolved `TokenAuthority` is the single source of truth
+    // for token verification. When the JWKS backend is selected
+    // (MCP_AUTHORITY_URL is set), the agent id is the JWT
+    // subject and the scopes are the JWT `scopes` claim. When
+    // the local backend is selected (the unset-env default),
+    // the agent id is the local roster `id` and the scopes
+    // are the local `scopes` array. Either way, the middleware
+    // in the shared base calls `authority.verify(token)` and
+    // the result flows through unchanged.
+    authority: config.authority,
+    // Phase 1b: the audit-safe label that `/healthz` exposes.
+    // "local" when MCP_AUTHORITY_URL is unset, "jwks" when set.
+    authorityBackend: config.authorityBackend,
+    // The legacy `agents` + `hmacSecret` fields are kept for
+    // back-compat with the Phase 1a back-compat shim in the
+    // shared base. The shared base builds a `LocalRosterAuthority`
+    // from these when `authority` is absent. We pass them
+    // anyway so the wiring is explicit; the shared base
+    // prefers `authority` when both are present.
     agents: config.agents,
     hmacSecret: config.hmacSecret,
     sessionMode: config.sessionMode,

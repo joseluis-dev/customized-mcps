@@ -20,6 +20,21 @@ export type { LogFormat };
 export type LogContext = {
   agentId?: string;
   requestId?: string;
+  /**
+   * The JWT `kid` (key id) for kid-miss WARN lines on the
+   * JWKS authority backend. Phase 1b added this field so the
+   * structured log can be indexed by the missing kid without
+   * re-parsing the message body.
+   */
+  kid?: string;
+  /**
+   * The first 8 hex chars of SHA-256(token) — the token
+   * fingerprint prefix. Phase 1b added this for the same
+   * reason as `kid`: indexed in the structured log so
+   * operators can correlate a kid-miss WARN with a captured
+   * token without seeing the full token in the message body.
+   */
+  tokenFp?: string;
 };
 
 export type Logger = {

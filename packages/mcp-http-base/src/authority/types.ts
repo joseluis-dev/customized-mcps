@@ -55,13 +55,33 @@ export type VerifiedToken = {
 };
 
 /**
+ * Optional per-request context passed to `TokenAuthority.verify`.
+ *
+ * Phase 1b's `JwksAuthority` uses this to attach the X-Request-Id
+ * (sanitized by the shared base's `sanitizeRequestId`) to the
+ * second-miss WARN log line, so an operator can correlate a
+ * kid-miss WARN with the request that triggered it. The
+ * `LocalRosterAuthority` ignores the context (the local backend
+ * has no per-request WARN scenario). Future backends (e.g.
+ * `IntrospectionAuthority`) may use additional fields.
+ *
+ * The field is intentionally narrow: only the values the spec
+ * requires in WARN lines, plus a slot for future fields. The
+ * middleware MUST sanitize `requestId` (the X-Request-Id header
+ * is untrusted client input) before passing it in.
+ */
+export type VerifyContext = {
+  requestId?: string;
+};
+
+/**
  * The contract every resource-server-side token verifier must
  * implement. The shared base's HTTP middleware calls
- * `verify(token)` for every request that arrives with a bearer
- * header.
+ * `verify(token, context)` for every request that arrives with a
+ * bearer header.
  */
 export interface TokenAuthority {
-  verify(token: string): Promise<VerifiedToken>;
+  verify(token: string, context?: VerifyContext): Promise<VerifiedToken>;
   /**
    * Optional startup probe. Implementations that need to pre-fetch
    * state (e.g. a JWKS) MAY implement this. The app-side config

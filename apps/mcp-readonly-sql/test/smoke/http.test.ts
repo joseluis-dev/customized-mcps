@@ -273,10 +273,14 @@ describe("smoke/http - Phase 4 cross-PR verification", () => {
       if (started) await stopHttpServer(started.proc);
     });
 
-    it("returns 200 'ok' before SIGTERM (proves the app bound and the listener is reachable)", async () => {
+    it("returns 200 with status=ok and authorityBackend=local before SIGTERM (proves the app bound and the listener is reachable)", async () => {
+      // Phase 1b: the health endpoint returns JSON with the
+      // `authorityBackend` field (per the mcp-token-authority spec).
       const res = await http("GET", started!.port, "/healthz");
       expect(res.status).toBe(200);
-      expect(res.body).toBe("ok");
+      const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
+      expect(body.status).toBe("ok");
+      expect(body.authorityBackend).toBe("local");
     });
   });
 

@@ -115,22 +115,30 @@ describe("createHttpMcpServer", () => {
   });
 
   describe("/healthz (unauthenticated)", () => {
-    it("returns 200 'ok' while healthy", async () => {
+    it("returns 200 with status=ok and authorityBackend=local while healthy", async () => {
+      // Phase 1b: the health endpoint returns JSON so it can carry
+      // the `authorityBackend` field per the mcp-token-authority spec.
+      // The body MUST NOT include tokens, `kid`, JWKS URL, or
+      // authority URL.
       const { handle, port } = await startServer(makeOptions());
       stopHandle = handle;
       const res = await http(port, "GET", "/healthz");
       expect(res.status).toBe(200);
-      expect(res.body).toBe("ok");
+      const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
+      expect(body.status).toBe("ok");
+      expect(body.authorityBackend).toBe("local");
     });
 
-    it("returns 503 'shutting-down' once the controller has been signaled", async () => {
+    it("returns 503 with status=shutting-down once the controller has been signaled", async () => {
       const opts = makeOptions();
       const { handle, port } = await startServer(opts);
       stopHandle = handle;
       handle.shutdownController.markShuttingDown();
       const res = await http(port, "GET", "/healthz");
       expect(res.status).toBe(503);
-      expect(res.body).toBe("shutting-down");
+      const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
+      expect(body.status).toBe("shutting-down");
+      expect(body.authorityBackend).toBe("local");
     });
   });
 

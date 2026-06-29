@@ -49,11 +49,14 @@ export {
  */
 export {
   LocalRosterAuthority,
+  JwksAuthority,
   AuthorityUnavailableError,
   TokenInvalidError,
+  type JwksAuthorityOptions,
   type LocalRosterAuthorityOptions,
   type TokenAuthority,
   type VerifiedToken,
+  type VerifyContext,
 } from "./authority/index.js";
 
 export {

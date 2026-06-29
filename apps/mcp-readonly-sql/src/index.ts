@@ -113,9 +113,12 @@ async function runStdioServer(): Promise<void> {
 
 async function runHttpServer(): Promise<void> {
   // 1. Load HTTP config + agents. Fail-closed on any validation error.
+  // Phase 1b: the loader is async because the JWKS backend's startup
+  // probe (`warm()`) is awaited here so a misconfigured authority URL
+  // fails fast at startup.
   let config;
   try {
-    config = loadHttpRuntimeConfig();
+    config = await loadHttpRuntimeConfig();
   } catch (e) {
     const message = e instanceof HttpRuntimeConfigError
       ? e.message

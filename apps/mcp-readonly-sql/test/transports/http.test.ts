@@ -6,6 +6,10 @@ import { runHttpTransport } from "../../src/transports/http.js";
 import { buildReadOnlyMcpServer } from "../../src/serverFactory.js";
 import type { Profile, SafetyLimits } from "../../src/types.js";
 import type { HttpRuntimeConfig } from "../../src/config/http.js";
+import {
+  LocalRosterAuthority,
+  type Logger,
+} from "@customized-mcps/mcp-http-base";
 
 const HMAC_SECRET = "x".repeat(32);
 const TOKEN = "tok-a";
@@ -63,6 +67,29 @@ function makeConfig(overrides: Partial<HttpRuntimeConfig> = {}): HttpRuntimeConf
       },
     ],
     allowUnboundedBody: false,
+    // Phase 1b: defaults for the new authority fields. The legacy
+    // tests use the local backend; the explicit
+    // LocalRosterAuthority construction here keeps the existing
+    // HMAC + scope behavior unchanged.
+    authority: new LocalRosterAuthority({
+      agents: [
+        {
+          id: "agent-a",
+          keyHash: KEY_HASH,
+          scopes: ["read:*"],
+        },
+      ],
+      hmacSecret: HMAC_SECRET,
+      logger: silentLogger(),
+    }),
+    authorityBackend: "local",
+    // Phase 1b env vars: defaults (undefined for unset).
+    authorityUrl: undefined,
+    authorityJwksUrl: undefined,
+    authorityAudience: undefined,
+    authorityJwksTtlSeconds: 60,
+    authorityLeewaySeconds: 30,
+    authorityFetchTimeoutMs: 5000,
     ...overrides,
   };
 }
@@ -137,7 +164,11 @@ describe("transports/http", () => {
       const port = Number(new URL(handle.url).port);
       const res = await http(port, "GET", "/healthz");
       expect(res.status).toBe(200);
-      expect(res.body).toBe("ok");
+      // Phase 1b: the health endpoint returns JSON with the
+      // `authorityBackend` field (per the mcp-token-authority spec).
+      const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
+      expect(body.status).toBe("ok");
+      expect(body.authorityBackend).toBe("local");
     });
 
     it("returns 401 when a request to /mcp has no Authorization header", async () => {
@@ -177,7 +208,7 @@ describe("transports/http", () => {
     it("exposes /healthz outside the authenticated path (no Authorization required)", async () => {
       // GIVEN the server is up
       // WHEN an unauthenticated GET /healthz is sent
-      // THEN the response is 200 with body "ok"
+      // THEN the response is 200 with body { status: "ok", authorityBackend: "local" }
       const cfg = makeConfig({ port: 0 });
       const handle = runHttpTransport({ config: cfg, serverFactory: () => buildReadOnlyMcpServer({ profiles: [FAKE_SQLITE_PROFILE], limits: TEST_LIMITS }).server });
       await handle.start();
@@ -185,7 +216,9 @@ describe("transports/http", () => {
       const port = Number(new URL(handle.url).port);
       const res = await http(port, "GET", "/healthz");
       expect(res.status).toBe(200);
-      expect(res.body).toBe("ok");
+      const body = JSON.parse(res.body) as { status?: string; authorityBackend?: string };
+      expect(body.status).toBe("ok");
+      expect(body.authorityBackend).toBe("local");
     });
 
     it("stop() closes the listener (subsequent /healthz attempts fail with ECONNREFUSED)", async () => {

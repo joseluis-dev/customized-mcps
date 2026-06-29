@@ -5,6 +5,15 @@
  * the unit tests do not need to mutate `process.env`. The app (PR2) is
  * responsible for reading the env, calling this function, and exiting
  * non-zero with a stderr message on `HttpConfigError`.
+ *
+ * Phase 1b of `external-token-authority-verification` adds six authority
+ * env vars (MCP_AUTHORITY_URL, MCP_AUTHORITY_JWKS_URL, MCP_AUTHORITY_AUDIENCE,
+ * MCP_AUTHORITY_JWKS_TTL_S, MCP_AUTHORITY_LEEWAY_S, MCP_AUTHORITY_FETCH_TIMEOUT_MS).
+ * The integer fields have documented defaults (60/30/5000); the URL
+ * fields are `undefined` when unset. When MCP_AUTHORITY_URL is set,
+ * MCP_AUTHORITY_AUDIENCE is REQUIRED — the audit-safe posture is to
+ * reject an empty audience so a token issued by the authority for any
+ * other audience cannot be accepted.
  */
 
 export type LogFormat = "text" | "json";
@@ -25,6 +34,13 @@ export type HttpConfigInput = {
   MCP_HTTP_ALLOW_INSECURE_BIND: string | undefined;
   /** Deprecated alias kept for backward compatibility. Prefer ALLOW_INSECURE_BIND. */
   MCP_HTTP_ALLOW_INSECURE_LOOPBACK: string | undefined;
+  // Phase 1b (external-token-authority-verification):
+  MCP_AUTHORITY_URL: string | undefined;
+  MCP_AUTHORITY_JWKS_URL: string | undefined;
+  MCP_AUTHORITY_AUDIENCE: string | undefined;
+  MCP_AUTHORITY_JWKS_TTL_S: string | undefined;
+  MCP_AUTHORITY_LEEWAY_S: string | undefined;
+  MCP_AUTHORITY_FETCH_TIMEOUT_MS: string | undefined;
 };
 
 export type HttpConfig = {
@@ -39,6 +55,18 @@ export type HttpConfig = {
   agentsInline: string | undefined;
   behindProxy: boolean;
   allowInsecureBind: boolean;
+  // Phase 1b (external-token-authority-verification): the six
+  // authority env vars. When `authorityUrl` is `undefined`, the
+  // app uses the local-roster backend; when set, the app uses
+  // the JWKS backend. The integer fields have the documented
+  // defaults (60/30/5000). The audience is REQUIRED when the
+  // URL is set.
+  authorityUrl: string | undefined;
+  authorityJwksUrl: string | undefined;
+  authorityAudience: string | undefined;
+  authorityJwksTtlSeconds: number;
+  authorityLeewaySeconds: number;
+  authorityFetchTimeoutMs: number;
 };
 
 export class HttpConfigError extends Error {
@@ -121,6 +149,46 @@ export function parseHttpConfig(input: HttpConfigInput): HttpConfig {
     );
   }
 
+  // Phase 1b (external-token-authority-verification): the six
+  // authority env vars. The integer fields have documented
+  // defaults (60/30/5000). When MCP_AUTHORITY_URL is set,
+  // MCP_AUTHORITY_AUDIENCE is REQUIRED — an empty audience would
+  // let any token issued by the authority be accepted. The
+  // shared config layer is permissive on the JWKS URL: the
+  // app-side loader enforces the fail-closed check on the
+  // (URL, JWKS URL) pair.
+  const authorityUrl = nonEmpty(input.MCP_AUTHORITY_URL);
+  const authorityAudience = nonEmpty(input.MCP_AUTHORITY_AUDIENCE);
+  if (authorityUrl !== undefined && authorityAudience === undefined) {
+    throw new HttpConfigError(
+      `MCP_AUTHORITY_AUDIENCE is required when MCP_AUTHORITY_URL is set. ` +
+        `An empty audience would let any token issued by the authority be accepted; ` +
+        `the spec requires fail-closed on this field. Set MCP_AUTHORITY_AUDIENCE to the ` +
+        `value the authority issues tokens for.`,
+    );
+  }
+  const authorityJwksTtlSeconds = parseStrictInteger(
+    input.MCP_AUTHORITY_JWKS_TTL_S,
+    60,
+    "MCP_AUTHORITY_JWKS_TTL_S",
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+  const authorityLeewaySeconds = parseStrictInteger(
+    input.MCP_AUTHORITY_LEEWAY_S,
+    30,
+    "MCP_AUTHORITY_LEEWAY_S",
+    0,
+    Number.MAX_SAFE_INTEGER,
+  );
+  const authorityFetchTimeoutMs = parseStrictInteger(
+    input.MCP_AUTHORITY_FETCH_TIMEOUT_MS,
+    5000,
+    "MCP_AUTHORITY_FETCH_TIMEOUT_MS",
+    1,
+    Number.MAX_SAFE_INTEGER,
+  );
+
   return {
     host,
     port,
@@ -133,6 +201,12 @@ export function parseHttpConfig(input: HttpConfigInput): HttpConfig {
     agentsInline: nonEmpty(input.MCP_AGENTS_INLINE),
     behindProxy,
     allowInsecureBind,
+    authorityUrl,
+    authorityJwksUrl: nonEmpty(input.MCP_AUTHORITY_JWKS_URL),
+    authorityAudience,
+    authorityJwksTtlSeconds,
+    authorityLeewaySeconds,
+    authorityFetchTimeoutMs,
   };
 }
 
