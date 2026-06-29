@@ -16,6 +16,20 @@
  * `src/db/`, and `src/oauth/`. The entrypoint is the
  * composition root.
  *
+ * Env loading: this file imports `dotenv/config` BEFORE any
+ * other module so the `process.env.*` reads below see the
+ * values from the per-app `.env` file (the same file the
+ * systemd unit mounts via `EnvironmentFile=`). Without this
+ * import, every `process.env.*` lookup returns `undefined`
+ * in dev / `node dist/index.js` and the operator's
+ * `.env` is silently ignored — a bug that surfaced as
+ * "env vars are not loading". The companion app
+ * `apps/mcp-readonly-sql` loads dotenv the same way
+ * (see `apps/mcp-readonly-sql/src/config/env.ts`); the
+ * deploy contract (`deploy/systemd/mcp-oauth-admin.service`)
+ * explicitly assumes dotenv runs at startup. Side-effect
+ * import only; we never reference `dotenv` again.
+ *
  * Audit-safety:
  * - The bootstrap admin's password is read from
  *   `MCP_OAUTH_ADMIN_PASSWORD` and stored as an `argon2id`
@@ -28,6 +42,7 @@
  *   invalidates sessions" rule).
  */
 
+import "dotenv/config";
 import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { openDatabase, initializeSchema, defaultDatabasePath, drainWriterChain } from "./db/index.js";

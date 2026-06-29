@@ -55,6 +55,50 @@ describe("entrypoint — module exists (W1 remediation)", () => {
   });
 });
 
+describe("entrypoint — env loading (dotenv regression)", () => {
+  it("src/index.ts imports `dotenv/config` BEFORE other modules", () => {
+    // Regression: previously the entrypoint read process.env.*
+    // for MCP_HTTP_HOST, MCP_HTTP_PORT, MCP_OAUTH_ADMIN_*,
+    // MCP_OAUTH_BACKUP_*, etc. without ever loading the per-app
+    // .env file. The systemd unit (`deploy/systemd/mcp-oauth-admin.service`)
+    // and the companion app (`apps/mcp-readonly-sql`) both
+    // assume dotenv runs at startup; the entrypoint must do
+    // the same. The import must come first so every later
+    // `process.env.*` read sees the loaded values.
+    const path = join(APP_ROOT, "src", "index.ts");
+    const content = readFileSync(path, "utf8");
+    expect(content).toMatch(/import\s+["']dotenv\/config["']/);
+    // The dotenv import must precede the first CODE line
+    // that reads `process.env.*`. We walk the file line by
+    // line and skip JSDoc / line comments (which legitimately
+    // mention `process.env` in prose) so the assertion
+    // reflects runtime ordering, not documentation order.
+    const lines = content.split(/\r?\n/);
+    const dotenvLine = lines.findIndex((l) => /import\s+["']dotenv\/config["']/.test(l));
+    const firstCodeEnvRead = lines.findIndex(
+      (l, idx) =>
+        idx > dotenvLine &&
+        !/^\s*(\/\/|\*|\/\*)/.test(l) &&
+        /process\.env\./.test(l),
+    );
+    expect(dotenvLine).toBeGreaterThanOrEqual(0);
+    expect(firstCodeEnvRead).toBeGreaterThanOrEqual(0);
+    expect(dotenvLine).toBeLessThan(firstCodeEnvRead);
+  });
+
+  it("package.json declares `dotenv` as a runtime dependency", () => {
+    // The runtime dep is required so the `import "dotenv/config"`
+    // line above resolves when the app is started via
+    // `node dist/index.js`. `dotenv` is already in the
+    // pnpm-lock (used by `apps/mcp-readonly-sql`), so the
+    // pnpm install reuses the existing resolution.
+    const pkg = JSON.parse(readFileSync(join(APP_ROOT, "package.json"), "utf8")) as {
+      dependencies?: Record<string, string>;
+    };
+    expect(pkg.dependencies?.["dotenv"]).toBeDefined();
+  });
+});
+
 describe("entrypoint — package.json scripts resolve", () => {
   it("package.json declares `bin.mcp-oauth-admin` pointing at dist/index.js", () => {
     const pkg = JSON.parse(readFileSync(join(APP_ROOT, "package.json"), "utf8")) as {

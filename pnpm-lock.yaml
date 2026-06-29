@@ -16,6 +16,9 @@ importers:
       argon2:
         specifier: ^0.44.0
         version: 0.44.0
+      dotenv:
+        specifier: ^16.4.7
+        version: 16.6.1
       jose:
         specifier: ^5.9.0
         version: 5.10.0
