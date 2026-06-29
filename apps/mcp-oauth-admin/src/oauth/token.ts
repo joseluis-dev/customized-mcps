@@ -3,7 +3,8 @@
  *
  * The mcp-oauth-authority spec requires:
  * - `POST /oauth/token` accepts `client_credentials`,
- *   `password`, and `refresh_token` grants.
+ *   `password`, `refresh_token`, and `authorization_code`
+ *   grants.
  * - The response is an RS256 JWT with the spec claims
  *   (`iss`, `aud=mcp:<app>`, `sub`, `scope`, `iat`,
  *   `nbf`, `exp`, `kid` header) and `expires_in=3600`.
@@ -14,14 +15,19 @@
  *   NEVER `*`.
  * - `refresh_token` grant REJECTS tokens whose `revokedAt`
  *   is non-null with `400 invalid_grant`.
+ * - `authorization_code` grant REQUIRES PKCE S256, the
+ *   `redirect_uri` MUST be byte-equal to the value bound
+ *   to the `code`, the `code` is single-use, expires in
+ *   ≤ 60 seconds, and the `sub` claim is `user:<agentId>`.
  *
  * Audit-safety: errors MUST NOT include the supplied
  * password, the resolved `agentId`, the `clientId`, the
- * `keyHash`, or the refresh-token plaintext. The handler
- * returns sanitized error shapes; structured audit logging
- * happens via the `audit_log` table (the caller is
- * expected to call the `auditAppend` helper for the
- * success/failure path).
+ * `keyHash`, the refresh-token plaintext, the
+ * `code_verifier`, the `code_challenge`, the `code`, or
+ * any authority / JWKS URL. The handler returns sanitized
+ * error shapes; structured audit logging happens via the
+ * `audit_log` table (the caller is expected to call the
+ * `auditAppend` helper for the success/failure path).
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -31,11 +37,18 @@ import { importSigningPrivateKey, type SigningKeyRecord } from "./keys.js";
 import { verifyPassword } from "./passwords.js";
 import { withSingleWriter, type AuthorityDatabase } from "../db/connection.js";
 import { SCOPE_PATTERN } from "@customized-mcps/mcp-http-base";
+import { consumeCode, isLoopbackRedirectUri } from "./authorize.js";
 
 /**
  * The dependencies the token handler needs. The wiring is
  * passed in by the app's main listener so the handler stays
  * driver-agnostic.
+ *
+ * `now` is a test-injection point. Production callers
+ * omit it; the verifier phase (and unit tests) may pass a
+ * custom clock so the TTL boundary (`expiresAt <= now`)
+ * is deterministic. The value is the Unix-seconds
+ * timestamp the handler passes to `consumeCode`.
  */
 export type TokenHandlerDeps = {
   db: AuthorityDatabase;
@@ -44,7 +57,12 @@ export type TokenHandlerDeps = {
   defaultScope: string;
   accessTokenTtlSeconds: number;
   activeKey: SigningKeyRecord;
+  now?: () => number;
 };
+
+function getNow(deps: TokenHandlerDeps): number {
+  return deps.now ? deps.now() : Math.floor(Date.now() / 1000);
+}
 
 const CLIENT_SCOPE_PATTERN = /^[A-Za-z0-9_*.:\s-]+$/;
 
@@ -74,6 +92,9 @@ export function createTokenHandler(
     }
     if (grant === "refresh_token") {
       return handleRefreshTokenGrant(deps, params, res);
+    }
+    if (grant === "authorization_code") {
+      return handleAuthorizationCodeGrant(deps, params, res);
     }
     return writeJson(res, 400, { error: "unsupported_grant_type" });
   };
@@ -269,6 +290,122 @@ function parseScopeList(raw: string | null | undefined): string[] {
   } catch {
     return [];
   }
+}
+
+/**
+ * The `authorization_code` grant (Authorization Code + PKCE).
+ *
+ * Flow (per the mcp-oauth-authority spec):
+ * 1. Read `code`, `redirect_uri`, `code_verifier`,
+ *    `client_id`, `client_secret` from the form body.
+ * 2. The `redirect_uri` MUST be loopback (RFC 8252 §7.3)
+ *    and MUST byte-equal the value bound to the `code`.
+ *    A non-loopback URI is rejected with `400 invalid_grant`.
+ * 3. The client MUST be registered; the `client_secret`
+ *    MUST verify against the stored hash. A failure is
+ *    `400 invalid_client`.
+ * 4. `consumeCode(code, now)` is single-use: a second
+ *    call returns `null`. An expired code
+ *    (`expiresAt <= now`) also returns `null`. The
+ *    handler maps both to `400 invalid_grant` with a
+ *    sanitized body.
+ * 5. The PKCE check: the handler computes
+ *    `base64url(sha256(code_verifier))` and compares it
+ *    to the `code_challenge` bound to the `code`. A
+ *    mismatch is `400 invalid_grant`.
+ * 6. On success, the handler mints an RS256 JWT with
+ *    `sub = user:<agentId>` and the consented `scopes`
+ *    from the `CodeRecord`. The response is the standard
+ *    OAuth2 token shape (`access_token`, `token_type`,
+ *    `expires_in`, `scope`).
+ *
+ * Audit-safety: every error path returns
+ * `{ error: "invalid_grant" }` with no internal detail.
+ * The supplied `code_verifier`, `code_challenge`, and
+ * `clientId` are NEVER echoed in the response body.
+ */
+async function handleAuthorizationCodeGrant(
+  deps: TokenHandlerDeps,
+  params: URLSearchParams,
+  res: ServerResponse,
+): Promise<void> {
+  const code = params.get("code") ?? "";
+  const redirectUri = params.get("redirect_uri") ?? "";
+  const codeVerifier = params.get("code_verifier") ?? "";
+  const clientId = params.get("client_id") ?? "";
+  const clientSecret = params.get("client_secret") ?? "";
+  if (code.length === 0 || redirectUri.length === 0 || codeVerifier.length === 0 || clientId.length === 0 || clientSecret.length === 0) {
+    return writeJson(res, 400, { error: "invalid_request" });
+  }
+  // Enforce the loopback rule on the token request.
+  // The spec is explicit: the token endpoint accepts
+  // `redirect_uri` only when it matches RFC 8252 §7.3.
+  // A non-loopback URI is a hostile-redirect attempt
+  // and is rejected with `invalid_grant` (the body is
+  // sanitized — no host or scheme is echoed).
+  if (!isLoopbackRedirectUri(redirectUri)) {
+    return writeJson(res, 400, { error: "invalid_grant" });
+  }
+  // Verify the client. We do this BEFORE consuming the
+  // code so a wrong `client_secret` does not burn a
+  // valid code. The `401 invalid_client` is the same
+  // shape the other grants use.
+  const clientRows = await deps.db.select<{ id: number; clientSecretHash: string }>(
+    "SELECT id, clientSecretHash FROM clients WHERE clientId = ?",
+    [clientId],
+  );
+  const client = clientRows[0];
+  if (!client) {
+    return writeJson(res, 401, { error: "invalid_client" });
+  }
+  const clientOk = await verifyPassword(client.clientSecretHash, clientSecret);
+  if (!clientOk) {
+    return writeJson(res, 401, { error: "invalid_client" });
+  }
+  // Consume the code. `consumeCode` is single-use: the
+  // second call returns `null` even within the TTL.
+  // An expired code also returns `null`. Both cases
+  // map to `invalid_grant` (the spec's mandated shape).
+  const now = getNow(deps);
+  const record = consumeCode(code, now);
+  if (record === null) {
+    return writeJson(res, 400, { error: "invalid_grant" });
+  }
+  // Bind the code to the client. A code issued to
+  // client-a MUST NOT be exchanged by client-b.
+  if (record.clientId !== clientId) {
+    return writeJson(res, 400, { error: "invalid_grant" });
+  }
+  // Bind the code to the exact `redirect_uri` (the spec
+  // is explicit: the comparison is byte-equal). A
+  // different port, path, or query string is a hostile
+  // open-redirect attempt and is rejected.
+  if (record.redirectUri !== redirectUri) {
+    return writeJson(res, 400, { error: "invalid_grant" });
+  }
+  // PKCE S256 verify. The challenge is the value bound
+  // to the code at issue time; the verifier is
+  // supplied on the token request. The handler
+  // computes `base64url(sha256(verifier))` and compares
+  // it to the challenge. A mismatch is `invalid_grant`.
+  const challenge = createHash("sha256").update(codeVerifier, "utf8").digest("base64url");
+  if (challenge !== record.codeChallenge) {
+    return writeJson(res, 400, { error: "invalid_grant" });
+  }
+  // Mint the JWT. The `sub` is `user:<agentId>` so the
+  // resource server can resolve the agent without an
+  // extra DB lookup. The consented scopes are the
+  // values bound to the code (NOT the client's allowed
+  // scopes — the user explicitly consented to this
+  // set).
+  const sub = `user:${record.agentId}`;
+  const token = await mintAccessToken(deps, sub, record.scopes);
+  return writeJson(res, 200, {
+    access_token: token,
+    token_type: "Bearer",
+    expires_in: deps.accessTokenTtlSeconds,
+    scope: record.scopes.join(" "),
+  });
 }
 
 /**

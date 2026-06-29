@@ -25,16 +25,16 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { createHmac, createHash, randomBytes } from "node:crypto";
 import { generateKeyPair, exportJWK, exportPKCS8, calculateJwkThumbprint, jwtVerify, importPKCS8 } from "jose";
-import { createHmac } from "node:crypto";
-import { createHash } from "node:crypto";
 import { openDatabase, initializeSchema, withSingleWriter } from "../../src/db/index.js";
 import { createTokenHandler, type TokenHandlerDeps } from "../../src/oauth/token.js";
 import { createIntrospectHandler } from "../../src/oauth/introspect.js";
 import { setActiveSigningKey, type SigningKeyRecord } from "../../src/oauth/keys.js";
-import { hashPassword, verifyPassword } from "../../src/oauth/passwords.js";
+import { hashPassword } from "../../src/oauth/passwords.js";
+import { _resetCodeStore, getCodeStore, type CodeRecord } from "../../src/oauth/authorize.js";
 
 async function makeTestKey(): Promise<SigningKeyRecord> {
   const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
@@ -55,12 +55,14 @@ async function setupApp(opts: {
   audience: string;
   issuer: string;
   defaultScope: string;
-}): Promise<{ baseUrl: string; db: ReturnType<typeof openDatabase>; key: SigningKeyRecord; server: Server }> {
+  now?: () => number;
+}): Promise<{ baseUrl: string; db: ReturnType<typeof openDatabase>; key: SigningKeyRecord; server: Server; now: () => number }> {
   const db = openDatabase({ path: ":memory:" });
   await initializeSchema(db);
   const key = await makeTestKey();
   await setActiveSigningKey(db, key);
 
+  const now = opts.now ?? (() => Math.floor(Date.now() / 1000));
   const deps: TokenHandlerDeps = {
     db,
     issuer: opts.issuer,
@@ -68,6 +70,7 @@ async function setupApp(opts: {
     defaultScope: opts.defaultScope,
     accessTokenTtlSeconds: 3600,
     activeKey: key,
+    now,
   };
   const tokenHandler = createTokenHandler(deps);
   const introspectHandler = createIntrospectHandler(deps);
@@ -84,7 +87,7 @@ async function setupApp(opts: {
   await new Promise<void>((resolveP) => server.listen(0, "127.0.0.1", () => resolveP()));
   const port = (server.address() as AddressInfo).port;
   const baseUrl = `http://127.0.0.1:${port}`;
-  return { baseUrl, db, key, server };
+  return { baseUrl, db, key, server, now };
 }
 
 async function teardownApp(ctx: { db: ReturnType<typeof openDatabase>; server: Server }): Promise<void> {
@@ -453,6 +456,289 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
     );
     expect(verified.payload.aud).toBe("mcp:readonly-sql");
+  });
+});
+
+describe("oauth/token (authorization_code grant — PKCE S256)", () => {
+  let ctx: Awaited<ReturnType<typeof setupApp>>;
+  let userId: number;
+  let clientId: string;
+  const clientSecret = "s3cret";
+  const redirectUri = "http://127.0.0.1:8080/cb";
+  let verifier: string;
+  let challenge: string;
+  let nowRef: { value: number };
+
+  beforeEach(async () => {
+    _resetCodeStore();
+    nowRef = { value: 1_700_000_000 };
+    ctx = await setupApp({
+      audience: "mcp:readonly-sql",
+      issuer: "http://127.0.0.1:3002",
+      defaultScope: "read:bi_catastro",
+      now: () => nowRef.value,
+    });
+    // Pre-register the user + client. The agent's id is
+    // captured for the `sub=user:<id>` assertion.
+    const userHash = await makeArgonHash("p4ssw0rd");
+    const clientHash = await makeArgonHash(clientSecret);
+    clientId = "client-a";
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        ["alice", userHash, JSON.stringify(["read:bi_catastro"]), 1, 0, nowRef.value],
+      );
+      const userRows = await trx.select<{ id: number }>(
+        "SELECT id FROM users WHERE username = ?",
+        ["alice"],
+      );
+      userId = userRows[0]!.id;
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        [clientId, clientHash, "test", JSON.stringify(["read:bi_catastro"]), nowRef.value],
+      );
+    });
+    verifier = randomBytes(32).toString("base64url");
+    challenge = createHash("sha256").update(verifier).digest("base64url");
+  });
+
+  afterEach(async () => {
+    _resetCodeStore();
+    await teardownApp(ctx);
+  });
+
+  function seedCode(overrides: Partial<CodeRecord> = {}): string {
+    const code = `code-${Math.random().toString(36).slice(2, 10)}`;
+    getCodeStore().set(code, {
+      clientId,
+      agentId: userId,
+      redirectUri,
+      codeChallenge: challenge,
+      codeChallengeMethod: "S256",
+      scopes: ["read:bi_catastro"],
+      expiresAt: nowRef.value + 60,
+      ...overrides,
+    });
+    return code;
+  }
+
+  it("happy path: returns a JWT with sub=user:<agentId> and the consented scopes", async () => {
+    // GIVEN a freshly-issued code
+    // WHEN we POST grant_type=authorization_code with
+    //      the matching code_verifier
+    // THEN the response is 200 + a JWT whose:
+    //   - sub is `user:<id>` (the agent's id)
+    //   - scope matches the consented scope set
+    //   - aud and iss match the authority config
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      access_token: string;
+      token_type: string;
+      expires_in: number;
+      scope: string;
+    };
+    expect(json.token_type).toBe("Bearer");
+    expect(json.expires_in).toBe(3600);
+    expect(json.scope).toBe("read:bi_catastro");
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      {
+        issuer: "http://127.0.0.1:3002",
+        audience: "mcp:readonly-sql",
+        algorithms: ["RS256"],
+      },
+    );
+    expect(verified.payload.sub).toBe(`user:${userId}`);
+    expect(verified.payload.iss).toBe("http://127.0.0.1:3002");
+    expect(verified.payload.aud).toBe("mcp:readonly-sql");
+    expect(verified.payload.scope).toBe("read:bi_catastro");
+  });
+
+  it("PKCE S256: wrong code_verifier returns 400 invalid_grant (sanitized)", async () => {
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: "a-wrong-verifier-of-sufficient-length-for-the-grammar",
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe("invalid_grant");
+    // Sanitized: no code, no verifier, no challenge, no
+    // authority / JWKS URL leaked.
+    expect(JSON.stringify(body)).not.toMatch(/code/i);
+    expect(JSON.stringify(body)).not.toMatch(/verifier/i);
+    expect(JSON.stringify(body)).not.toMatch(/challenge/i);
+    expect(JSON.stringify(body)).not.toMatch(/127\.0\.0\.1/);
+    expect(JSON.stringify(body)).not.toMatch(/mcp:readonly-sql/);
+    // No access_token.
+    expect(body.access_token).toBeUndefined();
+  });
+
+  it("redirect_uri byte-equal: a different redirect_uri returns 400 invalid_grant", async () => {
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "http://127.0.0.1:9999/different",
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("client_id mismatch: a code bound to client-a is rejected when exchanged by client-b", async () => {
+    // Pre-register a second client.
+    const otherHash = await makeArgonHash("s3cret-b");
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-b", otherHash, "test", JSON.stringify(["read:bi_catastro"]), nowRef.value],
+      );
+    });
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: "client-b",
+        client_secret: "s3cret-b",
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("single-use: the second call with the same code returns 400 invalid_grant", async () => {
+    const code = seedCode();
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+      client_id: clientId,
+      client_secret: clientSecret,
+      code_verifier: verifier,
+    });
+    const res1 = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    expect(res1.status).toBe(200);
+    const res2 = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      // Build a fresh body — `URLSearchParams` is single-shot.
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res2.status).toBe(400);
+    const body2 = (await res2.json()) as { error: string };
+    expect(body2.error).toBe("invalid_grant");
+  });
+
+  it("expiry: a code past expiresAt returns 400 invalid_grant", async () => {
+    // Issue with a 1-second TTL; advance the clock past
+    // the boundary; the second call returns invalid_grant.
+    const code = seedCode({ expiresAt: nowRef.value + 1 });
+    // Move the clock past expiry (60s + 1 per the spec
+    // is the boundary; we use 2s past to avoid edge
+    // flakiness).
+    nowRef.value += 2;
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("missing required fields (no code, no redirect_uri) returns 400 invalid_request", async () => {
+    // No code, no redirect_uri → 400 invalid_request.
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_request");
+  });
+
+  it("non-loopback redirect_uri on the token request is rejected (400 invalid_grant)", async () => {
+    // The token handler MUST enforce the same loopback
+    // rule as the authorize handler. A non-loopback
+    // redirect_uri on the token request is rejected
+    // with sanitized `invalid_grant`.
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "https://attacker.example/cb",
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
   });
 });
 

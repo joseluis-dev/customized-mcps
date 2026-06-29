@@ -50,6 +50,7 @@ import { setActiveSigningKey } from "./oauth/keys.js";
 import { createJwksHandler, createOidcDiscoveryHandler } from "./oauth/jwks.js";
 import { createTokenHandler, type TokenHandlerDeps } from "./oauth/token.js";
 import { createIntrospectHandler, type IntrospectHandlerDeps } from "./oauth/introspect.js";
+import { createAuthorizeHandler, type AuthorizeDeps } from "./oauth/authorize.js";
 import { createAdminRouter, type AdminRouterDeps } from "./admin/router.js";
 import { generateSessionSecret } from "./admin/session.js";
 import { ensureBootstrapAdmin, resolveBootstrapEnv, shouldWarnBootstrapEnv } from "./admin/bootstrap.js";
@@ -148,6 +149,18 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
     issuer: `http://${httpConfig.host}:${httpConfig.port}`,
     audience: tokenDeps.audience,
   };
+  // Authorize handler deps. The handler reuses the admin
+  // session secret (the spec's "one login surface" rule)
+  // and the authority's `defaultScope` for the consented
+  // scope set when the request omits one. `secure` mirrors
+  // the admin router's flag so the session cookie is marked
+  // `Secure` on non-loopback deployments.
+  const authorizeDeps: AuthorizeDeps = {
+    db,
+    sessionSecret,
+    secure: !["127.0.0.1", "::1", "localhost"].includes(httpConfig.host),
+    defaultScope: tokenDeps.defaultScope,
+  };
   // Admin router deps.
   const adminDeps: AdminRouterDeps = {
     db,
@@ -190,6 +203,7 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
   const adminRouter = createAdminRouter(adminDeps);
   const tokenHandler = createTokenHandler(tokenDeps);
   const introspectHandler = createIntrospectHandler(introspectDeps);
+  const authorizeHandler = createAuthorizeHandler(authorizeDeps);
   const jwksHandler = createJwksHandler({ db });
   const oidcHandler = createOidcDiscoveryHandler({ issuer: tokenDeps.issuer });
   const server = createServer((req, res) => {
@@ -202,6 +216,9 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
     }
     if (url === "/.well-known/openid-configuration") {
       return oidcHandler(req, res);
+    }
+    if (url.startsWith("/oauth/authorize")) {
+      return authorizeHandler(req, res);
     }
     if (url === "/oauth/token") {
       return tokenHandler(req, res);

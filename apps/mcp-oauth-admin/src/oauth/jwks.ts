@@ -6,11 +6,10 @@
  *   with ONLY public components (kty, n, e, kid, use, alg).
  *   Private components (d, p, q, dp, dq, qi) MUST NOT appear.
  * - `GET /.well-known/openid-configuration` advertises the
- *   OIDC + OAuth2 endpoints (token, introspect, JWKS), the
- *   supported grant types, response types, and the issuer.
- * - `GET /oauth/authorize` returns 404 (Phase 0; the
- *   authorization-code flow is Phase 6 and is NOT advertised
- *   in the discovery doc).
+ *   OIDC + OAuth2 endpoints (token, introspect, authorize,
+ *   JWKS), the supported grant types (including
+ *   `authorization_code`), the PKCE method (`S256`), the
+ *   response types, and the issuer.
  *
  * These handlers are intentionally thin: they read the
  * current `keys` row and shape the response. The handlers
@@ -73,15 +72,17 @@ export function createJwksHandler(options: {
  *
  * Per the spec:
  * - The `issuer` is the authority URL.
- * - The `token_endpoint` and `introspection_endpoint` are
- *   advertised. (The introspect endpoint is an internal
- *   contract; we advertise it so resource servers that
- *   want to opt into the introspection path can find it.)
- * - The `authorization_endpoint` is OMITTED in v1 (the
- *   authorization-code flow is Phase 6).
+ * - The `token_endpoint`, `introspection_endpoint`, and
+ *   `authorization_endpoint` are advertised. (The
+ *   introspect endpoint is an internal contract; we
+ *   advertise it so resource servers that want to opt
+ *   into the introspection path can find it.)
  * - Supported grants: `client_credentials`, `password`,
- *   `refresh_token`. (We expose `refresh_token` for the
- *   token-endpoint refresh grant.)
+ *   `refresh_token`, `authorization_code`. (We expose
+ *   `refresh_token` for the token-endpoint refresh grant,
+ *   and `authorization_code` for the auth-code flow.)
+ * - PKCE method: `S256` only. `plain` is forbidden by
+ *   OAuth 2.1 and the spec.
  * - Signing algs: `RS256` only (the only algorithm the
  *   authority uses to sign access tokens).
  */
@@ -93,15 +94,19 @@ export function createOidcDiscoveryHandler(options: {
     const body = {
       issuer,
       jwks_uri: `${issuer}/.well-known/jwks.json`,
+      authorization_endpoint: `${issuer}/oauth/authorize`,
       token_endpoint: `${issuer}/oauth/token`,
       introspection_endpoint: `${issuer}/oauth/introspect`,
-      grant_types_supported: ["client_credentials", "password", "refresh_token"],
-      response_types_supported: ["token"],
+      grant_types_supported: [
+        "client_credentials",
+        "password",
+        "refresh_token",
+        "authorization_code",
+      ],
+      response_types_supported: ["token", "code"],
       token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
       id_token_signing_alg_values_supported: ["RS256"],
       code_challenge_methods_supported: ["S256"],
-      // `authorization_endpoint` is intentionally omitted
-      // in v1. The spec says the auth-code flow is Phase 6.
     };
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json; charset=utf-8");

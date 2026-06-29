@@ -7,10 +7,12 @@
  *   dp, dq, qi) MUST NOT appear.
  * - `/.well-known/openid-configuration` advertises the
  *   authorization endpoint, token endpoint, JWKS URI,
- *   supported grant types, supported response types, and
- *   the issuer (= MCP_AUTHORITY_URL).
- * - `/oauth/authorize` MUST return 404 (Phase 0; the
- *   authorization-code flow is Phase 6).
+ *   supported grant types (including `authorization_code`),
+ *   `code_challenge_methods_supported: ["S256"]`, supported
+ *   response types, and the issuer (= MCP_AUTHORITY_URL).
+ * - The `authorization_endpoint` URL is
+ *   `<issuer>/oauth/authorize` and the `code_challenge_methods_supported`
+ *   array contains `"S256"` (the only PKCE method v1 accepts).
  *
  * Test layer: unit + integration. The JWKS endpoint is a
  * pure handler over the public-key store. We use a real
@@ -19,7 +21,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { generateKeyPair, exportJWK, calculateJwkThumbprint } from "jose";
 import { createJwksHandler, createOidcDiscoveryHandler } from "../../src/oauth/jwks.js";
@@ -63,16 +65,12 @@ describe("oauth/jwks + openid-configuration", () => {
     const issuer = "http://127.0.0.1:0";
     const jwksHandler = createJwksHandler({ db });
     const oidcHandler = createOidcDiscoveryHandler({ issuer });
-    const notFound = (_req: IncomingMessage, res: ServerResponse) => {
-      res.statusCode = 404;
-      res.setHeader("Content-Type", "application/json");
-      res.end(JSON.stringify({ error: "not_found" }));
-    };
     server = createServer((req, res) => {
       if (req.url === "/.well-known/jwks.json") return jwksHandler(req, res);
       if (req.url === "/.well-known/openid-configuration") return oidcHandler(req, res);
-      if (req.url === "/oauth/authorize") return notFound(req, res);
-      return notFound(req, res);
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "not_found" }));
     });
     await new Promise<void>((resolveP) => server.listen(0, "127.0.0.1", () => resolveP()));
     const port = (server.address() as AddressInfo).port;
@@ -154,14 +152,23 @@ describe("oauth/jwks + openid-configuration", () => {
     expect(String(body["issuer"])).toMatch(/^http:\/\/127\.0\.0\.1:\d+$/);
     expect(body["jwks_uri"]).toBe(`${body["issuer"]}/.well-known/jwks.json`);
     expect(body["token_endpoint"]).toBe(`${body["issuer"]}/oauth/token`);
-    // The spec explicitly does NOT advertise an
-    // authorization_endpoint in v1 (Phase 6 adds the
-    // authorization-code flow).
-    expect(body["authorization_endpoint"]).toBeUndefined();
-    // Supported grant types: client_credentials + password.
+    // The spec advertises the authorization-code endpoint
+    // in v1 (PR 2 of `unified-mcp-oauth-admin-auth`).
+    // The URL is `<issuer>/oauth/authorize` so the
+    // resource server's discovery handshake lands on
+    // the same host:port as the issuer.
+    expect(body["authorization_endpoint"]).toBe(`${body["issuer"]}/oauth/authorize`);
+    // Supported grant types include the auth-code flow.
     const grantTypes = body["grant_types_supported"];
     expect(Array.isArray(grantTypes)).toBe(true);
-    expect(grantTypes).toEqual(expect.arrayContaining(["client_credentials", "password", "refresh_token"]));
+    expect(grantTypes).toEqual(
+      expect.arrayContaining(["client_credentials", "password", "refresh_token", "authorization_code"]),
+    );
+    // PKCE method advertised: S256 only (`plain` is
+    // forbidden by OAuth 2.1 and the spec).
+    const challengeMethods = body["code_challenge_methods_supported"];
+    expect(Array.isArray(challengeMethods)).toBe(true);
+    expect(challengeMethods).toEqual(["S256"]);
     // The supported response types are "token" (introspect
     // returns the active shape; the access-token response
     // is the token). The spec leaves the exact list open
@@ -173,15 +180,5 @@ describe("oauth/jwks + openid-configuration", () => {
     const algs = body["id_token_signing_alg_values_supported"];
     expect(Array.isArray(algs)).toBe(true);
     expect(algs).toContain("RS256");
-  });
-
-  it("GET /oauth/authorize returns 404 (no auth-code in v1)", async () => {
-    // GIVEN the authority is up
-    // WHEN we GET /oauth/authorize
-    // THEN the response is 404. The spec says the endpoint
-    //      MUST NOT exist in v1; the authorization-code
-    //      flow is Phase 6.
-    const res = await fetch(`${baseUrl}/oauth/authorize`);
-    expect(res.status).toBe(404);
   });
 });
