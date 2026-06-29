@@ -513,6 +513,361 @@ describe("admin/router — agent CRUD (task 3.3)", () => {
   });
 });
 
+describe("admin/router — agent scope edit (tasks 3.1, 3.2)", () => {
+  // The mcp-admin-ui spec requires:
+  // - POST /admin/agents/:id/scopes updates the agent's
+  //   scope set via the existing setAgentScopes() helper.
+  // - Submitted scope strings MUST be validated against
+  //   SCOPE_PATTERN; invalid values are rejected with a
+  //   sanitized 400 and NO DB write, NO audit_log row.
+  // - Successful writes append an audit_log row with
+  //   action="agent.set_scopes", the new scope set, and
+  //   the acting admin.
+
+  async function loginAsAdmin(): Promise<string> {
+    const { ensureBootstrapAdmin } = await import("../../src/admin/bootstrap.js");
+    await ensureBootstrapAdmin(db, { username: "root", password: "x" }, 1_700_000_000);
+    const login = await fetch(`${baseUrl}/admin/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "root", password: "x" }),
+      redirect: "manual",
+    });
+    const session = extractCookie(login, "mcp_oauth_admin_session")!;
+    const cpPage = await fetch(`${baseUrl}/admin/change-password`, {
+      headers: { Cookie: `mcp_oauth_admin_session=${session}` },
+    });
+    const csrf = extractCsrf(await readHtml(cpPage));
+    await fetch(`${baseUrl}/admin/change-password`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${session}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, new_password: "new-password-123" }),
+    });
+    const reLogin = await fetch(`${baseUrl}/admin/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "root", password: "new-password-123" }),
+      redirect: "manual",
+    });
+    return extractCookie(reLogin, "mcp_oauth_admin_session")!;
+  }
+
+  async function getCsrf(cookie: string, path: string): Promise<string> {
+    const page = await fetch(`${baseUrl}${path}`, {
+      headers: { Cookie: `mcp_oauth_admin_session=${cookie}` },
+    });
+    return extractCsrf(await readHtml(page));
+  }
+
+  async function createAgentWithScopes(
+    cookie: string,
+    username: string,
+    scopes: string,
+  ): Promise<number> {
+    const csrf = await getCsrf(cookie, "/admin/agents");
+    await fetch(`${baseUrl}/admin/agents/create`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, username, scopes }),
+      redirect: "manual",
+    });
+    const rows = await db.select<{ id: number }>("SELECT id FROM users WHERE username = ?", [username]);
+    return rows[0]!.id;
+  }
+
+  it("POST /admin/agents/:id/scopes with a valid scope set updates the row and writes audit_log (task 3.1)", async () => {
+    const cookie = await loginAsAdmin();
+    const id = await createAgentWithScopes(cookie, "alice", "read:foo");
+    const csrf = await getCsrf(cookie, "/admin/agents");
+    // WHEN we POST a new scope set
+    const res = await fetch(`${baseUrl}/admin/agents/${id}/scopes`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, scopes: "read:foo list:foo" }),
+      redirect: "manual",
+    });
+    // THEN the response is 302 (back to the agents list)
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/admin/agents");
+    // AND the row is updated
+    const after = await db.select<{ scopes: string }>("SELECT scopes FROM users WHERE id = ?", [id]);
+    const parsed = JSON.parse(after[0]!.scopes) as string[];
+    expect(parsed.sort()).toEqual(["list:foo", "read:foo"]);
+    // AND an audit_log row records the change
+    const rows = await db.select<{
+      action: string;
+      actor: string;
+      target: string | null;
+      outcome: string;
+    }>(
+      "SELECT action, actor, target, outcome FROM audit_log WHERE action = 'agent.set_scopes'",
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.actor).toBe("root");
+    expect(rows[0]!.target).toBe(`user:${id}`);
+    expect(rows[0]!.outcome).toBe("ok");
+  });
+
+  it("POST /admin/agents/:id/scopes with an INVALID scope is rejected (400) with no DB write and no audit_log row (task 3.1)", async () => {
+    const cookie = await loginAsAdmin();
+    const id = await createAgentWithScopes(cookie, "alice", "read:foo");
+    const csrf = await getCsrf(cookie, "/admin/agents");
+    // The audit log is empty to start (the create call
+    // didn't log anything either). Capture the baseline
+    // BEFORE the bad POST so we can assert no NEW row is
+    // written.
+    const baseline = await db.select<{ id: number }>("SELECT id FROM audit_log");
+    const before = baseline.length;
+
+    // WHEN we POST an invalid scope
+    const res = await fetch(`${baseUrl}/admin/agents/${id}/scopes`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, scopes: "read:foo not-a-scope" }),
+      redirect: "manual",
+    });
+    // THEN the response is 400 (sanitized)
+    expect(res.status).toBe(400);
+    const html = await readHtml(res);
+    expect(html).toMatch(/not valid|invalid/i);
+    // AND the response MUST NOT include the bad scope
+    // (audit-safety: the page does not echo the bad value
+    // in a context that helps an attacker probe).
+    expect(html).not.toContain("not-a-scope");
+    // AND the row is unchanged
+    const after = await db.select<{ scopes: string }>("SELECT scopes FROM users WHERE id = ?", [id]);
+    expect(JSON.parse(after[0]!.scopes)).toEqual(["read:foo"]);
+    // AND no audit_log row was written (success or denied)
+    const now = await db.select<{ id: number; action: string }>("SELECT id, action FROM audit_log");
+    expect(now.length).toBe(before);
+  });
+
+  it("POST /admin/agents/:id/scopes accepts an EMPTY scope set (clears the scopes)", async () => {
+    // An empty scope set is allowed (the agent has no
+    // scopes; the token endpoint falls back to the default
+    // scope for that grant). The form's `scopes` field is
+    // a space-separated string; an empty string parses to
+    // an empty array.
+    const cookie = await loginAsAdmin();
+    const id = await createAgentWithScopes(cookie, "alice", "read:foo");
+    const csrf = await getCsrf(cookie, "/admin/agents");
+    const res = await fetch(`${baseUrl}/admin/agents/${id}/scopes`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, scopes: "" }),
+      redirect: "manual",
+    });
+    expect(res.status).toBe(302);
+    const after = await db.select<{ scopes: string }>("SELECT scopes FROM users WHERE id = ?", [id]);
+    expect(JSON.parse(after[0]!.scopes)).toEqual([]);
+  });
+
+  it("POST /admin/agents/:id/scopes with an UNKNOWN id returns 404 (no DB write, no audit row)", async () => {
+    const cookie = await loginAsAdmin();
+    const csrf = await getCsrf(cookie, "/admin/agents");
+    const before = (await db.select<{ id: number }>("SELECT id FROM audit_log")).length;
+    const res = await fetch(`${baseUrl}/admin/agents/99999/scopes`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, scopes: "read:foo" }),
+      redirect: "manual",
+    });
+    expect(res.status).toBe(404);
+    const after = (await db.select<{ id: number }>("SELECT id FROM audit_log")).length;
+    expect(after).toBe(before);
+  });
+
+  it("POST /admin/agents/:id/scopes without a CSRF token is rejected (403)", async () => {
+    const cookie = await loginAsAdmin();
+    const id = await createAgentWithScopes(cookie, "alice", "read:foo");
+    const res = await fetch(`${baseUrl}/admin/agents/${id}/scopes`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ scopes: "read:foo list:foo" }),
+      redirect: "manual",
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
+describe("admin/router — client scope edit (task 3.3)", () => {
+  // The mcp-admin-ui spec requires:
+  // - POST /admin/clients/:id/scopes updates the client's
+  //   scope set via the existing setClientScopes() helper.
+  // - Submitted scope strings MUST be validated against
+  //   SCOPE_PATTERN; invalid values are rejected with a
+  //   sanitized 400 and NO DB write, NO audit_log row.
+  // - Successful writes append an audit_log row with
+  //   action="client.set_scopes".
+
+  async function loginAsAdmin(): Promise<string> {
+    const { ensureBootstrapAdmin } = await import("../../src/admin/bootstrap.js");
+    await ensureBootstrapAdmin(db, { username: "root", password: "x" }, 1_700_000_000);
+    const login = await fetch(`${baseUrl}/admin/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "root", password: "x" }),
+      redirect: "manual",
+    });
+    const session = extractCookie(login, "mcp_oauth_admin_session")!;
+    const cpPage = await fetch(`${baseUrl}/admin/change-password`, {
+      headers: { Cookie: `mcp_oauth_admin_session=${session}` },
+    });
+    const csrf = extractCsrf(await readHtml(cpPage));
+    await fetch(`${baseUrl}/admin/change-password`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${session}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, new_password: "new-password-123" }),
+    });
+    const reLogin = await fetch(`${baseUrl}/admin/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "root", password: "new-password-123" }),
+      redirect: "manual",
+    });
+    return extractCookie(reLogin, "mcp_oauth_admin_session")!;
+  }
+
+  async function getCsrf(cookie: string, path: string): Promise<string> {
+    const page = await fetch(`${baseUrl}${path}`, {
+      headers: { Cookie: `mcp_oauth_admin_session=${cookie}` },
+    });
+    return extractCsrf(await readHtml(page));
+  }
+
+  async function createClientWithScopes(
+    cookie: string,
+    clientId: string,
+    scopes: string,
+  ): Promise<number> {
+    const csrf = await getCsrf(cookie, "/admin/clients");
+    await fetch(`${baseUrl}/admin/clients/create`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, client_id: clientId, label: clientId, scopes }),
+      redirect: "manual",
+    });
+    const rows = await db.select<{ id: number }>("SELECT id FROM clients WHERE clientId = ?", [clientId]);
+    return rows[0]!.id;
+  }
+
+  it("POST /admin/clients/:id/scopes with a valid scope set updates the row and writes audit_log (task 3.3)", async () => {
+    const cookie = await loginAsAdmin();
+    const id = await createClientWithScopes(cookie, "bi-app", "read:foo");
+    const csrf = await getCsrf(cookie, "/admin/clients");
+    const res = await fetch(`${baseUrl}/admin/clients/${id}/scopes`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, scopes: "read:foo list:foo" }),
+      redirect: "manual",
+    });
+    expect(res.status).toBe(302);
+    expect(res.headers.get("location")).toBe("/admin/clients");
+    const after = await db.select<{ scopes: string }>("SELECT scopes FROM clients WHERE id = ?", [id]);
+    const parsed = JSON.parse(after[0]!.scopes) as string[];
+    expect(parsed.sort()).toEqual(["list:foo", "read:foo"]);
+    const rows = await db.select<{
+      action: string;
+      actor: string;
+      target: string | null;
+      outcome: string;
+    }>(
+      "SELECT action, actor, target, outcome FROM audit_log WHERE action = 'client.set_scopes'",
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.actor).toBe("root");
+    expect(rows[0]!.target).toBe(`client:${id}`);
+    expect(rows[0]!.outcome).toBe("ok");
+  });
+
+  it("POST /admin/clients/:id/scopes with an INVALID scope is rejected (400) with no DB write and no audit_log row (task 3.3)", async () => {
+    const cookie = await loginAsAdmin();
+    const id = await createClientWithScopes(cookie, "bi-app", "read:foo");
+    const csrf = await getCsrf(cookie, "/admin/clients");
+    const before = (await db.select<{ id: number }>("SELECT id FROM audit_log")).length;
+    const res = await fetch(`${baseUrl}/admin/clients/${id}/scopes`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, scopes: "read:foo not-a-scope" }),
+      redirect: "manual",
+    });
+    expect(res.status).toBe(400);
+    const html = await readHtml(res);
+    expect(html).toMatch(/not valid|invalid/i);
+    expect(html).not.toContain("not-a-scope");
+    const after = await db.select<{ scopes: string }>("SELECT scopes FROM clients WHERE id = ?", [id]);
+    expect(JSON.parse(after[0]!.scopes)).toEqual(["read:foo"]);
+    const now = (await db.select<{ id: number }>("SELECT id FROM audit_log")).length;
+    expect(now).toBe(before);
+  });
+
+  it("POST /admin/clients/:id/scopes with an UNKNOWN id returns 404 (no DB write, no audit row)", async () => {
+    const cookie = await loginAsAdmin();
+    const csrf = await getCsrf(cookie, "/admin/clients");
+    const before = (await db.select<{ id: number }>("SELECT id FROM audit_log")).length;
+    const res = await fetch(`${baseUrl}/admin/clients/99999/scopes`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, scopes: "read:foo" }),
+      redirect: "manual",
+    });
+    expect(res.status).toBe(404);
+    const after = (await db.select<{ id: number }>("SELECT id FROM audit_log")).length;
+    expect(after).toBe(before);
+  });
+
+  it("POST /admin/clients/:id/scopes without a CSRF token is rejected (403)", async () => {
+    const cookie = await loginAsAdmin();
+    const id = await createClientWithScopes(cookie, "bi-app", "read:foo");
+    const res = await fetch(`${baseUrl}/admin/clients/${id}/scopes`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ scopes: "read:foo list:foo" }),
+      redirect: "manual",
+    });
+    expect(res.status).toBe(403);
+  });
+});
+
 describe("admin/router — client CRUD + scope catalog (task 3.4)", () => {
   async function loginAsAdmin(): Promise<string> {
     const { ensureBootstrapAdmin } = await import("../../src/admin/bootstrap.js");
@@ -648,6 +1003,91 @@ describe("admin/router — client CRUD + scope catalog (task 3.4)", () => {
     );
     expect(rows.length).toBeGreaterThan(0);
     expect(rows[0]?.target).toBe("refresh:1");
+  });
+});
+
+describe("admin/router — scopes list shows inUse count (task 3.4)", () => {
+  // The mcp-admin-ui spec requires the scopes list to
+  // display the `inUse` count (number of agents + clients
+  // currently bound to each scope). The router must call
+  // `scopeInUse` for every catalog scope and pass the
+  // counts to `renderScopesList`. This test pins the
+  // end-to-end behavior: a real DB row assignment causes
+  // the matching count to appear in the rendered HTML.
+
+  async function loginAsAdmin(): Promise<string> {
+    const { ensureBootstrapAdmin } = await import("../../src/admin/bootstrap.js");
+    await ensureBootstrapAdmin(db, { username: "root", password: "x" }, 1_700_000_000);
+    const login = await fetch(`${baseUrl}/admin/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "root", password: "x" }),
+      redirect: "manual",
+    });
+    const session = extractCookie(login, "mcp_oauth_admin_session")!;
+    const cpPage = await fetch(`${baseUrl}/admin/change-password`, {
+      headers: { Cookie: `mcp_oauth_admin_session=${session}` },
+    });
+    const csrf = extractCsrf(await readHtml(cpPage));
+    await fetch(`${baseUrl}/admin/change-password`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${session}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, new_password: "new-password-123" }),
+    });
+    const reLogin = await fetch(`${baseUrl}/admin/login`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ username: "root", password: "new-password-123" }),
+      redirect: "manual",
+    });
+    return extractCookie(reLogin, "mcp_oauth_admin_session")!;
+  }
+
+  async function getCsrf(cookie: string, path: string): Promise<string> {
+    const page = await fetch(`${baseUrl}${path}`, {
+      headers: { Cookie: `mcp_oauth_admin_session=${cookie}` },
+    });
+    return extractCsrf(await readHtml(page));
+  }
+
+  it("GET /admin/scopes renders the inUse count per scope (task 3.4)", async () => {
+    // GIVEN a scope assigned to 1 agent and 0 clients
+    const cookie = await loginAsAdmin();
+    const csrf = await getCsrf(cookie, "/admin/agents");
+    await fetch(`${baseUrl}/admin/agents/create`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: csrf, username: "alice", scopes: "read:bi_catastro" }),
+      redirect: "manual",
+    });
+    // Add the scope to the catalog so the scopes list
+    // has a row for it.
+    const scsrf = await getCsrf(cookie, "/admin/scopes");
+    await fetch(`${baseUrl}/admin/scopes/create`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Cookie: `mcp_oauth_admin_session=${cookie}`,
+      },
+      body: new URLSearchParams({ _csrf: scsrf, name: "read:bi_catastro", description: "" }),
+      redirect: "manual",
+    });
+    // WHEN the admin loads the scopes list
+    const res = await fetch(`${baseUrl}/admin/scopes`, {
+      headers: { Cookie: `mcp_oauth_admin_session=${cookie}` },
+    });
+    expect(res.status).toBe(200);
+    const html = await readHtml(res);
+    // THEN the page shows the scope name AND the inUse
+    // count of 1 next to it (1 agent has the scope).
+    expect(html).toContain("read:bi_catastro");
+    expect(html).toMatch(/read:bi_catastro[\s\S]{0,400}1/);
   });
 });
 

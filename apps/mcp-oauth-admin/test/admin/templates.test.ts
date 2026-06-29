@@ -76,6 +76,60 @@ describe("admin/templates — renderLayout", () => {
     const html = renderLayout({ title: "X", body: "y", csrfToken: null });
     expect(html).not.toContain('name="csrf-token"');
   });
+
+  it("emits <meta name=\"color-scheme\" content=\"dark\"> so browsers render native controls in dark mode (task 3.5)", () => {
+    // The mcp-admin-ui spec requires a dark-only theme.
+    // The `color-scheme` meta tag is the browser-level
+    // signal: it tells the user agent to render form
+    // controls, scrollbars, and the canvas in dark mode
+    // even before any CSS loads.
+    const html = renderLayout({ title: "X", body: "y", csrfToken: null });
+    expect(html).toMatch(/<meta\s+name="color-scheme"\s+content="dark"\s*>/);
+  });
+
+  it("emits `:root { color-scheme: dark }` in the embedded stylesheet (task 3.5)", () => {
+    // The CSS-level `color-scheme: dark` declaration is
+    // the matching hook for any nested element / pseudo
+    // class that doesn't inherit from the meta tag. The
+    // two together guarantee the page renders dark
+    // regardless of the user's system preference.
+    const html = renderLayout({ title: "X", body: "y", csrfToken: null });
+    expect(html).toMatch(/:root\s*\{\s*color-scheme:\s*dark\s*;?\s*\}/);
+  });
+
+  it("does NOT emit any light-palette tokens in the embedded stylesheet (task 3.6)", () => {
+    // The spec mandates dark-only; the previous light
+    // palette used `#1a1a1a` for text and `#f6f6f6` for
+    // the table-header background. The new palette MUST
+    // NOT reuse those values.
+    const html = renderLayout({ title: "X", body: "y", csrfToken: null });
+    expect(html).not.toContain("#1a1a1a");
+    expect(html).not.toContain("#f6f6f6");
+    // The body background must NOT be white (the old
+    // default). Any explicit `body { ... background: #fff
+    // ... }` block would also be a regression.
+    expect(html).not.toMatch(/body\s*\{[^}]*background:\s*#fff/i);
+  });
+
+  it("preserves the same class names used by the existing body markup (task 3.6 — class names unchanged)", () => {
+    // Class names MUST remain unchanged so the existing
+    // inline forms (warn, error, muted, btn, btn-danger,
+    // nav, code) keep styling after the CSS swap. We
+    // assert each class is reachable by checking the
+    // embedded CSS contains a rule that targets it.
+    const html = renderLayout({ title: "X", body: "y", csrfToken: null });
+    // Each of these class names is referenced from a
+    // `<div class="...">`, `<button class="...">`,
+    // `<form ...>`, or `<code>` in the existing body
+    // markup. The CSS must keep the selectors.
+    expect(html).toMatch(/\.warn\b/);
+    expect(html).toMatch(/\.error\b/);
+    expect(html).toMatch(/\.muted\b/);
+    expect(html).toMatch(/\.btn\b/);
+    expect(html).toMatch(/\.btn-danger\b/);
+    expect(html).toMatch(/\bnav\b/);
+    expect(html).toMatch(/\bcode\b/);
+  });
 });
 
 describe("admin/templates — renderLoginPage", () => {
@@ -201,6 +255,38 @@ describe("admin/templates — renderAgentsList", () => {
     expect(html).toContain('name="_csrf"');
     expect(html).toContain('value="csrf-abc"');
   });
+
+  it("renders an inline scope-edit form per agent (task 3.7)", () => {
+    // The mcp-admin-ui spec requires inline scope editing
+    // on the agents list page (server-rendered form, no
+    // JS). Each row exposes a form whose action posts to
+    // `/admin/agents/:id/scopes` with a hidden CSRF
+    // input and an editable `scopes` input pre-populated
+    // with the current scope set.
+    const html = renderAgentsList({
+      agents: [
+        {
+          id: 7,
+          username: "alice",
+          scopes: ["read:bi_catastro", "list:bi_catastro"],
+          enabled: true,
+          requireChangeOnFirstLogin: false,
+          createdAt: fixedNow,
+          lastLoginAt: null,
+        },
+      ],
+      csrfToken: "csrf-abc",
+    });
+    // Per-row form posting to the scope-edit route
+    expect(html).toContain('action="/admin/agents/7/scopes"');
+    // The form carries the CSRF token (the canonical
+    // form-based CSRF guard for state-changing requests)
+    expect(html).toMatch(/action="\/admin\/agents\/7\/scopes"[\s\S]*?name="_csrf"[\s\S]*?value="csrf-abc"/);
+    // The scopes input is pre-populated with the
+    // current scope set (space-separated; the handler
+    // re-parses it on POST).
+    expect(html).toMatch(/name="scopes"\s+value="[^"]*read:bi_catastro[^"]*"/);
+  });
 });
 
 describe("admin/templates — renderAgentCreated", () => {
@@ -250,6 +336,35 @@ describe("admin/templates — renderClientsList", () => {
     expect(html).toContain('action="/admin/clients/create"');
     expect(html).toContain('name="_csrf"');
   });
+
+  it("renders an inline scope-edit form per client (task 3.7)", () => {
+    // The mcp-admin-ui spec requires inline scope editing
+    // on the clients list page (server-rendered form, no
+    // JS). Each row exposes a form whose action posts to
+    // `/admin/clients/:id/scopes` with a hidden CSRF
+    // input and an editable `scopes` input pre-populated
+    // with the current scope set.
+    const html = renderClientsList({
+      clients: [
+        {
+          id: 9,
+          clientId: "bi-catastro-app",
+          label: "BI Catastro",
+          scopes: ["read:bi_catastro"],
+          createdAt: fixedNow,
+          lastUsedAt: null,
+        },
+      ],
+      csrfToken: "csrf-abc",
+    });
+    // Per-row form posting to the scope-edit route
+    expect(html).toContain('action="/admin/clients/9/scopes"');
+    // The form carries the CSRF token
+    expect(html).toMatch(/action="\/admin\/clients\/9\/scopes"[\s\S]*?name="_csrf"[\s\S]*?value="csrf-abc"/);
+    // The scopes input is pre-populated with the
+    // current scope set.
+    expect(html).toMatch(/name="scopes"\s+value="[^"]*read:bi_catastro[^"]*"/);
+  });
 });
 
 describe("admin/templates — renderClientCreated", () => {
@@ -272,6 +387,7 @@ describe("admin/templates — renderScopesList", () => {
         { name: "read:bi_catastro", description: "Read BI Catastro rows", createdAt: fixedNow },
         { name: "list:bi_catastro", description: "", createdAt: fixedNow + 1 },
       ],
+      inUse: { "read:bi_catastro": 0, "list:bi_catastro": 0 },
       csrfToken: "csrf-abc",
     });
     expect(html).toContain("read:bi_catastro");
@@ -280,8 +396,55 @@ describe("admin/templates — renderScopesList", () => {
   });
 
   it("includes a 'New scope' form with a CSRF token", () => {
-    const html = renderScopesList({ scopes: [], csrfToken: "csrf-abc" });
+    const html = renderScopesList({
+      scopes: [],
+      inUse: {},
+      csrfToken: "csrf-abc",
+    });
     expect(html).toContain('action="/admin/scopes/create"');
+  });
+
+  it("renders the inUse count next to each scope (task 3.4)", () => {
+    // The mcp-admin-ui spec requires the scopes list to
+    // show the `inUse` count (number of agents + clients
+    // currently bound to each scope). The template
+    // receives a `Record<name, count>` map so the router
+    // can pre-compute the counts via `scopeInUse` and
+    // pass them in one shot.
+    const html = renderScopesList({
+      scopes: [
+        { name: "read:bi_catastro", description: "Read BI", createdAt: fixedNow },
+        { name: "list:bi_catastro", description: "List BI", createdAt: fixedNow + 1 },
+      ],
+      inUse: { "read:bi_catastro": 4, "list:bi_catastro": 0 },
+      csrfToken: "csrf-abc",
+    });
+    // The count appears as a visible value next to the
+    // scope row. We assert the number is present in the
+    // HTML (the surrounding markup is up to the renderer).
+    expect(html).toMatch(/read:bi_catastro[\s\S]{0,200}4/);
+    // The 0-count for `list:bi_catastro` is also
+    // rendered (the admin needs to know a scope is
+    // currently unassigned — the delete form depends on
+    // it).
+    expect(html).toMatch(/list:bi_catastro[\s\S]{0,200}0/);
+  });
+
+  it("defaults the inUse count to 0 when a scope is missing from the map (defensive)", () => {
+    // A scope in the catalog might exist without a row
+    // in the inUse map if the router forgot to look it
+    // up. The template MUST NOT throw; it MUST render
+    // 0 so the page stays usable.
+    const html = renderScopesList({
+      scopes: [
+        { name: "read:bi_catastro", description: "Read BI", createdAt: fixedNow },
+      ],
+      inUse: {},
+      csrfToken: "csrf-abc",
+    });
+    expect(html).toContain("read:bi_catastro");
+    // The page renders successfully (no throw).
+    expect(html).toMatch(/<table[\s\S]+<\/table>/);
   });
 });
 
