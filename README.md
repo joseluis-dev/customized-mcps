@@ -8,17 +8,20 @@ under `apps/`.
 
 | App | Type | Path | Purpose |
 | --- | ---- | ---- | ------- |
+| `mcp-oauth-admin` | TypeScript (NodeNext ESM) | `apps/mcp-oauth-admin/` | SQLite-backed OAuth2 authorization server and server-rendered admin UI for MCP resource servers. |
 | `mcp-readonly-sql` | TypeScript (NodeNext ESM) | `apps/mcp-readonly-sql/` | Read-only MCP server for PostgreSQL, MySQL/MariaDB, SQL Server, and SQLite. |
 
-See [`apps/mcp-readonly-sql/README.md`](apps/mcp-readonly-sql/README.md) for that
-app's configuration, run instructions, and MCP host wiring.
+See [`deploy/README.md`](deploy/README.md) for the multi-app OAuth deployment
+runbook and [`apps/mcp-readonly-sql/README.md`](apps/mcp-readonly-sql/README.md)
+for the resource server's configuration, run instructions, and MCP host wiring.
 
 ## Workspace layout
 
 ```
 .
 ├── apps/
-│   └── mcp-readonly-sql/     # one folder per MCP app (its own manifest + source + tests)
+│   ├── mcp-oauth-admin/      # OAuth2 authority + admin UI
+│   └── mcp-readonly-sql/     # read-only SQL MCP resource server
 ├── openspec/                 # spec-driven change tracking
 ├── .atl/                     # skill registry cache (tracked)
 ├── package.json              # workspace root: private, no bin/main
@@ -35,18 +38,19 @@ app's configuration, run instructions, and MCP host wiring.
 # 1. Install dependencies for the whole workspace
 pnpm install
 
-# 2. Build the MCP app you want to run
-pnpm --filter mcp-readonly-sql build
+# 2. Build all apps and shared packages
+pnpm build
 
-# 3. Test it (all 130 tests, including the monorepoStructure contract)
-pnpm --filter mcp-readonly-sql test
+# 3. Test the workspace
+pnpm test
 
-# 4. Launch it via the MCP Inspector
+# 4. Launch the resource server via the MCP Inspector
 pnpm --filter mcp-readonly-sql inspect
 ```
 
-Root-level shortcuts (e.g. `pnpm test`, `pnpm build`) are provided as ergonomic
-aliases; they all delegate to `pnpm --filter mcp-readonly-sql <script>`.
+Root-level `pnpm test`, `pnpm typecheck`, and `pnpm build` run across the
+workspace. Root-level `pnpm dev`, `pnpm start`, and `pnpm inspect` remain
+ergonomic shortcuts for `mcp-readonly-sql`.
 
 ## Adding a new app
 
