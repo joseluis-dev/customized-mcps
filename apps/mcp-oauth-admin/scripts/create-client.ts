@@ -9,19 +9,19 @@
  *
  * Usage:
  *   pnpm --filter mcp-oauth-admin create:client \
- *     -- --client-id my-app --label "My app" --scope "read:bi_catastro"
+ *     -- --client-id my-app --label "My app"
  *
- * The `--client-id` flag is required. `--label` and
- * `--scope` are optional. `--label` defaults to the empty
- * string; `--scope` defaults to the authority's
- * `MCP_OAUTH_DEFAULT_SCOPE` (or `read:bi_catastro` when
- * the env is unset). Multiple `--scope` flags are
- * space-joined.
- *
- * The script reads the SQLite path from
+ * The `--client-id` flag is required. `--label` is
+ * optional. The script reads the SQLite path from
  * `MCP_OAUTH_DB_PATH` (the same env var the app reads);
  * the default is `./data/mcp-oauth.sqlite` relative to
  * the process CWD.
+ *
+ * PR 4 of `remove-scope-authorization`: the `--scope`
+ * flag is removed. Scope authorization is inert; new
+ * clients have an empty `scopes` column (the column
+ * is INERT legacy storage). The output JSON no longer
+ * carries a `scopes` field.
  *
  * Audit-safety: the script NEVER logs the plaintext
  * secret to any stream other than the single stdout
@@ -45,7 +45,6 @@ async function main(): Promise<void> {
     options: {
       "client-id": { type: "string" },
       label: { type: "string" },
-      scope: { type: "string", multiple: true },
       "db-path": { type: "string" },
       help: { type: "boolean", short: "h" },
     },
@@ -54,14 +53,13 @@ async function main(): Promise<void> {
   if (parsed.values.help === true) {
     process.stdout.write(
       [
-        "Usage: create-client --client-id ID [--label TEXT] [--scope SCOPE] [--db-path PATH]",
+        "Usage: create-client --client-id ID [--label TEXT] [--db-path PATH]",
         "",
         "  --client-id  required OAuth2 client_id",
         "  --label      human-readable label (optional)",
-        "  --scope      space-delimited scope string; may be passed multiple times",
         "  --db-path    SQLite path; defaults to $MCP_OAUTH_DB_PATH or ./data/mcp-oauth.sqlite",
         "",
-        "Output: a single JSON line with { client_id, client_secret, scopes, label }.",
+        "Output: a single JSON line with { client_id, client_secret, label }.",
         "The client_secret is shown ONCE; capture it now.",
         "",
         "Redirect URI policy: clients created by this script are",
@@ -83,19 +81,6 @@ async function main(): Promise<void> {
   const dbPath = (parsed.values["db-path"] as string | undefined) ?? defaultDatabasePath();
   const clientId = (parsed.values["client-id"] as string | undefined) ?? "";
   const label = (parsed.values.label as string | undefined) ?? "";
-  // The `scope` option is `multiple: true`, so its value
-  // is either `string | string[] | undefined` depending
-  // on how many flags the operator passed. We coerce to
-  // a `string[]` for the dedup-free split.
-  const scopeFlags: string[] = Array.isArray(parsed.values.scope)
-    ? (parsed.values.scope as string[])
-    : typeof parsed.values.scope === "string"
-      ? [parsed.values.scope]
-      : [];
-  const scopes = scopeFlags
-    .join(" ")
-    .split(/\s+/)
-    .filter((s: string) => s.length > 0);
   const db: AuthorityDatabase = openDatabase({ path: dbPath });
   try {
     await initializeSchema(db);
@@ -103,7 +88,6 @@ async function main(): Promise<void> {
     const result: CreateClientResult = await createClient(db, {
       clientId,
       label,
-      scopes,
       now,
     });
     if (!result.ok) {
@@ -115,7 +99,6 @@ async function main(): Promise<void> {
       client_id: result.client.clientId,
       client_secret: result.plaintextSecret,
       label: result.client.label,
-      scopes: result.client.scopes,
     };
     // Single stdout write; the operator captures it.
     process.stdout.write(`${JSON.stringify(out)}\n`);
