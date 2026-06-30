@@ -147,8 +147,8 @@ changes. No data is lost.
 
 The OAuth2 authority + SQLite identity store + web admin UI.
 Binds port **3002** by default (mcp-http-transport
-reservation). Owns default-scope assignment for newly
-registered agents and clients. The resource server
+reservation). Manages agent and client identity (default scopes are
+removed — scope authorization is inert; `scopes` columns are legacy storage). The resource server
 ([mcp-readonly-sql](#mcp-readonly-sql)) is a resource-server
 peer that talks to this authority over `/oauth/introspect`
 and `/.well-known/jwks.json`.
@@ -528,7 +528,7 @@ changes. No data is lost.
   `400 password_change_required` (the rotation is
   enforced).
 - [ ] A POST to `/oauth/introspect` with a valid token
-  returns `{"active":true,"sub":"...","scope":"..."}`.
+  returns `{"active":true,"sub":"...","iss":"...","aud":"...","iat":...,"exp":...}` (no `scope` field — scope authorization is removed).
 - [ ] The backup target (if `MCP_OAUTH_BACKUP_TARGET` is
   set) is updated on the configured interval.
 

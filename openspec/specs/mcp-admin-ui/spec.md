@@ -2,7 +2,7 @@
 
 ## Purpose
 
-Server-rendered web admin UI alongside the OAuth2 endpoints in `apps/mcp-oauth-admin`. Operators manage agents, OAuth clients, scopes, refresh-token revocations, and inspect the audit log from a browser. Thin layer over the same SQLite store.
+Server-rendered web admin UI alongside the OAuth2 endpoints in `apps/mcp-oauth-admin`. Operators manage agents, OAuth clients, refresh-token revocations, and inspect the audit log from a browser. Scope management is removed; scope values on agents/clients are inert legacy storage. Thin layer over the same SQLite store.
 
 ## Requirements
 
@@ -28,23 +28,15 @@ Session cookie on admin login: `HttpOnly`, `SameSite=Strict`, `Secure` (when not
 
 ### Requirement: Agent And Client CRUD
 
-Pages to list, create, edit, and disable agents AND OAuth clients. Each row shows identifying fields plus `enabled` / `scopes` / `createdAt` / `lastLoginAt` (agents) or `clientId` / `label` / `scopes` / `lastUsedAt` (clients). UI generates a one-time plaintext password (agents) or client secret (clients) on create and rotate, displays it once, and stores only the `argon2id` hash.
+Pages to list, create, edit, and disable agents AND OAuth clients. Each row shows `enabled` / `createdAt` / `lastLoginAt` (agents) or `clientId` / `label` / `lastUsedAt` (clients). UI generates a one-time plaintext password/secret on create and rotate, displays it once, stores only the `argon2id` hash. The legacy `scopes` column is no longer surfaced through the admin UI: no row, column, field, or detail view is required to display it, and no edit affordance is required. The admin UI MUST NOT add a new detail page, column, or field whose purpose is to display the inert `scopes` value. Legacy `scopes` values remain in storage; operators inspect them via the SQLite file or another low-level path that is outside the admin UI.
+(Previously: row showed `scopes` and an inline edit form. Now: no `scopes` display is required in the admin UI; legacy values remain in storage only.)
 
-#### Scenario: One-time secret and disable/rotate
+#### Scenario: One-time secret and disable/rotate, no scope surface in the UI
 
 - GIVEN the admin submits "create agent"/"create client", clicks "disable" on an agent, OR clicks "rotate secret" on a client
 - WHEN the form posts
-- THEN the response shows the plaintext in a one-time block with a `WARN` log, OR `enabled` is `false` and token requests return `400 account_disabled`, OR a new secret is hashed and shown once and the old secret returns `401 invalid_client`.
-
-### Requirement: Scope Catalog Management
-
-Page that lists the `scopes` table. Allows adding a new scope string and validates against `SCOPE_PATTERN` server-side. Refuses deletion of a scope currently assigned to any agent or client with a sanitized error naming the affected count.
-
-#### Scenario: Delete blocked when in use
-
-- GIVEN `read:bi_catastro` is assigned to 3 agents
-- WHEN the admin submits "delete read:bi_catastro"
-- THEN the server returns a sanitized error naming the count and no deletion occurs.
+- THEN the response shows the plaintext in a one-time block with a `WARN` log, OR `enabled` is `false` and token requests return `400 account_disabled`, OR a new secret is hashed and shown once and the old secret returns `401 invalid_client`
+- AND the page does not render a "set scopes" form, an "edit scopes" button, a `POST .../scopes` action, OR a `scopes` column, cell, or field.
 
 ### Requirement: Refresh Token Revocation Page
 
@@ -67,35 +59,6 @@ Audit viewer paginates `audit_log` rows newest-first, filterable by `actor`, `ac
 - WHEN the page renders, a 6th attempt arrives, OR a client posts to `/oauth/token`
 - THEN the value is `***`, OR the response is `429`, OR a normal access token is returned.
 
-### Requirement: Agent And Client Scope Editing
-
-The agent detail page and the client detail page MUST expose an inline form to edit the assigned scope set. `POST /admin/agents/:id/scopes` MUST update the agent's scopes via the existing `setAgentScopes()` helper and append an `audit_log` row with `action="agent.set_scopes"`, the new scope set, and the acting admin. `POST /admin/clients/:id/scopes` MUST behave symmetrically with `setClientScopes()` and `action="client.set_scopes"`. Submitted scope strings MUST be validated against `SCOPE_PATTERN`; invalid values MUST be rejected with a sanitized error and no DB write. Pages MUST re-render with the new scope set after a successful POST.
-
-#### Scenario: Edit agent scopes succeeds
-
-- GIVEN an admin viewing agent `a1` with current scopes `["read:foo"]`
-- WHEN the admin submits `["read:foo", "list:foo"]` to `POST /admin/agents/a1/scopes`
-- THEN the agent's scope set is updated
-- AND an `audit_log` row records the change with actor, target, and new scope set.
-
-#### Scenario: Invalid scope rejected
-
-- GIVEN a form submission containing `not-a-scope`
-- WHEN the form posts
-- THEN the response is `400` with a sanitized error
-- AND no `audit_log` row is written
-- AND the agent's scope set is unchanged.
-
-### Requirement: Scope Usage Display
-
-The scopes list page MUST display the `inUse` count (number of agents + clients currently bound to each scope) next to each scope row. The count MUST be derived from the existing `scopeInUse()` helper.
-
-#### Scenario: inUse count shown
-
-- GIVEN `read:bi_catastro` is assigned to 3 agents and 1 client
-- WHEN the admin views the scopes list
-- THEN the `read:bi_catastro` row shows `inUse: 4`.
-
 ### Requirement: Dark-Only Color Scheme
 
 The admin UI layout (`renderLayout`) MUST emit `<meta name="color-scheme" content="dark">` and the HTML root element MUST declare `color-scheme: dark` so browsers render native controls in dark mode. All CSS in `apps/mcp-oauth-admin/src/admin/templates.ts` MUST use a dark palette (background, text, borders, focus rings, form controls, warning/error boxes) and MUST NOT include a light theme or theme toggle. Class names MUST remain unchanged. Text vs. background contrast MUST meet WCAG AA (4.5:1 for normal text, 3:1 for large text).
@@ -116,3 +79,24 @@ The admin UI layout (`renderLayout`) MUST emit `<meta name="color-scheme" conten
 - GIVEN the admin UI changes are in `apps/mcp-oauth-admin`
 - WHEN `pnpm --filter mcp-oauth-admin typecheck` is run
 - THEN the command exits `0`.
+
+### Requirement: Scope UI Hidden
+
+The admin UI MUST NOT render any active control, link, button, or form whose purpose is to create, edit, delete, or assign OAuth scopes (scope catalog page, "new scope" / "delete scope" forms, inline "set scopes" forms, `inUse` count column, scope nav entry). The admin UI MUST NOT render a `scopes` column, cell, field, or section whose purpose is to display the legacy `scopes` value on the agent list, client list, agent detail, or client detail. The rendered HTML MUST NOT contain any `POST .../scopes` form action, nor a `<td>` / `<th>` / `<div>` whose labeled purpose is to display the legacy `scopes` value. Legacy scope values remain in storage and MAY be exposed through low-level DB/export/debug paths; the admin UI is not required to display them.
+(Previously: scope management was active and legacy `scopes` was shown as a read-only field. Now: scope management is hidden and the admin UI does not display legacy `scopes` at all.)
+
+#### Scenario: No active scope controls in the UI
+
+- GIVEN the admin UI templates and routes
+- WHEN an operator inspects any rendered page (list, detail, new, edit) and greps the HTML and the router
+- THEN no `<form method="POST" action=".../scopes">` element exists
+- AND no link/button labeled "set scopes", "edit scopes", "new scope", "delete scope", or "scope catalog" is rendered
+- AND the navigation does not link to a scope list page.
+
+#### Scenario: No scopes column or field rendered in the admin UI
+
+- GIVEN the admin UI templates for the agent list, client list, agent detail, and client detail
+- WHEN an operator inspects the rendered HTML
+- THEN no row, cell, field, or section labels the legacy `scopes` value
+- AND the templates do not read `agent.scopes` or `client.scopes` for display purposes
+- AND no scope string (e.g. `read:bi_catastro`) is rendered as inert text in any admin page.
