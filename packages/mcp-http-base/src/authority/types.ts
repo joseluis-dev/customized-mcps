@@ -14,9 +14,12 @@
  *   `/oauth/introspect` so a misconfigured authority URL fails fast.
  *
  * Every `verify` implementation MUST:
- * - return `{ agentId, scopes }` on success. The `scopes` array is
- *   filtered against `SCOPE_PATTERN`; entries that do not match are
- *   dropped.
+ * - return `{ agentId, scopes: [] }` on success. The `scopes` array
+ *   is ALWAYS empty (`[]`); the previous `SCOPE_PATTERN` filter on
+ *   the inbound JWT `scopes` claim is removed (per PR 1 of
+ *   `remove-scope-authorization`). The field is retained for
+ *   backward compatibility with downstream consumers but MUST NOT
+ *   be used for authorization.
  * - throw `TokenInvalidError` for malformed, expired, revoked, or
  *   unknown tokens. The middleware maps this to `401`.
  * - throw `AuthorityUnavailableError` for fetch / network / timeout
@@ -44,9 +47,14 @@ import type { Logger } from "../logging.js";
  * A verified agent identity, as returned by `TokenAuthority.verify`.
  *
  * The shape is intentionally narrow: `agentId` is the stable id
- * (the JWT `sub` claim on the JWKS / OAuth admin backend) and
- * `scopes` is the granted set, already filtered against
- * `SCOPE_PATTERN`.
+ * (the JWT `sub` claim on the JWKS / OAuth admin backend). The
+ * `scopes` field is RETAINED for backward compatibility with
+ * downstream consumers that read `req.auth.scopes` (the SDK
+ * forwards it as `MessageExtraInfo.authInfo.scopes`) but is ALWAYS
+ * the empty array `[]`; the value is decorative and MUST NOT be
+ * consulted for any authorization decision. The previous
+ * `SCOPE_PATTERN`-filtered granted set is removed (per PR 1 of
+ * `remove-scope-authorization`).
  */
 export type VerifiedToken = {
   agentId: string;

@@ -243,6 +243,12 @@ export type ResourceServerRequestLike = {
  * resource server's own public base URL; `authorization_servers` lists
  * OAuth authority issuers; `bearer_methods_supported` is hard-coded to
  * `["header"]` (token-in-query / token-in-body are out of scope for v1).
+ *
+ * `scopes_supported` is ALWAYS the empty array `[]` (per PR 1 of
+ * `remove-scope-authorization`). The field is retained for RFC 9728
+ * schema compliance but is no longer a source of authorization.
+ * The previous `scopeCatalog` option that contributed entries to
+ * this field is removed.
  */
 export type ProtectedResourceMetadata = {
   resource: string;
