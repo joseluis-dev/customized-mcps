@@ -144,6 +144,42 @@ describe("admin/clients — createClient", () => {
     expect(r.reason).toBe("invalid_scope");
   });
 
+  it("rejects a caller-supplied plaintextSecret shorter than MIN_PLAINTEXT_SECRET_LENGTH", async () => {
+    // The pre-PR review found that `createClient`
+    // accepted a caller-supplied plaintext of any
+    // length. The fix enforces a minimum (16 chars)
+    // so a weak injected secret is rejected before it
+    // ever reaches the `argon2id` hash. The DCR
+    // handler's pre-generated value (32+ chars) is
+    // always above the minimum, so the production
+    // path is unaffected.
+    const r = await createClient(db, {
+      clientId: "c1",
+      scopes: ["read:bi_catastro"],
+      // 6 chars — well under the 16-char floor.
+      plaintextSecret: "s3cret",
+      now,
+    });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("invalid_secret");
+  });
+
+  it("accepts a 16-char caller-supplied plaintextSecret (boundary)", async () => {
+    // 16 chars is the documented minimum. The
+    // helper accepts the value and stores its hash.
+    const r = await createClient(db, {
+      clientId: "c1",
+      scopes: ["read:bi_catastro"],
+      // Exactly 16 chars — the minimum.
+      plaintextSecret: "abcdefghijklmnop",
+      now,
+    });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    expect(r.plaintextSecret).toBe("abcdefghijklmnop");
+  });
+
   it("the generated secret is cryptographically random (different on each call)", async () => {
     const r1 = await createClient(db, { clientId: "c1", scopes: [], now });
     const r2 = await createClient(db, { clientId: "c2", scopes: [], now });

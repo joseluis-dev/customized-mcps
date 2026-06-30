@@ -47,7 +47,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
-import { withSingleWriter, type AuthorityDatabase } from "../db/connection.js";
+import { type AuthorityDatabase } from "../db/connection.js";
 import {
   buildSetCookieHeader,
   generateCsrfToken,
@@ -61,7 +61,10 @@ import {
 import { verifyAgentPassword } from "../admin/agents.js";
 import { auditAppend } from "../admin/audit.js";
 import { clearFailures, isLocked, recordFailure } from "../admin/backoff.js";
-import { SCOPE_PATTERN } from "@customized-mcps/mcp-http-base";
+import { loadScopePrincipal, resolveGrantedScopes } from "./scopes.js";
+import { getClientByClientId } from "../admin/clients.js";
+import { BodyTooLargeError, readFormBody } from "./bodyReader.js";
+import { readClientIp } from "./clientIp.js";
 
 /**
  * The in-memory shape of a one-time code. The
@@ -96,11 +99,20 @@ export type AuthorizeDeps = {
   defaultScope: string;
   now?: () => number;
   ttlSeconds?: number;
+  /** Trust the `X-Forwarded-For` header for the audit
+   *  `actor` / `ip` columns. The default is `false`: the
+   *  direct TCP peer (`req.socket.remoteAddress`) is the
+   *  source of truth, so a spoofed XFF cannot distort the
+   *  audit attribution. Operators behind a TLS-terminating
+   *  reverse proxy MUST set this to `true` (the app's
+   *  `index.ts` wires it from
+   *  `httpConfig.behindProxy` / `MCP_HTTP_BEHIND_PROXY=true`).
+   *  Tests inject the value directly to drive both branches. */
+  trustProxy?: boolean;
 };
 
 const DEFAULT_CODE_TTL_SECONDS = 60;
 const DEFAULT_CODE_BYTES = 32;
-const FORM_BODY_CAP = 64 * 1024;
 const MAX_CODE_CHALLENGE_LENGTH = 128;
 const MIN_CODE_CHALLENGE_LENGTH = 43;
 
@@ -212,6 +224,7 @@ export function consumeCode(code: string, now: number): CodeRecord | null {
 export function createAuthorizeHandler(
   deps: AuthorizeDeps,
 ): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  const trustProxy = deps.trustProxy ?? false;
   return async (req, res) => {
     try {
       // Opportunistic sweep: keeps the store bounded under
@@ -228,19 +241,37 @@ export function createAuthorizeHandler(
         return writeJsonError(res, 404, "not_found");
       }
       if (method === "GET") {
-        return handleGet(deps, req, res);
+        return await handleGet(deps, req, res);
       }
       if (method === "POST") {
-        return handlePost(deps, req, res);
+        // `await` the per-method helper so the
+        // surrounding `try` / `catch` actually catches
+        // its rejection. A bare `return handlePost(...)`
+        // returns an unawaited promise whose rejection
+        // bypasses the catch (and surfaces as an
+        // unhandled rejection, which the verify phase
+        // and the test suite both flag).
+        return await handlePost(deps, req, res, trustProxy);
       }
       res.setHeader("Allow", "GET, POST");
       return writeJsonError(res, 405, "invalid_request");
-    } catch {
-      // Defense in depth: the handler MUST NOT 500 the
-      // listener. Surface a sanitized 500 page; the real
-      // error stays in the catch scope (we never log
-      // request bodies or query strings because they may
-      // contain a verifier or a client secret).
+    } catch (e) {
+      // `BodyTooLargeError` is a typed signal from the
+      // shared body reader (the cap was exceeded during
+      // form-encoded POST parsing). The stream is paused
+      // (NOT destroyed), so we can write a sanitized HTML
+      // 400. The 400 is preferred over 500 because the
+      // spec is explicit: an oversize body is an
+      // `invalid_request` from the client's perspective.
+      if (e instanceof BodyTooLargeError) {
+        return writeHtml(res, 400, renderErrorPage("Invalid request."));
+      }
+      // Defense in depth: any other unexpected error
+      // MUST NOT 500 the listener. Surface a sanitized
+      // 500 page; the real error stays in the catch scope
+      // (we never log request bodies or query strings
+      // because they may contain a verifier or a client
+      // secret).
       return writeHtml(res, 500, renderErrorPage("Internal error"));
     }
   };
@@ -260,13 +291,23 @@ async function handleGet(
   if (!validation.ok) {
     return writeHtml(res, 400, renderErrorPage(validation.message));
   }
-  if (!(await isRegisteredClient(deps, validation.normalized.clientId))) {
+  const client = await getRegisteredClient(deps, validation.normalized.clientId);
+  if (client === null) {
     // Unknown client: render a sanitized 400 page. The
     // error MUST NOT echo the supplied client_id (an
     // attacker probing the endpoint learns nothing) and
     // MUST NOT redirect to the (possibly hostile)
     // `redirect_uri` — that would convert a "client not
     // found" into a redirect-based open redirect.
+    return writeHtml(res, 400, renderErrorPage("Invalid request."));
+  }
+  if (!redirectUriAllowedForClient(client, validation.normalized.redirectUri)) {
+    // The client was registered via DCR with a specific
+    // redirect URI list. The supplied `redirect_uri` is
+    // NOT in the list — reject with a sanitized 400 page.
+    // We do NOT redirect to the supplied URI on this path
+    // (an attacker could enumerate clients and probe URIs
+    // via the redirect target).
     return writeHtml(res, 400, renderErrorPage("Invalid request."));
   }
   const session = readSession(deps, req);
@@ -287,14 +328,15 @@ async function handlePost(
   deps: AuthorizeDeps,
   req: IncomingMessage,
   res: ServerResponse,
+  trustProxy: boolean,
 ): Promise<void> {
   const body = await readFormBody(req);
   const action = body.get("_action") ?? "";
   if (action === "login") {
-    return handleLogin(deps, req, res, body);
+    return handleLogin(deps, req, res, body, trustProxy);
   }
   if (action === "consent") {
-    return handleConsent(deps, req, res, body);
+    return handleConsent(deps, req, res, body, trustProxy);
   }
   return writeJsonError(res, 400, "invalid_request");
 }
@@ -304,13 +346,18 @@ async function handleLogin(
   req: IncomingMessage,
   res: ServerResponse,
   body: URLSearchParams,
+  trustProxy: boolean,
 ): Promise<void> {
   const params = extractRequestParamsFromBody(body);
   const validation = validateAuthorizeParams(params);
   if (!validation.ok) {
     return writeHtml(res, 400, renderErrorPage(validation.message));
   }
-  if (!(await isRegisteredClient(deps, validation.normalized.clientId))) {
+  const client = await getRegisteredClient(deps, validation.normalized.clientId);
+  if (client === null) {
+    return writeHtml(res, 400, renderErrorPage("Invalid request."));
+  }
+  if (!redirectUriAllowedForClient(client, validation.normalized.redirectUri)) {
     return writeHtml(res, 400, renderErrorPage("Invalid request."));
   }
   const username = (body.get("username") ?? "").trim();
@@ -356,7 +403,7 @@ async function handleLogin(
     actor: username,
     action: "authorize.login",
     target: `user:${result.agent.id}`,
-    ip: readIp(req),
+    ip: readClientIp(req, trustProxy),
     outcome: "ok",
   });
   return writeHtml(res, 200, renderConsentForm(validation.normalized, session));
@@ -367,13 +414,18 @@ async function handleConsent(
   req: IncomingMessage,
   res: ServerResponse,
   body: URLSearchParams,
+  trustProxy: boolean,
 ): Promise<void> {
   const params = extractRequestParamsFromBody(body);
   const validation = validateAuthorizeParams(params);
   if (!validation.ok) {
     return writeHtml(res, 400, renderErrorPage(validation.message));
   }
-  if (!(await isRegisteredClient(deps, validation.normalized.clientId))) {
+  const client = await getRegisteredClient(deps, validation.normalized.clientId);
+  if (client === null) {
+    return writeHtml(res, 400, renderErrorPage("Invalid request."));
+  }
+  if (!redirectUriAllowedForClient(client, validation.normalized.redirectUri)) {
     return writeHtml(res, 400, renderErrorPage("Invalid request."));
   }
   const session = readSession(deps, req);
@@ -395,7 +447,29 @@ async function handleConsent(
   const now = getNow(deps);
   const ttl = getTtl(deps);
   const code = generateCode();
-  const scopes = parseScopeList(params.scope, deps.defaultScope);
+  // Scope resolution: the spec REQUIRES the consented scope
+  // set to be the intersection of the user's scopes and the
+  // client's scopes (not the URL-requested scope verbatim).
+  // The URL-requested scope is the user's REQUEST, not the
+  // grant; the grant is bounded by the union of both
+  // principals. We read the user row, the client row, and
+  // (for `authorization_code` defense in depth) the catalog,
+  // then delegate to the centralized resolver.
+  const scopePrincipal = await loadScopePrincipal(
+    deps.db,
+    deps.defaultScope,
+    params.clientId,
+    session.userId,
+  );
+  const scopeResult = resolveGrantedScopes(
+    "authorization_code",
+    params.scope,
+    scopePrincipal,
+  );
+  if (!scopeResult.ok) {
+    return writeHtml(res, 400, renderErrorPage("Invalid request."));
+  }
+  const scopes = scopeResult.scopes;
   codeStore.set(code, {
     clientId: params.clientId,
     agentId: session.userId,
@@ -410,7 +484,7 @@ async function handleConsent(
     actor: session.username,
     action: "authorize.code_issued",
     target: `client:${params.clientId}`,
-    ip: readIp(req),
+    ip: readClientIp(req, trustProxy),
     outcome: "ok",
   });
   // Build the redirect URL. The `state` is echoed
@@ -491,15 +565,6 @@ function validateAuthorizeParams(p: NormalizedParams): ValidationResult {
   return { ok: true, normalized: p };
 }
 
-function parseScopeList(raw: string, defaultScope: string): string[] {
-  if (raw.trim().length === 0) return [defaultScope];
-  const tokens = raw.split(/\s+/).filter((s) => s.length > 0);
-  // Filter against SCOPE_PATTERN (defense in depth) and
-  // fall back to the default if nothing survived.
-  const valid = tokens.filter((s) => SCOPE_PATTERN.test(s));
-  return valid.length > 0 ? valid : [defaultScope];
-}
-
 // -----------------------------------------------------------------------
 // Query / body parsing
 // -----------------------------------------------------------------------
@@ -541,51 +606,57 @@ function readSession(deps: AuthorizeDeps, req: IncomingMessage): SessionData | n
 }
 
 /**
- * Check whether the supplied `clientId` is a registered
- * OAuth2 client. The check is per-request (no caching) so
- * a future client rotation is picked up without a
- * restart. The query is bounded by the `clientId` UNIQUE
- * index.
+ * Look up the registered OAuth2 client by `clientId`. The
+ * check is per-request (no caching) so a future client
+ * rotation is picked up without a restart. The query is
+ * bounded by the `clientId` UNIQUE index. Returns `null`
+ * for an unknown client or an empty `clientId`; the
+ * caller maps the result to a sanitized 400 page (we
+ * never echo the supplied `client_id`).
+ *
+ * The helper delegates to `getClientByClientId` from the
+ * admin module so the JSON decoding of the `scopes` and
+ * `redirectUris` columns is consistent with the admin UI.
  */
-async function isRegisteredClient(deps: AuthorizeDeps, clientId: string): Promise<boolean> {
-  if (clientId.length === 0) return false;
-  const rows = await deps.db.select<{ id: number }>(
-    "SELECT id FROM clients WHERE clientId = ? LIMIT 1",
-    [clientId],
-  );
-  return rows.length > 0;
+async function getRegisteredClient(
+  deps: AuthorizeDeps,
+  clientId: string,
+): Promise<Awaited<ReturnType<typeof getClientByClientId>>> {
+  if (clientId.length === 0) return null;
+  return getClientByClientId(deps.db, clientId);
 }
 
-function readIp(req: IncomingMessage): string | null {
-  const xff = req.headers["x-forwarded-for"];
-  if (typeof xff === "string" && xff.length > 0) {
-    return xff.split(",")[0]!.trim();
+/**
+ * Decide whether a `redirect_uri` is allowed for a given
+ * registered client. The policy has two branches:
+ *
+ *   - **Empty stored list** (legacy / pre-DCR clients):
+ *     the v1 spec's loopback rule applies. The URI MUST
+ *     satisfy `isLoopbackRedirectUri` (RFC 8252 §7.3).
+ *     This is the behavior the previous implementation
+ *     enforced for every client.
+ *   - **Non-empty stored list** (DCR-registered clients):
+ *     the URI MUST be byte-equal to one of the entries
+ *     the client registered. The list is the
+ *     authoritative source — the loopback rule is NOT
+ *     bypassed (a DCR-registered client that registered
+ *     a non-loopback URI is rejected by the DCR handler
+ *     at registration time, so the list is a subset of
+ *     loopback URIs by construction).
+ *
+ * The function never throws; the caller maps a `false`
+ * return to a sanitized 400 page. We do NOT echo the
+ * supplied URI in the response (the URI is the
+ * attacker-controlled side channel).
+ */
+function redirectUriAllowedForClient(
+  client: NonNullable<Awaited<ReturnType<typeof getClientByClientId>>>,
+  redirectUri: string,
+): boolean {
+  if (client.redirectUris.length === 0) {
+    return isLoopbackRedirectUri(redirectUri);
   }
-  if (Array.isArray(xff) && xff.length > 0) {
-    return xff[0]!;
-  }
-  return req.socket.remoteAddress ?? null;
-}
-
-function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
-  return new Promise((resolveP, rejectP) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    req.on("data", (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > FORM_BODY_CAP) {
-        rejectP(new Error("request body too large"));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => {
-      const text = Buffer.concat(chunks).toString("utf8");
-      resolveP(new URLSearchParams(text));
-    });
-    req.on("error", rejectP);
-  });
+  return client.redirectUris.includes(redirectUri);
 }
 
 // -----------------------------------------------------------------------
@@ -689,8 +760,3 @@ function writeJsonError(res: ServerResponse, status: number, error: string): voi
   res.setHeader("Pragma", "no-cache");
   res.end(JSON.stringify({ error }));
 }
-
-// Mark the import as used (the helper exposes the
-// single-writer surface for callers that need it; the
-// authorize handler itself does not write directly).
-void withSingleWriter;

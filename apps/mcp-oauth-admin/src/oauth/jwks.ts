@@ -9,7 +9,10 @@
  *   OIDC + OAuth2 endpoints (token, introspect, authorize,
  *   JWKS), the supported grant types (including
  *   `authorization_code`), the PKCE method (`S256`), the
- *   response types, and the issuer.
+ *   response types, and the issuer. The only response
+ *   type the authority supports is `code` (the
+ *   authorization-code flow); the implicit `token` flow
+ *   is out of scope and MUST NOT be advertised.
  *
  * These handlers are intentionally thin: they read the
  * current `keys` row and shape the response. The handlers
@@ -85,6 +88,11 @@ export function createJwksHandler(options: {
  *   OAuth 2.1 and the spec.
  * - Signing algs: `RS256` only (the only algorithm the
  *   authority uses to sign access tokens).
+ * - `subject_types_supported` is `["public"]`: the authority
+ *   issues the same stable local subject (e.g.
+ *   `user:<agentId>`, `client:<clientId>`) to every
+ *   relying party. No pairwise / sector-identifier mapping
+ *   is performed.
  */
 export function createOidcDiscoveryHandler(options: {
   issuer?: string;
@@ -97,16 +105,24 @@ export function createOidcDiscoveryHandler(options: {
       authorization_endpoint: `${issuer}/oauth/authorize`,
       token_endpoint: `${issuer}/oauth/token`,
       introspection_endpoint: `${issuer}/oauth/introspect`,
+      registration_endpoint: `${issuer}/oauth/register`,
       grant_types_supported: [
         "client_credentials",
         "password",
         "refresh_token",
         "authorization_code",
       ],
-      response_types_supported: ["token", "code"],
+      // The authority only supports the authorization-code
+      // flow (PKCE S256). The implicit `token` flow is out
+      // of scope and is intentionally NOT advertised. An
+      // OIDC client that requires `token` would discover
+      // it does not apply here and fall back to the
+      // standard code flow.
+      response_types_supported: ["code"],
       token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
       id_token_signing_alg_values_supported: ["RS256"],
       code_challenge_methods_supported: ["S256"],
+      subject_types_supported: ["public"],
     };
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json; charset=utf-8");

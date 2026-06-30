@@ -272,4 +272,57 @@ describe("db/schema", () => {
     );
     expect(rows).toEqual([{ actor: "agent:1", target: "alice" }]);
   });
+
+  it("clients.redirectUris column is present (RFC 7591 DCR support)", async () => {
+    // GIVEN the schema is initialized
+    // WHEN we read the columns of `clients`
+    // THEN `redirectUris` is a TEXT column with NOT NULL.
+    // The DCR path populates this column; pre-registered
+    // clients that pre-date the DCR work keep the
+    // default `'[]'` value.
+    const cols = await db.select<{ name: string; type: string; notnull: number; dflt_value: string | null }[]>(
+      "PRAGMA table_info(clients)",
+    );
+    const byName = new Map(cols.map((c) => [c.name, c]));
+    expect(byName.get("redirectUris")?.type).toBe("TEXT");
+    expect(byName.get("redirectUris")?.notnull).toBe(1);
+    // The default is `'[]'` so legacy clients (pre-DCR)
+    // carry an empty list and the authorize handler
+    // continues to enforce the loopback rule.
+    expect(byName.get("redirectUris")?.dflt_value).toBe("'[]'");
+  });
+
+  it("initializeSchema is idempotent when the clients.redirectUris migration fires on a legacy DB", async () => {
+    // Simulate a pre-DCR database: create the clients
+    // table without the `redirectUris` column, then run
+    // the migration. The function MUST add the column
+    // AND be safe to run a second time (idempotent).
+    const legacy = openDatabase({ path: ":memory:" });
+    try {
+      await legacy.execute(`
+        CREATE TABLE clients (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          clientId TEXT NOT NULL UNIQUE,
+          clientSecretHash TEXT NOT NULL,
+          label TEXT NOT NULL DEFAULT '',
+          scopes TEXT NOT NULL DEFAULT '[]',
+          createdAt INTEGER NOT NULL,
+          lastUsedAt INTEGER
+        )
+      `);
+      // Pre-DCR column list.
+      const before = await legacy.select<{ name: string }[]>("PRAGMA table_info(clients)");
+      expect(before.map((c) => c.name)).not.toContain("redirectUris");
+      // First call: migration fires.
+      await initializeSchema(legacy);
+      const after1 = await legacy.select<{ name: string }[]>("PRAGMA table_info(clients)");
+      expect(after1.map((c) => c.name)).toContain("redirectUris");
+      // Second call: migration is a no-op (no error).
+      await expect(initializeSchema(legacy)).resolves.not.toThrow();
+      const after2 = await legacy.select<{ name: string }[]>("PRAGMA table_info(clients)");
+      expect(after2.map((c) => c.name)).toContain("redirectUris");
+    } finally {
+      await legacy.close();
+    }
+  });
 });

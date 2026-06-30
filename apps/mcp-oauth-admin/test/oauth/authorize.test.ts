@@ -502,6 +502,505 @@ describe("oauth/authorize (integration)", () => {
     const setCookie = res.headers.get("set-cookie") ?? "";
     expect(setCookie).not.toMatch(/mcp_oauth_admin_session=/);
   });
+
+  it("GET /oauth/authorize with an extra `resource` query param is tolerated (registered client)", async () => {
+    // Regression: opencode's MCP auth flow adds a
+    // `resource=...` query param (RFC 8707 Resource
+    // Indicators) that the v1 authority does not
+    // understand. The authorize handler MUST ignore
+    // unknown query params — the request MUST NOT
+    // fail when `resource` is present alongside the
+    // other required params.
+    const url = buildAuthorizeUrl({}) + "&resource=http%3A%2F%2F127.0.0.1%3A3001%2F";
+    const res = await fetch(url);
+    expect(res.status).toBe(200);
+    const ctype = res.headers.get("content-type") ?? "";
+    expect(ctype).toMatch(/text\/html/);
+    const body = await res.text();
+    expect(body).toMatch(/username|password|login/i);
+  });
+
+  it("POST /oauth/authorize with an extra `resource` form field is tolerated (registered client)", async () => {
+    // The same regression on the POST /authorize
+    // path: the form-encoded body is allowed to
+    // carry a `resource` field; the consent flow
+    // MUST NOT 400 on it.
+    const loginBody = new URLSearchParams({
+      _action: "login",
+      username,
+      password,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: "read:bi_catastro",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "xyz123",
+      resource: "http://127.0.0.1:3001/",
+    });
+    const res = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: loginBody,
+    });
+    expect(res.status).toBe(200);
+  });
+
+  it("consent: a `*` URL scope is REJECTED when the client does not allow `*`", async () => {
+    // Pre-2026 regression: the consent handler
+    // bound URL-requested scopes to the code
+    // verbatim. A crafted `scope=*` URL would have
+    // produced a code with `scope=["*"]`. The fix
+    // is the intersection rule.
+    const loginBody = new URLSearchParams({
+      _action: "login",
+      username,
+      password,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: "*",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "xyz123",
+    });
+    const loginRes = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: loginBody,
+    });
+    const sessionCookie = (loginRes.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const consentHtml = await loginRes.text();
+    const csrf = extractCsrfFromHtml(consentHtml);
+    expect(csrf).not.toBeNull();
+    const consentBody = new URLSearchParams({
+      _action: "consent",
+      _csrf: csrf!,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: "*",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "xyz123",
+    });
+    const consentRes = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        cookie: sessionCookie,
+      },
+      body: consentBody,
+    });
+    // The intersection rule returns invalid_scope
+    // (the client has `read:bi_catastro`, not `*`).
+    expect(consentRes.status).toBe(400);
+  });
+
+  it("consent: a scope outside both the user + client intersection is REJECTED", async () => {
+    // Privilege-escalation regression: a user with
+    // `read:bi_catastro` cannot consent to
+    // `call:secret` even when the client allows
+    // `call:secret` (the user is the bottleneck).
+    await withSingleWriter(db, async (trx) => {
+      await trx.execute(
+        "UPDATE users SET scopes = ? WHERE id = ?",
+        [JSON.stringify(["read:bi_catastro"]), agentId],
+      );
+      await trx.execute(
+        "UPDATE clients SET scopes = ? WHERE clientId = ?",
+        [JSON.stringify(["call:secret"]), clientId],
+      );
+    });
+    const loginBody = new URLSearchParams({
+      _action: "login",
+      username,
+      password,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: "call:secret",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "xyz123",
+    });
+    const loginRes = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: loginBody,
+    });
+    const sessionCookie = (loginRes.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const consentHtml = await loginRes.text();
+    const csrf = extractCsrfFromHtml(consentHtml);
+    expect(csrf).not.toBeNull();
+    const consentBody = new URLSearchParams({
+      _action: "consent",
+      _csrf: csrf!,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: "call:secret",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "xyz123",
+    });
+    const consentRes = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        cookie: sessionCookie,
+      },
+      body: consentBody,
+    });
+    expect(consentRes.status).toBe(400);
+  });
+
+  it("GET /oauth/authorize with a redirect_uri NOT in the client's stored list is rejected (RFC 7591 enforcement)", async () => {
+    // Pre-register a client that was created via
+    // DCR with a specific `redirectUris` list. The
+    // authorize handler MUST reject any `redirect_uri`
+    // not in the list, even when the URI passes the
+    // loopback rule (the DCR client registered an
+    // explicit allow-list; the list is the
+    // authoritative source). Legacy / pre-DCR clients
+    // have an empty list and keep the loopback-only
+    // behavior.
+    const registeredUri = "http://127.0.0.1:7777/cb";
+    await withSingleWriter(db, async (trx) => {
+      await trx.execute(
+        "UPDATE clients SET redirectUris = ? WHERE clientId = ?",
+        [JSON.stringify([registeredUri]), clientId],
+      );
+    });
+    // The supplied `redirect_uri` is loopback (so it
+    // would pass the legacy rule) but NOT in the
+    // registered list — must be rejected.
+    const res = await fetch(buildAuthorizeUrl({ redirectUri: "http://127.0.0.1:9999/different" }));
+    expect(res.status).toBe(400);
+    const ctype = res.headers.get("content-type") ?? "";
+    expect(ctype).toMatch(/text\/html/);
+    const body = await res.text();
+    expect(body).toMatch(/invalid/i);
+    // The supplied `redirect_uri` is NOT echoed in
+    // the response body (sanitized).
+    expect(body).not.toMatch(/9999/);
+  });
+
+  it("GET /oauth/authorize accepts a redirect_uri in the client's stored list (DCR enforcement)", async () => {
+    // Same setup as above: the client has a stored
+    // list. A request whose redirect_uri IS in the
+    // list passes.
+    const registeredUri = "http://127.0.0.1:7777/cb";
+    await withSingleWriter(db, async (trx) => {
+      await trx.execute(
+        "UPDATE clients SET redirectUris = ? WHERE clientId = ?",
+        [JSON.stringify([registeredUri]), clientId],
+      );
+    });
+    const res = await fetch(buildAuthorizeUrl({ redirectUri: registeredUri }));
+    expect(res.status).toBe(200);
+    const ctype = res.headers.get("content-type") ?? "";
+    expect(ctype).toMatch(/text\/html/);
+  });
+
+  it("GET /oauth/authorize with an empty stored list keeps the legacy loopback-only behavior", async () => {
+    // Pre-DCR clients have an empty list. The
+    // authorize handler falls back to the existing
+    // loopback rule.
+    const loopback = "http://127.0.0.1:8080/cb";
+    const res = await fetch(buildAuthorizeUrl({ redirectUri: loopback }));
+    expect(res.status).toBe(200);
+  });
+
+  it("consent: the granted scope is the intersection of the user + client scope sets", async () => {
+    // End-to-end: the user has `read` + `list`,
+    // the client has `read` + `call`. The consent
+    // for `read list call` produces a code with
+    // `scope=[read]` (the only scope both
+    // principals allow).
+    await withSingleWriter(db, async (trx) => {
+      await trx.execute(
+        "UPDATE users SET scopes = ? WHERE id = ?",
+        [JSON.stringify(["read:bi_catastro", "list:bi_catastro"]), agentId],
+      );
+      await trx.execute(
+        "UPDATE clients SET scopes = ? WHERE clientId = ?",
+        [JSON.stringify(["read:bi_catastro", "call:foo"]), clientId],
+      );
+    });
+    const loginBody = new URLSearchParams({
+      _action: "login",
+      username,
+      password,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: "read:bi_catastro list:bi_catastro call:foo",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "xyz123",
+    });
+    const loginRes = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: loginBody,
+    });
+    const sessionCookie = (loginRes.headers.get("set-cookie") ?? "").split(";")[0]!;
+    const consentHtml = await loginRes.text();
+    const csrf = extractCsrfFromHtml(consentHtml);
+    expect(csrf).not.toBeNull();
+    const consentBody = new URLSearchParams({
+      _action: "consent",
+      _csrf: csrf!,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+      response_type: "code",
+      scope: "read:bi_catastro list:bi_catastro call:foo",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "xyz123",
+    });
+    const consentRes = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        cookie: sessionCookie,
+      },
+      body: consentBody,
+      redirect: "manual",
+    });
+    expect(consentRes.status).toBe(302);
+    const location = consentRes.headers.get("location") ?? "";
+    const locUrl = new URL(location);
+    const code = locUrl.searchParams.get("code");
+    expect(code).toBeTruthy();
+    // Inspect the code record via the public helper
+    // so the assertion is the same shape the token
+    // endpoint sees. Use the current `now` (NOT
+    // `now + 60`) — the code expires 60s AFTER issue,
+    // and we want the assertion to run within the TTL
+    // window.
+    const now = Math.floor(Date.now() / 1000);
+    const rec = consumeCode(code!, now);
+    expect(rec).not.toBeNull();
+    expect(rec!.scopes).toEqual(["read:bi_catastro"]);
+  });
+});
+
+describe("oauth/authorize — oversized POST body returns sanitized 400 HTML (not connection reset)", () => {
+  // The pre-PR review found that `authorize.ts`
+  // used `req.destroy()` on the body-cap-exceeded
+  // path, converting a 400 into a connection
+  // reset. The fix pauses the stream and returns a
+  // sanitized 400 HTML page (the authorize flow is
+  // HTML, not JSON). The test below pins the
+  // contract: the response is a parseable HTML
+  // page with a sanitized error message.
+  let server: Server;
+  let baseUrl: string;
+  let db: ReturnType<typeof openDatabase>;
+
+  beforeEach(async () => {
+    _resetCodeStore();
+    db = openDatabase({ path: ":memory:" });
+    await initializeSchema(db);
+    const key = await makeTestKey();
+    await setActiveSigningKey(db, key);
+    const passwordHash = await hashPassword("p4ssw0rd");
+    const now = Math.floor(Date.now() / 1000);
+    await withSingleWriter(db, async (trx) => {
+      await trx.execute(
+        `INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt)
+         VALUES (?, ?, ?, 1, 0, ?)`,
+        ["alice", passwordHash, JSON.stringify(["read:bi_catastro"]), now],
+      );
+    });
+    const handler = createAuthorizeHandler({
+      db,
+      sessionSecret: "x".repeat(64),
+      secure: false,
+      defaultScope: "read:bi_catastro",
+    });
+    server = createServer((req, res) => {
+      if (req.url?.startsWith("/oauth/authorize") ?? false) {
+        return handler(req, res);
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    await new Promise<void>((resolveP) =>
+      server.listen(0, "127.0.0.1", () => resolveP()),
+    );
+    const port = (server.address() as AddressInfo).port;
+    baseUrl = `http://127.0.0.1:${port}`;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolveP, rejectP) => {
+      server.close((err) => (resolveP(err), undefined));
+    });
+    await db.close();
+  });
+
+  it("a 100 KiB POST body returns 400 + sanitized HTML (no socket reset)", async () => {
+    // 100 KiB body — well over the 64 KiB cap.
+    const oversized = "x".repeat(100 * 1024);
+    const res = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: oversized,
+    });
+    // The handler MUST NOT crash the listener with a
+    // connection reset. The response is a sanitized
+    // 400 HTML page (the authorize flow is HTML, not
+    // JSON).
+    expect(res.status).toBe(400);
+    expect(res.headers.get("content-type")).toMatch(/text\/html/);
+    const text = await res.text();
+    // Sanitized: no verifier, no code, no JWKS URL.
+    // The error page is a static "Invalid request."
+    // message — the only allowed body content.
+    expect(text).toMatch(/Invalid request/i);
+  });
+});
+
+describe("oauth/authorize — X-Forwarded-For trust (audit IP attribution)", () => {
+  // The pre-PR review found that `authorize.ts`
+  // read `X-Forwarded-For` unconditionally. The
+  // fix gates XFF consumption on the `trustProxy`
+  // flag (default `false`). The test below pins
+  // the contract: with `trustProxy=false`, a
+  // spoofed XFF does NOT influence the audit IP.
+  let server: Server;
+  let baseUrl: string;
+  let db: ReturnType<typeof openDatabase>;
+  let trustProxy: boolean;
+
+  async function startServer(): Promise<void> {
+    _resetCodeStore();
+    const passwordHash = await hashPassword("p4ssw0rd");
+    const now = Math.floor(Date.now() / 1000);
+    await withSingleWriter(db, async (trx) => {
+      await trx.execute(
+        `INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt)
+         VALUES (?, ?, ?, 1, 0, ?)`,
+        ["alice", passwordHash, JSON.stringify(["read:bi_catastro"]), now],
+      );
+      // Register the client too — the authorize handler
+      // requires a known client for the login to succeed.
+      await trx.execute(
+        `INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt)
+         VALUES (?, ?, ?, ?, ?)`,
+        [
+          "client-a",
+          await hashPassword("s3cret"),
+          "test",
+          JSON.stringify(["read:bi_catastro"]),
+          now,
+        ],
+      );
+    });
+    const handler = createAuthorizeHandler({
+      db,
+      sessionSecret: "x".repeat(64),
+      secure: false,
+      defaultScope: "read:bi_catastro",
+      trustProxy,
+    });
+    server = createServer((req, res) => {
+      if (req.url?.startsWith("/oauth/authorize") ?? false) {
+        return handler(req, res);
+      }
+      res.statusCode = 404;
+      res.end();
+    });
+    await new Promise<void>((resolveP) =>
+      server.listen(0, "127.0.0.1", () => resolveP()),
+    );
+    const port = (server.address() as AddressInfo).port;
+    baseUrl = `http://127.0.0.1:${port}`;
+  }
+
+  beforeEach(async () => {
+    db = openDatabase({ path: ":memory:" });
+    await initializeSchema(db);
+    const key = await makeTestKey();
+    await setActiveSigningKey(db, key);
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolveP, rejectP) => {
+      server.close((err) => (resolveP(err), undefined));
+    });
+    await db.close();
+  });
+
+  it("default (trustProxy=false): the audit IP reflects the loopback peer, not a spoofed XFF", async () => {
+    trustProxy = false;
+    await startServer();
+    const loginBody = new URLSearchParams({
+      _action: "login",
+      username: "alice",
+      password: "p4ssw0rd",
+      client_id: "client-a",
+      redirect_uri: "http://127.0.0.1:8080/cb",
+      response_type: "code",
+      scope: "read:bi_catastro",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "xyz123",
+    });
+    const res = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        // Spoofed XFF — the default policy MUST NOT
+        // honor it.
+        "X-Forwarded-For": "203.0.113.99",
+      },
+      body: loginBody,
+    });
+    expect(res.status).toBe(200);
+    // The audit row's `ip` is the loopback peer, NOT
+    // the spoofed XFF.
+    const rows = await db.select<{ ip: string | null }>(
+      "SELECT ip FROM audit_log WHERE action = 'authorize.login'",
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.ip).not.toBe("203.0.113.99");
+    expect(rows[0]!.ip).toMatch(/^127\.0\.0\.1|^::ffff:127\.0\.0\.1$|^::1$/);
+  });
+
+  it("trustProxy=true: the audit IP reflects the leftmost XFF entry", async () => {
+    trustProxy = true;
+    await startServer();
+    const loginBody = new URLSearchParams({
+      _action: "login",
+      username: "alice",
+      password: "p4ssw0rd",
+      client_id: "client-a",
+      redirect_uri: "http://127.0.0.1:8080/cb",
+      response_type: "code",
+      scope: "read:bi_catastro",
+      code_challenge: "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
+      code_challenge_method: "S256",
+      state: "xyz123",
+    });
+    const res = await fetch(`${baseUrl}/oauth/authorize`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "X-Forwarded-For": "203.0.113.99",
+      },
+      body: loginBody,
+    });
+    expect(res.status).toBe(200);
+    const rows = await db.select<{ ip: string | null }>(
+      "SELECT ip FROM audit_log WHERE action = 'authorize.login'",
+    );
+    expect(rows.length).toBe(1);
+    expect(rows[0]!.ip).toBe("203.0.113.99");
+  });
 });
 
 // Reference imports so the unused-import linter stays quiet

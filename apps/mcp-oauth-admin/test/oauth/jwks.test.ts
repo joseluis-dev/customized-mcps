@@ -169,16 +169,39 @@ describe("oauth/jwks + openid-configuration", () => {
     const challengeMethods = body["code_challenge_methods_supported"];
     expect(Array.isArray(challengeMethods)).toBe(true);
     expect(challengeMethods).toEqual(["S256"]);
-    // The supported response types are "token" (introspect
-    // returns the active shape; the access-token response
-    // is the token). The spec leaves the exact list open
-    // but MUST include "token".
+    // The supported response types are exactly `["code"]`
+    // (the authorization-code + PKCE S256 flow). The
+    // implicit `token` flow is out of scope and MUST NOT
+    // be advertised; an OIDC client that requires `token`
+    // would discover it does not apply here and fall back
+    // to the standard code flow.
     const responseTypes = body["response_types_supported"];
     expect(Array.isArray(responseTypes)).toBe(true);
-    expect(responseTypes).toContain("token");
+    expect(responseTypes).toEqual(["code"]);
     // Signing algs.
     const algs = body["id_token_signing_alg_values_supported"];
     expect(Array.isArray(algs)).toBe(true);
     expect(algs).toContain("RS256");
+    // subject_types_supported: the authority issues stable
+    // local subjects (e.g. `user:<agentId>`, `client:<id>`),
+    // so the only advertised subject type is `public`. The
+    // field is required by OIDC discovery consumers that
+    // validate the schema (e.g. opencode's MCP auth flow).
+    const subjectTypes = body["subject_types_supported"];
+    expect(Array.isArray(subjectTypes)).toBe(true);
+    expect(subjectTypes).toEqual(["public"]);
+  });
+
+  it("GET /.well-known/openid-configuration advertises the registration_endpoint (RFC 7591)", async () => {
+    // The discovery doc MUST advertise the DCR
+    // endpoint so OIDC clients (e.g. opencode) can
+    // find it during the auth handshake. The
+    // `registration_endpoint` field is a single
+    // string with the absolute URL.
+    const res = await fetch(`${baseUrl}/.well-known/openid-configuration`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(typeof body["registration_endpoint"]).toBe("string");
+    expect(body["registration_endpoint"]).toBe(`${body["issuer"]}/oauth/register`);
   });
 });

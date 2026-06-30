@@ -21,6 +21,13 @@
  * directory; `initializeSchema` is the single source of truth.
  * The CREATE TABLE statements use `IF NOT EXISTS` so the
  * function is idempotent on a re-run.
+ *
+ * Schema migrations:
+ * - The DCR work added a `redirectUris` column to `clients`.
+ *   New databases get it from `CREATE TABLE`; existing
+ *   databases (pre-DCR) get it from `ensureClientsRedirectUris`,
+ *   which uses `PRAGMA table_info` to detect the column and
+ *   `ALTER TABLE` to add it. The function is idempotent.
  */
 
 import type { AuthorityDatabase } from "./connection.js";
@@ -28,12 +35,35 @@ import type { AuthorityDatabase } from "./connection.js";
 /**
  * Apply the schema. The function is idempotent: it uses
  * `CREATE TABLE IF NOT EXISTS` and `CREATE INDEX IF NOT EXISTS`
- * so re-running it on a populated database is a no-op.
+ * so re-running it on a populated database is a no-op. Column
+ * migrations are run AFTER the CREATE statements so legacy
+ * databases pick up the new columns.
  */
 export async function initializeSchema(db: AuthorityDatabase): Promise<void> {
   for (const statement of SCHEMA_STATEMENTS) {
     await db.execute(statement);
   }
+  await ensureClientsRedirectUris(db);
+}
+
+/**
+ * Add the `redirectUris` column to the `clients` table for
+ * databases that pre-date the DCR work. New databases get the
+ * column from the `CREATE TABLE` statement; this function
+ * only fires on legacy schemas.
+ *
+ * The function reads `PRAGMA table_info(clients)` to detect
+ * the column. The pragma returns one row per column; we add
+ * the column when the name list does NOT include
+ * `redirectUris`. The check is per-process startup; the
+ * column is added exactly once.
+ */
+async function ensureClientsRedirectUris(db: AuthorityDatabase): Promise<void> {
+  const cols = await db.select<{ name: string }>("PRAGMA table_info(clients)");
+  if (cols.some((c) => c.name === "redirectUris")) return;
+  await db.execute(
+    "ALTER TABLE clients ADD COLUMN redirectUris TEXT NOT NULL DEFAULT '[]'",
+  );
 }
 
 /**
@@ -50,6 +80,14 @@ export async function initializeSchema(db: AuthorityDatabase): Promise<void> {
  *
  * `audit_log.actor` is deliberately `TEXT` with no FK: the spec
  * requires that audit rows survive a user delete.
+ *
+ * `clients.redirectUris` is a JSON-encoded array of redirect
+ * URIs (RFC 7591 §2). The column defaults to `'[]'` so
+ * pre-registered clients that pre-date the DCR work have no
+ * specific redirect URI list; the authorize handler treats the
+ * empty list as "use the existing loopback-only rule" (RFC
+ * 8252 §7.3). The DCR path is the only path that populates
+ * this column.
  */
 const SCHEMA_STATEMENTS: string[] = [
   // users — agents + admin. JSON `scopes` column holds the
@@ -66,12 +104,19 @@ const SCHEMA_STATEMENTS: string[] = [
   )`,
 
   // clients — OAuth2 client_id + client_secret hash + scopes.
+  // `redirectUris` is a JSON array of redirect URIs (RFC 7591
+  // §2). The default is `[]`; pre-registered clients that
+  // pre-date the DCR work keep the loopback-only behavior (the
+  // authorize handler enforces RFC 8252 §7.3 when the list is
+  // empty). The DCR path is the only path that populates the
+  // column with a non-empty list.
   `CREATE TABLE IF NOT EXISTS clients (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     clientId TEXT NOT NULL UNIQUE,
     clientSecretHash TEXT NOT NULL,
     label TEXT NOT NULL DEFAULT '',
     scopes TEXT NOT NULL DEFAULT '[]',
+    redirectUris TEXT NOT NULL DEFAULT '[]',
     createdAt INTEGER NOT NULL,
     lastUsedAt INTEGER
   )`,
