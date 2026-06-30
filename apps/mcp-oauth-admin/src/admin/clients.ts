@@ -18,6 +18,14 @@
  *   `refresh_tokens` rows for this client where
  *   `revokedAt IS NULL`.
  *
+ * PR 4 of `remove-scope-authorization`:
+ * - The `clients.scopes` column is INERT legacy storage. The
+ *   `createClient` path no longer validates against the
+ *   scope-pattern grammar (the column defaults to `[]` for
+ *   new rows). The `setClientScopes` helper is removed —
+ *   there is no admin route to call it, and the catalog
+ *   that backed it is gone.
+ *
  * Audit-safety:
  * - The `ClientRecord` shape does NOT include `clientSecretHash`
  *   so the secret hash can never leak through the admin UI.
@@ -27,7 +35,6 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { SCOPE_PATTERN } from "@customized-mcps/mcp-http-base";
 import { withSingleWriter, type AuthorityDatabase } from "../db/connection.js";
 import { hashPassword } from "../oauth/passwords.js";
 
@@ -38,7 +45,13 @@ import { hashPassword } from "../oauth/passwords.js";
  *  pre-registered clients that pre-date the DCR work; the
  *  authorize handler treats the empty list as "use the
  *  loopback-only rule" (RFC 8252 §7.3). The DCR path is the
- *  only path that populates the list with one or more entries. */
+ *  only path that populates the list with one or more entries.
+ *
+ *  The `scopes` field is INERT legacy storage (PR 4 of
+ *  `remove-scope-authorization`). It is read so the
+ *  `ClientRecord` shape stays BC-compatible with the
+ *  `clients` table; it is NOT validated, NOT exposed through
+ *  the admin UI, and NOT surfaced on any rendered page. */
 export type ClientRecord = {
   id: number;
   clientId: string;
@@ -49,10 +62,15 @@ export type ClientRecord = {
   lastUsedAt: number | null;
 };
 
+/**
+ * `CreateClientInput` no longer carries `scopes`. The client
+ * is created with the inert default `[]`; the column is
+ * legacy storage. The field is removed from the public
+ * input to make the removal observable at the type level.
+ */
 export type CreateClientInput = {
   clientId: string;
   label?: string;
-  scopes: string[];
   /** Optional: DCR-supplied redirect URI list. Empty when the
    *  client is pre-registered (the admin UI does not surface
    *  this field). Each URI MUST satisfy the loopback rule
@@ -73,7 +91,7 @@ export type CreateClientInput = {
 
 export type CreateClientResult =
   | { ok: true; client: ClientRecord; plaintextSecret: string }
-  | { ok: false; reason: "invalid_clientId" | "invalid_label" | "invalid_scope" | "invalid_secret" | "duplicate" };
+  | { ok: false; reason: "invalid_clientId" | "invalid_label" | "invalid_secret" | "duplicate" };
 
 export type RotateSecretResult =
   | { ok: true; plaintextSecret: string }
@@ -111,6 +129,10 @@ export const MIN_PLAINTEXT_SECRET_LENGTH = 16;
 /**
  * Create a new OAuth client. Returns a one-time plaintext
  * secret; the DB row stores only the `argon2id` hash.
+ *
+ * PR 4 of `remove-scope-authorization`: the `scopes` input
+ * was removed. The `clients.scopes` column is inert legacy
+ * storage and defaults to `[]` for new rows.
  */
 export async function createClient(
   db: AuthorityDatabase,
@@ -121,11 +143,6 @@ export async function createClient(
     return { ok: false, reason: "invalid_clientId" };
   }
   const label = (input.label ?? "").trim();
-  for (const scope of input.scopes) {
-    if (!SCOPE_PATTERN.test(scope)) {
-      return { ok: false, reason: "invalid_scope" };
-    }
-  }
   // Sanity-check a caller-supplied plaintext secret. The
   // check fires only when the caller passed a value
   // (the DCR handler / admin UI's auto-generated path
@@ -144,8 +161,8 @@ export async function createClient(
     const inserted = await withSingleWriter(db, async (trx) => {
       await trx.execute(
         `INSERT INTO clients (clientId, clientSecretHash, label, scopes, redirectUris, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-        [clientId, secretHash, label, JSON.stringify(input.scopes), JSON.stringify(redirectUris), input.now],
+         VALUES (?, ?, ?, '[]', ?, ?)`,
+        [clientId, secretHash, label, JSON.stringify(redirectUris), input.now],
       );
       const rows = await trx.select<{ id: number }>(
         "SELECT id FROM clients WHERE clientId = ?",
@@ -161,7 +178,7 @@ export async function createClient(
       id: inserted,
       clientId,
       label,
-      scopes: [...input.scopes],
+      scopes: [],
       redirectUris: [...redirectUris],
       createdAt: input.now,
       lastUsedAt: null,
@@ -258,32 +275,6 @@ export async function rotateClientSecret(
 }
 
 /**
- * Replace a client's scope set. Each scope MUST match
- * `SCOPE_PATTERN`. An empty array is allowed.
- */
-export async function setClientScopes(
-  db: AuthorityDatabase,
-  id: number,
-  scopes: string[],
-): Promise<boolean> {
-  for (const scope of scopes) {
-    if (!SCOPE_PATTERN.test(scope)) return false;
-  }
-  return withSingleWriter(db, async (trx) => {
-    const existing = await trx.select<{ id: number }>(
-      "SELECT id FROM clients WHERE id = ?",
-      [id],
-    );
-    if (existing.length === 0) return false;
-    await trx.execute("UPDATE clients SET scopes = ? WHERE id = ?", [
-      JSON.stringify(scopes),
-      id,
-    ]);
-    return true;
-  });
-}
-
-/**
  * Set a client's label. Empty / whitespace-only labels are
  * rejected so the admin UI never shows a blank row.
  */
@@ -369,6 +360,8 @@ function rowToClient(r: {
     id: r.id,
     clientId: r.clientId,
     label: r.label,
+    // INERT legacy column — read for BC shape, never validated
+    // or surfaced through the admin UI.
     scopes: parseScopeList(r.scopes),
     redirectUris: parseScopeList(r.redirectUris ?? "[]"),
     createdAt: r.createdAt,

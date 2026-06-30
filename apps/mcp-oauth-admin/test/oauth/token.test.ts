@@ -2,21 +2,28 @@
  * Unit + integration tests for the RS256 access-token signer
  * and the OAuth2 token endpoint.
  *
- * The mcp-oauth-authority spec requires:
+ * The mcp-oauth-authority spec requires (post `remove-scope-authorization`):
  * - Access tokens are RS256-signed JWTs.
  * - Claims: `iss` (the authority URL), `aud` (= `mcp:<app>`),
- *   `sub` (the agent id), `scope` (space-delimited), `iat`,
- *   `nbf`, `exp`, `kid` in the header.
+ *   `sub` (the agent id), `iat`, `nbf`, `exp`, `kid` in the
+ *   header. The JWT MUST NOT include a `scope` or `scopes`
+ *   claim; the authority mints scope-free tokens by design
+ *   (scope authorization is removed).
  * - TTL: 3600 seconds (1 hour).
- * - Token endpoint supports `client_credentials` and
- *   `password` grants. `refresh_token` is supported in v1
- *   (the spec lists it in `grant_types_supported`); the
- *   refresh grant rejects tokens with a non-null
- *   `revokedAt` (Phase 1/2 wiring).
- * - New agents/clients default to `read:<bound-profile>`
- *   (the spec's default-scope assignment). A request that
- *   mixes `*` with a specific scope is rejected with
- *   `400 invalid_scope`.
+ * - Token endpoint supports `client_credentials`, `password`,
+ *   `refresh_token`, and `authorization_code` grants.
+ * - The `refresh_token` grant rejects tokens with a non-null
+ *   `revokedAt` with `400 invalid_grant`.
+ * - Incoming `scope` request parameters (on any of the four
+ *   grants) are tolerated and ignored. The authority MUST
+ *   NOT reject the request with `invalid_scope` and MUST NOT
+ *   include `scope` in the issued token, the token response
+ *   body, the introspection response, or the authorization
+ *   code.
+ * - The token response body is the standard OAuth2 shape
+ *   (`access_token`, `token_type`, `expires_in`). The
+ *   `scope` field is omitted; callers MUST treat the token
+ *   as scope-free by construction.
  *
  * Test layer: integration. We mount the token handler on a
  * real `node:http` listener and POST to it. The signer is
@@ -112,13 +119,15 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     await teardownApp(ctx);
   });
 
-  it("client_credentials grant: returns a JWT with the spec claims, header kid, TTL 3600", async () => {
+  it("client_credentials grant: returns a JWT with the spec claims, header kid, TTL 3600 (no scope claims)", async () => {
     // GIVEN a registered client with no specific scope request
     // WHEN we POST grant_type=client_credentials
     // THEN the response is 200 + a JWT whose:
     //   - header is { alg: RS256, kid, typ: JWT }
-    //   - payload has iss, aud=mcp:readonly-sql, sub, scope, iat, nbf, exp
+    //   - payload has iss, aud=mcp:readonly-sql, sub, iat, nbf, exp
+    //     and MUST NOT include a `scope` or `scopes` claim
     //   - exp - iat = 3600 (TTL)
+    //   - the response body MUST NOT include a `scope` field
     const clientId = "client-a";
     const clientSecret = "s3cret";
     // Use the password module's hash for the client secret
@@ -146,11 +155,13 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       access_token: string;
       token_type: string;
       expires_in: number;
-      scope: string;
+      scope?: string;
     };
     expect(json.token_type).toBe("Bearer");
     expect(json.expires_in).toBe(3600);
-    expect(json.scope).toBe("read:bi_catastro");
+    // The body MUST NOT include a `scope` field (PR 3 of
+    // `remove-scope-authorization` removes the field).
+    expect(json.scope).toBeUndefined();
     expect(typeof json.access_token).toBe("string");
 
     // Decode + verify the JWT.
@@ -171,7 +182,12 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     expect(payload.iss).toBe("http://127.0.0.1:3002");
     expect(payload.aud).toBe("mcp:readonly-sql");
     expect(typeof payload.sub).toBe("string");
-    expect(payload.scope).toBe("read:bi_catastro");
+    // The JWT MUST NOT include a `scope` or `scopes` claim.
+    // The `remove-scope-authorization` change mints
+    // scope-free tokens by design (no wildcard, no
+    // empty-string fallback).
+    expect(payload.scope).toBeUndefined();
+    expect(payload.scopes).toBeUndefined();
     expect(typeof payload.iat).toBe("number");
     expect(typeof payload.nbf).toBe("number");
     expect(typeof payload.exp).toBe("number");
@@ -179,11 +195,14 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     expect(ttl).toBe(3600);
   });
 
-  it("password grant: returns a JWT for a registered user (argon2id-stored hash)", async () => {
+  it("password grant: returns a JWT for a registered user (argon2id-stored hash, no scope claims)", async () => {
     // GIVEN a registered user with an argon2id password hash
     //      + a registered client
     // WHEN we POST grant_type=password
-    // THEN the response is 200 + a JWT with the spec claims.
+    // THEN the response is 200 + a JWT with the spec
+    //      claims (iss, aud, sub, iat, nbf, exp) and NO
+    //      `scope` / `scopes` claims. The response body
+    //      does NOT include a `scope` field.
     const username = "alice";
     const password = "p4ssw0rd";
     const passwordHash = await makeArgonHash(password);
@@ -213,8 +232,9 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       body,
     });
     expect(res.status).toBe(200);
-    const json = (await res.json()) as { access_token: string; scope: string };
-    expect(json.scope).toBe("read:bi_catastro");
+    const json = (await res.json()) as { access_token: string; scope?: string };
+    // The body MUST NOT include a `scope` field.
+    expect(json.scope).toBeUndefined();
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
@@ -225,6 +245,9 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       },
     );
     expect(verified.payload.sub).toBeDefined();
+    // The JWT MUST NOT include a `scope` or `scopes` claim.
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 
   it("password grant: returns 400 password_change_required when requireChangeOnFirstLogin=1 (gate W3 remediation)", async () => {
@@ -311,11 +334,15 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     expect(json.error).toBe("invalid_grant");
   });
 
-  it("client_credentials grant: refuses `*` mixed with a specific scope (400 invalid_scope)", async () => {
-    // GIVEN a registered client
+  it("client_credentials grant: incoming `scope=* read:bi_catastro` is tolerated and ignored (no invalid_scope)", async () => {
+    // GIVEN a registered client (the wildcard-vs-specific
+    //      behavior is removed; incoming scope is tolerated
+    //      and ignored, NOT validated).
     // WHEN we POST with scope=* read:bi_catastro (mixed wildcard + specific)
-    // THEN the response is 400 + { error: invalid_scope }. The
-    //      spec says `*` MUST NOT be mixed with specific scopes.
+    // THEN the response is 200 + a JWT. The handler does
+    //      NOT reject with `invalid_scope` (the spec
+    //      `incoming-scope-tolerated` rule for PR 3 of
+    //      `remove-scope-authorization`).
     const stored = await makeArgonHash("s3cret");
     await withSingleWriter(ctx.db, async (trx) => {
       await trx.execute(
@@ -334,19 +361,30 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body,
     });
-    expect(res.status).toBe(400);
-    const json = (await res.json()) as { error: string };
-    expect(json.error).toBe("invalid_scope");
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { access_token: string; scope?: string };
+    expect(json.scope).toBeUndefined();
+    // The JWT MUST NOT include a `scope` or `scopes` claim.
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 
-  it("client_credentials grant: a new client defaults to `read:<bound-profile>` (no `*`)", async () => {
-    // GIVEN a new client whose `scopes` column is the default
-    //      empty array (the test pre-registers with [])
-    // WHEN we POST with NO scope param
-    // THEN the issued token's `scope` is the authority's
-    //      default: `read:bi_catastro` (the spec's
-    //      `read:<bound-profile>`). The token's scope MUST
-    //      NOT include `*`.
+  it("client_credentials grant: a new client with no stored scopes still mints a scope-free token", async () => {
+    // GIVEN a new client whose `scopes` column is the
+    //      default empty array (the test pre-registers
+    //      with `[]`).
+    // WHEN we POST with NO `scope` param
+    // THEN the response is 200 + a JWT with NO `scope`
+    //      field in the body and NO `scope` / `scopes`
+    //      claim in the JWT. The pre-PR behavior
+    //      (defaulting to `read:<bound-profile>`) is
+    //      removed: the authority no longer assigns a
+    //      default scope.
     const stored = await makeArgonHash("s3cret");
     await withSingleWriter(ctx.db, async (trx) => {
       await trx.execute(
@@ -365,9 +403,15 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       body,
     });
     expect(res.status).toBe(200);
-    const json = (await res.json()) as { scope: string };
-    expect(json.scope).toBe("read:bi_catastro");
-    expect(json.scope.split(/\s+/)).not.toContain("*");
+    const json = (await res.json()) as { scope?: string; access_token: string };
+    expect(json.scope).toBeUndefined();
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 
   it("refresh_token grant: rejects revoked refresh tokens with 400 invalid_grant", async () => {
@@ -410,10 +454,17 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     expect(json.error).toBe("invalid_grant");
   });
 
-  it("refresh_token grant: issues a new access token for a non-revoked refresh token", async () => {
-    // GIVEN a refresh token whose revokedAt is null
+  it("refresh_token grant: issues a new scope-free access token for a non-revoked refresh token", async () => {
+    // GIVEN a refresh token whose revokedAt is null AND
+    //      whose bound `scopes` column is a legacy value
+    //      (`["read:bi_catastro"]`) from a pre-PR
+    //      deployment.
     // WHEN we POST grant_type=refresh_token
     // THEN the response is 200 + a new access token.
+    //      The minted token is scope-free (no `scope` /
+    //      `scopes` claims, no `scope` in the body). The
+    //      legacy stored `scopes` value is inert — it
+    //      MUST NOT influence the new access token.
     const clientId = "client-a";
     const clientSecret = "s3cret";
     const stored = await makeArgonHash(clientSecret);
@@ -446,14 +497,19 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       body,
     });
     expect(res.status).toBe(200);
-    const json = (await res.json()) as { access_token: string; scope: string };
-    expect(json.scope).toBe("read:bi_catastro");
+    const json = (await res.json()) as { access_token: string; scope?: string };
+    expect(json.scope).toBeUndefined();
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
       { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
     );
     expect(verified.payload.aud).toBe("mcp:readonly-sql");
+    // The JWT MUST NOT include a `scope` or `scopes` claim
+    // even though the refresh token's bound `scopes` column
+    // holds a legacy value.
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 });
 
@@ -529,14 +585,19 @@ describe("oauth/token (authorization_code grant — PKCE S256)", () => {
     return code;
   }
 
-  it("happy path: returns a JWT with sub=user:<agentId> and the consented scopes", async () => {
-    // GIVEN a freshly-issued code
+  it("happy path: returns a JWT with sub=user:<agentId> (no scope claims, no scope in body)", async () => {
+    // GIVEN a freshly-issued code (the `code` is bound
+    //      to clientId + agentId + redirectUri +
+    //      codeChallenge; in the PR 3 contract it is
+    //      NOT bound to a scope set).
     // WHEN we POST grant_type=authorization_code with
     //      the matching code_verifier
     // THEN the response is 200 + a JWT whose:
     //   - sub is `user:<id>` (the agent's id)
-    //   - scope matches the consented scope set
     //   - aud and iss match the authority config
+    //   - payload MUST NOT include a `scope` or `scopes`
+    //     claim
+    //   - body MUST NOT include a `scope` field
     const code = seedCode();
     const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
       method: "POST",
@@ -555,11 +616,12 @@ describe("oauth/token (authorization_code grant — PKCE S256)", () => {
       access_token: string;
       token_type: string;
       expires_in: number;
-      scope: string;
+      scope?: string;
     };
     expect(json.token_type).toBe("Bearer");
     expect(json.expires_in).toBe(3600);
-    expect(json.scope).toBe("read:bi_catastro");
+    // The body MUST NOT include a `scope` field.
+    expect(json.scope).toBeUndefined();
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
@@ -572,7 +634,9 @@ describe("oauth/token (authorization_code grant — PKCE S256)", () => {
     expect(verified.payload.sub).toBe(`user:${userId}`);
     expect(verified.payload.iss).toBe("http://127.0.0.1:3002");
     expect(verified.payload.aud).toBe("mcp:readonly-sql");
-    expect(verified.payload.scope).toBe("read:bi_catastro");
+    // The JWT MUST NOT include a `scope` or `scopes` claim.
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 
   it("PKCE S256: wrong code_verifier returns 400 invalid_grant (sanitized)", async () => {
@@ -748,22 +812,13 @@ describe("oauth/token (authorization_code grant — PKCE S256)", () => {
     expect(body.error).toBe("invalid_grant");
   });
 
-  it("defense in depth: a rotation of the client scope after issue shrinks the granted set", async () => {
-    // The consent handler bound the code's `scopes`
-    // to the user+client intersection at issue time
-    // (a `read:bi_catastro` consent). The token
-    // endpoint re-derives the intersection at
-    // exchange time so a future rotation that
-    // REMOVES the scope from the client shrinks
-    // the granted set (NOT broadens it).
+  it("defense in depth: a code with a legacy bound `scopes` array still mints a scope-free token", async () => {
+    // Pre-PR code rows stored a `scopes: ["read:bi_catastro", "list:bi_catastro"]`
+    // value at consent time. After PR 3, the token
+    // endpoint MUST NOT carry that value into the new
+    // access token (the `code` is no longer bound to
+    // a scope set; the JWT omits `scope` / `scopes`).
     const code = seedCode({ scopes: ["read:bi_catastro", "list:bi_catastro"] });
-    // Rotate the client to have only `read:bi_catastro`.
-    await withSingleWriter(ctx.db, async (trx) => {
-      await trx.execute(
-        "UPDATE clients SET scopes = ? WHERE clientId = ?",
-        [JSON.stringify(["read:bi_catastro"]), clientId],
-      );
-    });
     const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -777,9 +832,18 @@ describe("oauth/token (authorization_code grant — PKCE S256)", () => {
       }),
     });
     expect(res.status).toBe(200);
-    const json = (await res.json()) as { scope: string };
-    // The re-derived set is `read:bi_catastro` only.
-    expect(json.scope).toBe("read:bi_catastro");
+    const json = (await res.json()) as { scope?: string; access_token: string };
+    // The body MUST NOT include a `scope` field, and the
+    // JWT MUST NOT include a `scope` or `scopes` claim
+    // even though the code had a legacy `scopes` array.
+    expect(json.scope).toBeUndefined();
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 });
 
@@ -820,8 +884,9 @@ describe("oauth/token — client_secret_basic (RFC 6749 §2.3.1)", () => {
       }),
     });
     expect(res.status).toBe(200);
-    const json = (await res.json()) as { scope: string };
-    expect(json.scope).toBe("read:bi_catastro");
+    const json = (await res.json()) as { scope?: string };
+    // The body MUST NOT include a `scope` field.
+    expect(json.scope).toBeUndefined();
   });
 
   it("rejects a malformed Basic header (falls back to no-creds error)", async () => {
@@ -863,7 +928,18 @@ describe("oauth/token — client_secret_basic (RFC 6749 §2.3.1)", () => {
   });
 });
 
-describe("oauth/token — password grant scope intersection (user AND client)", () => {
+describe("oauth/token — incoming `scope` parameter is tolerated and ignored (PR 3 of remove-scope-authorization)", () => {
+  // The pre-PR3 implementation validated, bounded, and
+  // resolved the `scope` request parameter for every
+  // grant. The post-PR3 contract is: the parameter is
+  // accepted, ignored, and never causes a rejection.
+  // The authority MUST NOT return `invalid_scope` for
+  // any scope request, and the issued token MUST NOT
+  // include the requested scope in any form.
+  //
+  // This describe block pins the contract with one
+  // test per grant (triangulation: same behavior across
+  // all four grant types).
   let ctx: Awaited<ReturnType<typeof setupApp>>;
 
   beforeEach(async () => {
@@ -878,20 +954,47 @@ describe("oauth/token — password grant scope intersection (user AND client)", 
     await teardownApp(ctx);
   });
 
-  it("rejects a `*` request when the client does not allow `*` (privilege escalation closed)", async () => {
-    // Pre-2026 regression: a user with `*` could
-    // mint a `*` token through a client with no
-    // scopes. The fix is the intersection.
+  it("client_credentials: incoming `scope=read:bi_catastro list:bi_catastro` is ignored, JWT has no `scope`", async () => {
+    const stored = await makeArgonHash("s3cret");
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-a", stored, "test", JSON.stringify([]), Math.floor(Date.now() / 1000)],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: "client-a",
+        client_secret: "s3cret",
+        scope: "read:bi_catastro list:bi_catastro",
+      }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { scope?: string; access_token: string };
+    expect(json.scope).toBeUndefined();
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
+  });
+
+  it("password: incoming `scope=*` is tolerated (no invalid_scope), JWT has no `scope`", async () => {
     const passwordHash = await makeArgonHash("p4ssw0rd");
     const clientHash = await makeArgonHash("s3cret");
     await withSingleWriter(ctx.db, async (trx) => {
       await trx.execute(
         "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
-        ["alice", passwordHash, JSON.stringify(["*"]), 1, 0, Math.floor(Date.now() / 1000)],
+        ["alice", passwordHash, JSON.stringify([]), 1, 0, Math.floor(Date.now() / 1000)],
       );
       await trx.execute(
         "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
-        ["client-a", clientHash, "test", JSON.stringify(["read:bi_catastro"]), Math.floor(Date.now() / 1000)],
+        ["client-a", clientHash, "test", JSON.stringify([]), Math.floor(Date.now() / 1000)],
       );
     });
     const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
@@ -906,81 +1009,141 @@ describe("oauth/token — password grant scope intersection (user AND client)", 
         scope: "*",
       }),
     });
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("invalid_scope");
-  });
-
-  it("grants the intersection of the user's and the client's scope sets", async () => {
-    const passwordHash = await makeArgonHash("p4ssw0rd");
-    const clientHash = await makeArgonHash("s3cret");
-    await withSingleWriter(ctx.db, async (trx) => {
-      await trx.execute(
-        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
-        ["alice", passwordHash, JSON.stringify(["read:bi_catastro", "list:bi_catastro"]), 1, 0, Math.floor(Date.now() / 1000)],
-      );
-      await trx.execute(
-        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
-        ["client-a", clientHash, "test", JSON.stringify(["read:bi_catastro", "call:foo"]), Math.floor(Date.now() / 1000)],
-      );
-    });
-    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        grant_type: "password",
-        username: "alice",
-        password: "p4ssw0rd",
-        client_id: "client-a",
-        client_secret: "s3cret",
-        scope: "read:bi_catastro list:bi_catastro call:foo",
-      }),
-    });
     expect(res.status).toBe(200);
-    const json = (await res.json()) as { scope: string };
-    expect(json.scope).toBe("read:bi_catastro");
+    const json = (await res.json()) as { scope?: string; access_token: string };
+    expect(json.scope).toBeUndefined();
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 
-  it("rejects a request when the user has the scope but the client does not", async () => {
-    const passwordHash = await makeArgonHash("p4ssw0rd");
-    const clientHash = await makeArgonHash("s3cret");
+  it("refresh_token: incoming `scope=call:secret` on a fresh refresh grant is ignored", async () => {
+    // A refresh grant with a legacy refresh token that
+    // had bound `scopes = []` and a NEW request that
+    // includes `scope=call:secret` MUST still succeed;
+    // the `scope` is ignored, the token is scope-free.
+    const clientId = "client-a";
+    const clientSecret = "s3cret";
+    const stored = await makeArgonHash(clientSecret);
+    const now = Math.floor(Date.now() / 1000);
+    const refreshPlaintext = "fresh-refresh-token";
+    const refreshHash = createHash("sha256").update(refreshPlaintext).digest("hex");
     await withSingleWriter(ctx.db, async (trx) => {
       await trx.execute(
-        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
-        ["alice", passwordHash, JSON.stringify(["call:secret"]), 1, 0, Math.floor(Date.now() / 1000)],
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        [clientId, stored, "test", JSON.stringify([]), now],
       );
       await trx.execute(
-        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
-        ["client-a", clientHash, "test", JSON.stringify(["read:bi_catastro"]), Math.floor(Date.now() / 1000)],
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        ["alice", "argon2id-stub", JSON.stringify([]), 1, 0, now],
+      );
+      await trx.execute(
+        "INSERT INTO refresh_tokens (agentId, clientId, scopes, tokenHash, issuedAt, revokedAt) VALUES (?, ?, ?, ?, ?, ?)",
+        [1, 1, JSON.stringify([]), refreshHash, now - 1000, null],
       );
     });
     const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
       body: new URLSearchParams({
-        grant_type: "password",
-        username: "alice",
-        password: "p4ssw0rd",
-        client_id: "client-a",
-        client_secret: "s3cret",
+        grant_type: "refresh_token",
+        refresh_token: refreshPlaintext,
+        client_id: clientId,
+        client_secret: clientSecret,
         scope: "call:secret",
       }),
     });
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("invalid_scope");
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { scope?: string; access_token: string };
+    expect(json.scope).toBeUndefined();
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
+  });
+
+  it("authorization_code: incoming `scope=* read:bi_catastro` on a code exchange is ignored, JWT has no `scope`", async () => {
+    // The PR 3 contract: the `code` is bound to
+    // clientId + agentId + redirectUri + codeChallenge
+    // only; the `scope` request param on the token
+    // request is tolerated and ignored. The token is
+    // scope-free.
+    _resetCodeStore();
+    const clientIdLocal = "client-a";
+    const clientSecretLocal = "s3cret";
+    const redirectUriLocal = "http://127.0.0.1:8080/cb";
+    const userHash = await makeArgonHash("p4ssw0rd");
+    const clientHash = await makeArgonHash(clientSecretLocal);
+    let userIdLocal = 0;
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        ["alice", userHash, JSON.stringify([]), 1, 0, Math.floor(Date.now() / 1000)],
+      );
+      const userRows = await trx.select<{ id: number }>(
+        "SELECT id FROM users WHERE username = ?",
+        ["alice"],
+      );
+      userIdLocal = userRows[0]!.id;
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        [clientIdLocal, clientHash, "test", JSON.stringify([]), Math.floor(Date.now() / 1000)],
+      );
+    });
+    const v = randomBytes(32).toString("base64url");
+    const c = createHash("sha256").update(v).digest("base64url");
+    const code = `code-${Math.random().toString(36).slice(2, 10)}`;
+    getCodeStore().set(code, {
+      clientId: clientIdLocal,
+      agentId: userIdLocal,
+      redirectUri: redirectUriLocal,
+      codeChallenge: c,
+      codeChallengeMethod: "S256",
+      scopes: [],
+      expiresAt: Math.floor(Date.now() / 1000) + 60,
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUriLocal,
+        client_id: clientIdLocal,
+        client_secret: clientSecretLocal,
+        code_verifier: v,
+        scope: "* read:bi_catastro",
+      }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { scope?: string; access_token: string };
+    expect(json.scope).toBeUndefined();
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 });
 
-describe("oauth/token — refresh_token + authorization_code scope defense in depth (no `*` bypass)", () => {
-  // Regression coverage for the review finding: the
-  // pre-PR2 implementation preserved `*` on
-  // refresh-token and authorization-code grants even
-  // when neither principal currently allowed `*`. The
-  // fix delegates to the centralized
-  // `resolveGrantedScopes` helper with the stored
-  // scopes as the request string, so the `*` rules
-  // apply uniformly.
+describe("oauth/token — legacy wildcard / mixed scope storage mints a scope-free token (PR 3)", () => {
+  // Pre-PR refresh tokens / authorization codes may
+  // carry a legacy `scopes` column with a `*` (or
+  // mixed `*` + specific) value from a pre-2026
+  // deployment. The post-PR3 contract: the stored
+  // value is LEGACY/INERT. The new access token is
+  // ALWAYS scope-free; the `*` value MUST NOT be
+  // honored, MUST NOT be carried into the JWT, and
+  // MUST NOT cause a rejection.
   let ctx: Awaited<ReturnType<typeof setupApp>>;
   let userId: number;
   let clientId: string;
@@ -992,10 +1155,6 @@ describe("oauth/token — refresh_token + authorization_code scope defense in de
 
   beforeEach(async () => {
     _resetCodeStore();
-    // Use a recent past second as the base. See the
-    // note on the other `nowRef` initial value for why
-    // a fixed past time no longer works (the
-    // deterministic-clock change in `token.ts`).
     nowRef = { value: Math.floor(Date.now() / 1000) - 60 };
     ctx = await setupApp({
       audience: "mcp:readonly-sql",
@@ -1030,13 +1189,13 @@ describe("oauth/token — refresh_token + authorization_code scope defense in de
     await teardownApp(ctx);
   });
 
-  it("refresh_token: a stored `*` scope is REJECTED when the principal does not allow `*`", async () => {
+  it("refresh_token: a stored `*` scope mints a SCOPE-FREE token (legacy wildcard is inert)", async () => {
     // The refresh token's `scopes` is `["*"]` (a
-    // pre-existing token issued under a more permissive
-    // policy). After a rotation that narrows both
-    // principals, the recomputed set MUST NOT include
-    // `*`. The endpoint returns `invalid_grant` (NOT
-    // a token with `*`).
+    // pre-PR3 token). The new endpoint MUST NOT
+    // carry that value into the JWT, MUST NOT
+    // reject the request, and MUST NOT include a
+    // `scope` or `scopes` claim. The new token is
+    // scope-free by design.
     const refreshPlaintext = "stale-wildcard-refresh";
     const refreshHash = createHash("sha256").update(refreshPlaintext).digest("hex");
     await withSingleWriter(ctx.db, async (trx) => {
@@ -1055,24 +1214,23 @@ describe("oauth/token — refresh_token + authorization_code scope defense in de
         client_secret: clientSecret,
       }),
     });
-    // The recomputed set is empty (the principal does
-    // not allow `*`); the endpoint MUST return
-    // `invalid_grant`. Using `invalid_scope` here
-    // would leak the wildcard state — `invalid_grant`
-    // is the sanitized shape every other refresh
-    // failure uses.
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("invalid_grant");
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { scope?: string; access_token: string };
+    expect(json.scope).toBeUndefined();
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 
-  it("authorization_code: a stored `*` scope is REJECTED when the principal does not allow `*`", async () => {
-    // Same regression on the authorization_code
-    // path: the code's `scopes` is `["*"]` (an
-    // older consent form permitted wildcard). After
-    // a rotation that narrows both principals, the
-    // exchange MUST fail with `invalid_grant` (NOT
-    // mint a `*` token, NOT `invalid_scope`).
+  it("authorization_code: a stored `*` scope mints a SCOPE-FREE token (legacy wildcard is inert)", async () => {
+    // Same contract on the authorization_code
+    // path: the code's `scopes` is `["*"]` (a
+    // legacy code issued before the change). The
+    // new endpoint MUST mint a scope-free token.
     const code = `code-${Math.random().toString(36).slice(2, 10)}`;
     getCodeStore().set(code, {
       clientId,
@@ -1095,20 +1253,22 @@ describe("oauth/token — refresh_token + authorization_code scope defense in de
         code_verifier: verifier,
       }),
     });
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("invalid_grant");
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { scope?: string; access_token: string };
+    expect(json.scope).toBeUndefined();
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 
-  it("refresh_token: a mixed `*` + specific stored scope is REJECTED (the policy rejects mixing)", async () => {
-    // The pre-PR2 implementation could mint a token
-    // with a mixed set. The fix delegates to the
-    // centralized resolver, which rejects mixed
-    // `*` + specific requests with `invalid_scope`.
-    // The endpoint maps this to `invalid_grant` for
-    // the same reason as the previous case: the
-    // response shape MUST NOT leak the wildcard
-    // state of the stored scopes.
+  it("refresh_token: a mixed `*` + specific stored scope mints a SCOPE-FREE token (legacy mixed storage is inert)", async () => {
+    // The pre-PR3 storage could have a mixed
+    // value. The new endpoint MUST NOT honor it.
+    // The new token is scope-free.
     const refreshPlaintext = "mixed-wildcard-refresh";
     const refreshHash = createHash("sha256").update(refreshPlaintext).digest("hex");
     await withSingleWriter(ctx.db, async (trx) => {
@@ -1127,9 +1287,16 @@ describe("oauth/token — refresh_token + authorization_code scope defense in de
         client_secret: clientSecret,
       }),
     });
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("invalid_grant");
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { scope?: string; access_token: string };
+    expect(json.scope).toBeUndefined();
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+    );
+    expect(verified.payload.scope).toBeUndefined();
+    expect(verified.payload.scopes).toBeUndefined();
   });
 });
 
@@ -1519,10 +1686,13 @@ describe("oauth/introspect", () => {
     await teardownApp(ctx);
   });
 
-  it("introspect: returns { active: true, ... } for a valid token", async () => {
+  it("introspect: returns { active: true, ... } for a valid token (no `scope` in body)", async () => {
     // GIVEN a client_credentials grant that returned a token
     // WHEN we POST /oauth/introspect with the token
-    // THEN the response is 200 + { active: true, sub, aud, iss, scope }.
+    // THEN the response is 200 + { active: true, sub, aud, iss }
+    //      and the body MUST NOT include a `scope` field
+    //      (PR 3 of `remove-scope-authorization` removes
+    //      `scope` from the introspection response).
     const stored = await makeArgonHash("s3cret");
     await withSingleWriter(ctx.db, async (trx) => {
       await trx.execute(
@@ -1556,7 +1726,8 @@ describe("oauth/introspect", () => {
     expect(body.active).toBe(true);
     expect(body.aud).toBe("mcp:readonly-sql");
     expect(body.iss).toBe("http://127.0.0.1:3002");
-    expect(body.scope).toBe("read:bi_catastro");
+    // The body MUST NOT include a `scope` field.
+    expect(body.scope).toBeUndefined();
   });
 
   it("introspect: returns { active: false } for a malformed/expired token", async () => {

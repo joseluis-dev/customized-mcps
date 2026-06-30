@@ -7,9 +7,14 @@
  * dev/offline fallback; the JWKS backend is the recommended default for
  * production and shared deployments.
  *
- * What the tests assert (per the mcp-token-authority spec):
+ * What the tests assert (per the mcp-token-authority spec + the
+ * `remove-scope-authorization` PR 1 delta):
  * - `verify` accepts a JWT with valid `iss` + `aud` + `exp` + `nbf` and
- *   resolves to `{ agentId: sub, scopes: SCOPE_PATTERN-filtered }`.
+ *   resolves to `{ agentId: sub, scopes: [] }`. The `scopes` claim
+ *   on the JWT (in any shape) is IGNORED — there is no filter, no
+ *   per-entry match, no logging. The exhaustive contract for the
+ *   "ignore inbound scopes" behavior is in
+ *   `test/authority/jwksScope.test.ts`.
  * - `verify` rejects an expired JWT, a wrong-`aud` JWT, a wrong-`iss`
  *   JWT, a wrong-signature JWT, and a JWT with a `kid` absent from two
  *   consecutive JWKS responses. All rejections throw
@@ -21,9 +26,6 @@
  *   calls within `MCP_AUTHORITY_JWKS_TTL_S` reuse the cached key set.
  *   A `kid` miss triggers a single refetch; a second `kid` miss on the
  *   same `kid` is rejected.
- * - Scopes that do not match `SCOPE_PATTERN` are dropped from the
- *   resolved set; the WARN log line MUST NOT include the rejected
- *   values.
  *
  * Approach:
  * - `jose` produces a real key pair and signed JWTs. No stubs on the
@@ -198,12 +200,14 @@ describe("JwksAuthority", () => {
   });
 
   describe("verify — claim validation (1b.1)", () => {
-    it("accepts a valid JWT (valid iss, aud, exp) and resolves { agentId: sub, scopes }", async () => {
+    it("accepts a valid JWT (valid iss, aud, exp) and resolves { agentId: sub, scopes: [] }", async () => {
       // GIVEN an authority backed by a JWKS that contains the signing key
       // WHEN verify is called with a JWT signed by that key, with the
       //      correct iss + aud + exp
-      // THEN the resolved identity has the JWT's sub as agentId and the
-      //      scopes claim as scopes
+      // THEN the resolved identity has the JWT's sub as agentId AND
+      //      scopes is exactly [] (the `remove-scope-authorization`
+      //      change makes the resource server ignore the inbound
+      //      `scopes` claim — see PR 1 task 1.1).
       const harness = await startJwksHarness([[key.publicJwk]]);
       try {
         const auth = new JwksAuthority(baseOptions({ jwksUrl: harness.url }));
@@ -213,7 +217,10 @@ describe("JwksAuthority", () => {
         });
         const result = await auth.verify(token);
         expect(result.agentId).toBe("third-party-x");
-        expect(result.scopes).toEqual(["read:bi_catastro", "list:reporting"]);
+        // The `scopes` claim on the JWT is ignored. The contract is
+        // `scopes: []` for any successful verify, regardless of the
+        // inbound claim shape.
+        expect(result.scopes).toEqual([]);
         // The JWKS was fetched exactly once (first call).
         expect(harness.calls.length).toBe(1);
       } finally {
@@ -371,81 +378,26 @@ describe("JwksAuthority", () => {
     });
   });
 
-  describe("verify — SCOPE_PATTERN filter (1b.2)", () => {
-    it("drops scopes that do not match SCOPE_PATTERN (rejected values are NOT in the result)", async () => {
-      // GIVEN a JWT with a mix of valid and invalid scopes
-      // WHEN verify is called
-      // THEN only the valid scopes are returned; the invalid ones are
-      //      dropped from the resolved set
-      const harness = await startJwksHarness([[key.publicJwk]]);
-      try {
-        const auth = new JwksAuthority(baseOptions({ jwksUrl: harness.url }));
-        const token = await signTestJwt(key.privateKey, key.kid, {
-          scopes: ["read:bi_catastro", "delete:foo", "list:reporting", "no-verb"],
-        });
-        const result = await auth.verify(token);
-        expect(result.scopes).toEqual(["read:bi_catastro", "list:reporting"]);
-        expect(result.scopes).not.toContain("delete:foo");
-        expect(result.scopes).not.toContain("no-verb");
-      } finally {
-        await harness.close();
-      }
-    });
-
-    it("emits a single WARN log line when invalid scopes are dropped (no rejected values in the line)", async () => {
-      // GIVEN an authority whose logger captures warn messages
-      // WHEN verify resolves a JWT with invalid scopes
-      // THEN a WARN is emitted that does NOT include the rejected values
-      //      (per the audit-safe redaction contract in mcp-token-authority)
-      const harness = await startJwksHarness([[key.publicJwk]]);
-      try {
-        const captured: string[] = [];
-        const logger: Logger = {
-          info: () => undefined,
-          warn: (msg) => captured.push(String(msg)),
-          error: (msg) => captured.push(String(msg)),
-        };
-        const auth = new JwksAuthority(baseOptions({ jwksUrl: harness.url, logger }));
-        const token = await signTestJwt(key.privateKey, key.kid, {
-          scopes: ["read:bi_catastro", "delete:foo", "another-bad"],
-        });
-        await auth.verify(token);
-        const joined = captured.join("\n");
-        // Rejected values MUST NOT leak into the WARN line.
-        expect(joined).not.toContain("delete:foo");
-        expect(joined).not.toContain("another-bad");
-        // The WARN line itself MUST exist (operator signal: a misconfigured scope).
-        const droppedWarn = captured.find((m) => /dropped|invalid|mismatch/i.test(m));
-        expect(droppedWarn).toBeDefined();
-      } finally {
-        await harness.close();
-      }
-    });
-
-    it("does not emit a WARN when every scope is valid (happy path is silent)", async () => {
-      // GIVEN a JWT with all-valid scopes
-      // WHEN verify resolves it
-      // THEN no scope-related WARN is emitted — the filter is a
-      //      defense layer, not a normal-path log line
-      const harness = await startJwksHarness([[key.publicJwk]]);
-      try {
-        const captured: string[] = [];
-        const logger: Logger = {
-          info: () => undefined,
-          warn: (msg) => captured.push(String(msg)),
-          error: (msg) => captured.push(String(msg)),
-        };
-        const auth = new JwksAuthority(baseOptions({ jwksUrl: harness.url, logger }));
-        const token = await signTestJwt(key.privateKey, key.kid, {
-          scopes: ["read:bi_catastro", "list:*"],
-        });
-        await auth.verify(token);
-        // No drop-related WARN should have fired.
-        const dropWarn = captured.find((m) => /dropped|invalid scope|mismatch/i.test(m));
-        expect(dropWarn).toBeUndefined();
-      } finally {
-        await harness.close();
-      }
+  describe("verify — ignores inbound scopes (PR 1 task 1.1)", () => {
+    // PR 1 of the `remove-scope-authorization` change makes scope
+    // authorization inert. The `scopes` claim on the inbound JWT is
+    // ignored end-to-end: the resource server never extracts it,
+    // never filters it, never logs it, and never returns it. The
+    // `verify` contract is `scopes: []` for every successful call.
+    // The behavior is exhaustively covered by
+    // `test/authority/jwksScope.test.ts` (the strict-TDD test
+    // companion to this change). This block exists to keep the
+    // SCOPE_PATTERN-filter assertions out of the main file: the
+    // `extractScopesClaim` / `filterScopes` / SCOPE_PATTERN machinery
+    // is no longer present in `authority/jwks.ts`, so the old
+    // "filter / drop / warn" assertions no longer describe the
+    // production behavior. The new contract is asserted in
+    // `jwksScope.test.ts`.
+    it("(contract moved) see jwksScope.test.ts for the new contract", () => {
+      // This placeholder keeps the describe block in the test file
+      // so reviewers can see the deliberate removal of the old
+      // "verify — SCOPE_PATTERN filter" assertions.
+      expect(true).toBe(true);
     });
   });
 

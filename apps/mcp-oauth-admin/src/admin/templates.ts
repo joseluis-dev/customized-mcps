@@ -16,6 +16,19 @@
  *   shown in a dedicated "WARN: copy this now" block; the
  *   secret appears ONCE in the response, never re-rendered.
  *
+ * PR 4 of `remove-scope-authorization`:
+ * - `renderScopesList` and `renderScopeError` are REMOVED.
+ *   The scope catalog page is no longer rendered; the
+ *   `/admin/scopes` route is no longer registered.
+ * - The agents list, clients list, and refresh-tokens list
+ *   MUST NOT include a `Scopes` / `Current scopes` /
+ *   `Edit scopes` column. The nav MUST NOT link to a
+ *   "Scopes" page.
+ * - Legacy `scopes` values are NEVER rendered as inert
+ *   text on any admin page. The `RefreshTokenRow.scopes`
+ *   field is still read (for BC), but the template does
+ *   not surface it.
+ *
  * HTML escaping:
  * - Every dynamic value is passed through `escapeHtml`
  *   before being embedded in the page. The escape covers
@@ -36,7 +49,6 @@
 import { redactAuditValue } from "./audit.js";
 import type { AgentRecord } from "./agents.js";
 import type { ClientRecord } from "./clients.js";
-import type { ScopeRecord } from "./scopes.js";
 import type { RefreshTokenRow } from "./refresh.js";
 import type { AuditRow } from "./audit.js";
 
@@ -51,8 +63,13 @@ export type AuditRowView = Omit<AuditRow, "target" | "ip"> & {
   ip: string | null;
 };
 
-/** A pre-shaped row for the refresh-token list. */
-export type RefreshTokenView = RefreshTokenRow;
+/** A pre-shaped row for the refresh-token list.
+ *  PR 4 of `remove-scope-authorization`: the `scopes` field
+ *  is intentionally NOT part of the view-model that the
+ *  refresh-tokens template renders. The field is still
+ *  read from the DB (for BC + future migration tooling)
+ *  but the template does not project it onto a column. */
+export type RefreshTokenView = Omit<RefreshTokenRow, "scopes">;
 
 /** HTML escape. The 5 characters that have meaning in HTML
  *  text / attribute contexts. */
@@ -188,7 +205,6 @@ export function renderDashboard(options: { username: string; csrfToken: string }
 <nav>
   <a href="/admin/agents">Agents</a>
   <a href="/admin/clients">Clients</a>
-  <a href="/admin/scopes">Scopes</a>
   <a href="/admin/refresh-tokens">Refresh tokens</a>
   <a href="/admin/audit">Audit log</a>
   <a href="/admin/change-password">Change password</a>
@@ -210,23 +226,15 @@ export function renderAgentsList(options: {
 }): string {
   const rows =
     options.agents.length === 0
-      ? `<tr><td colspan="7" class="muted">No agents yet.</td></tr>`
+      ? `<tr><td colspan="5" class="muted">No agents yet.</td></tr>`
       : options.agents
           .map(
             (a) => `
 <tr>
   <td>${escapeHtml(a.username)}</td>
-  <td>${a.scopes.map(escapeHtml).join(", ")}</td>
   <td>${a.enabled ? "yes" : "no"}</td>
   <td>${a.requireChangeOnFirstLogin ? "yes" : "no"}</td>
   <td>${escapeHtml(formatDate(a.createdAt))}</td>
-  <td>
-    <form action="/admin/agents/${a.id}/scopes" method="POST" style="display:inline">
-      <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
-      <input type="text" name="scopes" value="${escapeHtml(a.scopes.join(" "))}" size="20" placeholder="read:resource">
-      <button type="submit" class="btn">Save scopes</button>
-    </form>
-  </td>
   <td>
     <form action="/admin/agents/${a.id}/${a.enabled ? "disable" : "enable"}" method="POST" style="display:inline">
       <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
@@ -245,20 +253,18 @@ export function renderAgentsList(options: {
   <a href="/admin/">Dashboard</a>
   <a href="/admin/agents">Agents</a>
   <a href="/admin/clients">Clients</a>
-  <a href="/admin/scopes">Scopes</a>
   <a href="/admin/refresh-tokens">Refresh tokens</a>
   <a href="/admin/audit">Audit log</a>
 </nav>
 <h1>Agents</h1>
 <table>
-  <thead><tr><th>Username</th><th>Current scopes</th><th>Enabled</th><th>Rotation required</th><th>Created</th><th>Edit scopes</th><th>Actions</th></tr></thead>
+  <thead><tr><th>Username</th><th>Enabled</th><th>Rotation required</th><th>Created</th><th>Actions</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>
 <h2>Create agent</h2>
 <form action="/admin/agents/create" method="POST">
   <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
   <p><label>Username: <input type="text" name="username" required pattern="[A-Za-z0-9_.-]+"></label></p>
-  <p><label>Scopes (space-separated): <input type="text" name="scopes" placeholder="read:bi_catastro"></label></p>
   <p><label><input type="checkbox" name="require_change" value="1"> Require password change on first login</label></p>
   <p><button type="submit" class="btn">Create agent</button></p>
 </form>
@@ -292,23 +298,15 @@ export function renderClientsList(options: {
 }): string {
   const rows =
     options.clients.length === 0
-      ? `<tr><td colspan="6" class="muted">No clients yet.</td></tr>`
+      ? `<tr><td colspan="5" class="muted">No clients yet.</td></tr>`
       : options.clients
           .map(
             (c) => `
 <tr>
   <td><code>${escapeHtml(c.clientId)}</code></td>
   <td>${escapeHtml(c.label)}</td>
-  <td>${c.scopes.map(escapeHtml).join(", ")}</td>
   <td>${escapeHtml(formatDate(c.createdAt))}</td>
   <td>${c.lastUsedAt === null ? "<span class=\"muted\">never</span>" : escapeHtml(formatDate(c.lastUsedAt))}</td>
-  <td>
-    <form action="/admin/clients/${c.id}/scopes" method="POST" style="display:inline">
-      <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
-      <input type="text" name="scopes" value="${escapeHtml(c.scopes.join(" "))}" size="20" placeholder="read:resource">
-      <button type="submit" class="btn">Save scopes</button>
-    </form>
-  </td>
   <td>
     <form action="/admin/clients/${c.id}/rotate" method="POST" style="display:inline">
       <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
@@ -327,13 +325,12 @@ export function renderClientsList(options: {
   <a href="/admin/">Dashboard</a>
   <a href="/admin/agents">Agents</a>
   <a href="/admin/clients">Clients</a>
-  <a href="/admin/scopes">Scopes</a>
   <a href="/admin/refresh-tokens">Refresh tokens</a>
   <a href="/admin/audit">Audit log</a>
 </nav>
 <h1>OAuth clients</h1>
 <table>
-  <thead><tr><th>clientId</th><th>Label</th><th>Current scopes</th><th>Created</th><th>Last used</th><th>Edit scopes</th><th>Actions</th></tr></thead>
+  <thead><tr><th>clientId</th><th>Label</th><th>Created</th><th>Last used</th><th>Actions</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>
 <h2>Create client</h2>
@@ -341,7 +338,6 @@ export function renderClientsList(options: {
   <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
   <p><label>clientId: <input type="text" name="client_id" required pattern="[A-Za-z0-9_.-]+"></label></p>
   <p><label>Label: <input type="text" name="label"></label></p>
-  <p><label>Scopes (space-separated): <input type="text" name="scopes" placeholder="read:bi_catastro"></label></p>
   <p><button type="submit" class="btn">Create client</button></p>
 </form>
 `;
@@ -367,94 +363,18 @@ export function renderClientCreated(options: {
   return renderLayout({ title: "Client created", body, csrfToken: options.csrfToken });
 }
 
-/** Render the scope catalog. */
-export function renderScopesList(options: {
-  scopes: ScopeRecord[];
-  /**
-   * Map of scope name → in-use count (number of agents
-   * + clients currently bound to the scope). The router
-   * computes the counts via `scopeInUse(name)` and
-   * passes them in one shot. Missing entries default to
-   * `0` so the template never throws on a stale map.
-   */
-  inUse: Record<string, number>;
-  csrfToken: string;
-}): string {
-  const rows =
-    options.scopes.length === 0
-      ? `<tr><td colspan="4" class="muted">No scopes in the catalog.</td></tr>`
-      : options.scopes
-          .map(
-            (s) => `
-<tr>
-  <td><code>${escapeHtml(s.name)}</code></td>
-  <td>${escapeHtml(s.description)}</td>
-  <td class="inuse">${escapeHtml(String(options.inUse[s.name] ?? 0))}</td>
-  <td>
-    <form action="/admin/scopes/${encodeURIComponent(s.name)}/delete" method="POST" style="display:inline" onsubmit="return confirm('Delete scope ${escapeHtml(s.name)}?')">
-      <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
-      <button type="submit" class="btn btn-danger">Delete</button>
-    </form>
-  </td>
-</tr>`,
-          )
-          .join("");
-  const body = `
-<nav>
-  <a href="/admin/">Dashboard</a>
-  <a href="/admin/agents">Agents</a>
-  <a href="/admin/clients">Clients</a>
-  <a href="/admin/scopes">Scopes</a>
-  <a href="/admin/refresh-tokens">Refresh tokens</a>
-  <a href="/admin/audit">Audit log</a>
-</nav>
-<h1>Scope catalog</h1>
-<table>
-  <thead><tr><th>Name</th><th>Description</th><th>In use</th><th>Actions</th></tr></thead>
-  <tbody>${rows}</tbody>
-</table>
-<h2>Add scope</h2>
-<form action="/admin/scopes/create" method="POST">
-  <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
-  <p><label>Name: <input type="text" name="name" required placeholder="read:bi_catastro"></label></p>
-  <p><label>Description: <input type="text" name="description"></label></p>
-  <p><button type="submit" class="btn">Add scope</button></p>
-</form>
-`;
-  return renderLayout({ title: "Scopes", body, csrfToken: options.csrfToken });
-}
-
-/** Render the scope-delete error page. */
-export function renderScopeError(options: {
-  scopeName: string;
-  reason: "in_use" | "not_found" | "invalid";
-  count?: number;
-  csrfToken: string;
-}): string {
-  let message: string;
-  if (options.reason === "in_use") {
-    const n = options.count ?? 0;
-    message = `Scope <code>${escapeHtml(options.scopeName)}</code> cannot be deleted: it is currently assigned to ${n} row(s). Revoke or rotate the affected agents / clients first.`;
-  } else if (options.reason === "not_found") {
-    message = `Scope <code>${escapeHtml(options.scopeName)}</code> does not exist.`;
-  } else {
-    message = `Scope name <code>${escapeHtml(options.scopeName)}</code> is not a valid <code>&lt;verb&gt;:&lt;resource&gt;</code>.`;
-  }
-  const body = `
-<nav><a href="/admin/scopes">Back to scopes</a></nav>
-<h1>Scope operation failed</h1>
-<div class="error">${message}</div>
-`;
-  return renderLayout({ title: "Scope error", body, csrfToken: options.csrfToken });
-}
-
-/** Render the refresh-token revocation list. */
+/** Render the refresh-token revocation list.
+ *  PR 4 of `remove-scope-authorization`: the `Scopes`
+ *  column is REMOVED. The `RefreshTokenRow.scopes` field
+ *  is still read (the DB column is legacy/inert storage)
+ *  but the template does not project it onto a column.
+ *  Legacy scope values are NOT rendered on this page. */
 export function renderRefreshTokensList(options: {
   rows: RefreshTokenView[];
   csrfToken: string;
 }): string {
   const rowsHtml = options.rows.length === 0
-    ? `<tr><td colspan="6" class="muted">No refresh tokens.</td></tr>`
+    ? `<tr><td colspan="5" class="muted">No refresh tokens.</td></tr>`
     : options.rows
         .map(
           (r) => {
@@ -472,7 +392,6 @@ export function renderRefreshTokensList(options: {
 <tr>
   <td>${escapeHtml(r.agentUsername)}</td>
   <td><code>${escapeHtml(r.clientId)}</code></td>
-  <td>${r.scopes.map(escapeHtml).join(", ")}</td>
   <td>${escapeHtml(formatDate(r.issuedAt))}</td>
   <td>${status}</td>
   <td>${action}</td>
@@ -485,13 +404,12 @@ export function renderRefreshTokensList(options: {
   <a href="/admin/">Dashboard</a>
   <a href="/admin/agents">Agents</a>
   <a href="/admin/clients">Clients</a>
-  <a href="/admin/scopes">Scopes</a>
   <a href="/admin/refresh-tokens">Refresh tokens</a>
   <a href="/admin/audit">Audit log</a>
 </nav>
 <h1>Refresh tokens</h1>
 <table>
-  <thead><tr><th>Agent</th><th>Client</th><th>Scopes</th><th>Issued</th><th>Status</th><th>Actions</th></tr></thead>
+  <thead><tr><th>Agent</th><th>Client</th><th>Issued</th><th>Status</th><th>Actions</th></tr></thead>
   <tbody>${rowsHtml}</tbody>
 </table>
 `;
@@ -539,7 +457,6 @@ export function renderAuditList(options: {
   <a href="/admin/">Dashboard</a>
   <a href="/admin/agents">Agents</a>
   <a href="/admin/clients">Clients</a>
-  <a href="/admin/scopes">Scopes</a>
   <a href="/admin/refresh-tokens">Refresh tokens</a>
   <a href="/admin/audit">Audit log</a>
 </nav>

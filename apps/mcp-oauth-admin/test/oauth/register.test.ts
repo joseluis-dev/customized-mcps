@@ -18,12 +18,20 @@
  * - The response carries `client_id`, `client_secret`,
  *   `client_id_issued_at`, `client_secret_expires_at`,
  *   `redirect_uris`, `grant_types`, `response_types`,
- *   `token_endpoint_auth_method`, and `scope`.
+ *   `token_endpoint_auth_method`, and `scope`. The
+ *   `scope` field is the empty string `""` by design
+ *   (PR 3 of `remove-scope-authorization` makes
+ *   scope authorization inert; the DCR response retains
+ *   the `scope` field for RFC 7591 compatibility and
+ *   sets it to the empty string so legacy clients do
+ *   not see a missing field).
  * - The plaintext `client_secret` is returned exactly
  *   once; the DB row stores only the `argon2id` hash.
- * - Requested `scope` is bounded against the authority
- *   scope catalog (or the `defaultScope` when the
- *   catalog is empty).
+ * - Incoming `scope` request parameters are tolerated
+ *   and ignored (no `invalid_scope` rejection). The
+ *   response's `scope` field is always `""` (the
+ *   empty string), regardless of what the request
+ *   supplied.
  *
  * Test layer: integration. We mount the registration
  * handler on a real `node:http` listener on a random
@@ -103,7 +111,15 @@ async function postRegister(body: unknown, contentType = "application/json"): Pr
 }
 
 describe("oauth/register (RFC 7591)", () => {
-  it("happy path: returns 201 + the standards-shaped registration response", async () => {
+  it("happy path: returns 201 + the standards-shaped registration response (`scope: \"\"`)", async () => {
+    // GIVEN a request with a `scope` field
+    // WHEN we POST to /oauth/register
+    // THEN the response is 201 with the standards-
+    //      shaped fields. The `scope` field is the
+    //      empty string `""` regardless of the
+    //      request's `scope` (the request value is
+    //      tolerated and ignored; the field is
+    //      retained for RFC 7591 compatibility).
     const res = await postRegister({
       redirect_uris: ["http://127.0.0.1:8080/cb"],
       scope: "read:bi_catastro",
@@ -119,7 +135,12 @@ describe("oauth/register (RFC 7591)", () => {
     expect(body["grant_types"]).toEqual(["authorization_code"]);
     expect(body["response_types"]).toEqual(["code"]);
     expect(body["token_endpoint_auth_method"]).toBe("client_secret_post");
-    expect(body["scope"]).toBe("read:bi_catastro");
+    // The `scope` field is the empty string `""` (PR 3
+    // of `remove-scope-authorization` makes scope
+    // authorization inert; the DCR response retains
+    // the field for RFC 7591 compatibility and sets it
+    // to the empty string).
+    expect(body["scope"]).toBe("");
     // Deterministic generator: the test injects the
     // `gen-padded-N-value-test-x-x-x-x` generator so
     // the response shape is stable. The values are
@@ -127,6 +148,59 @@ describe("oauth/register (RFC 7591)", () => {
     // check in `createClient` accepts the secret.
     expect(body["client_id"]).toBe("gen-padded-0-value-test-x-x-x-x");
     expect(body["client_secret"]).toBe("gen-padded-1-value-test-x-x-x-x");
+  });
+
+  it("DCR: incoming `scope=*` is tolerated (no invalid_scope); response `scope: \"\"`", async () => {
+    // The pre-PR3 DCR handler bounded the requested
+    // scope against the catalog and rejected with
+    // `invalid_scope` when the request was out of
+    // catalog. The post-PR3 contract: incoming
+    // `scope` is tolerated; the response is 201 with
+    // `scope: ""` (no `invalid_scope` rejection, the
+    // requested value is not echoed).
+    const res = await postRegister({
+      redirect_uris: ["http://127.0.0.1:8080/cb"],
+      scope: "*",
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { scope: string };
+    expect(body.scope).toBe("");
+  });
+
+  it("DCR: incoming `scope=call:secret` is tolerated; response `scope: \"\"` (out-of-catalog values are not rejected)", async () => {
+    // Pre-PR3: an out-of-catalog request returned
+    // `400 invalid_scope`. Post-PR3: the request is
+    // accepted and the response `scope` is `""`.
+    const res = await postRegister({
+      redirect_uris: ["http://127.0.0.1:8080/cb"],
+      scope: "call:secret",
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { scope: string };
+    expect(body.scope).toBe("");
+  });
+
+  it("DCR: with a populated catalog, the response `scope` is still `\"\"` (the catalog is informational only post-PR3)", async () => {
+    // Seed a catalog entry. The pre-PR3 handler used
+    // the catalog to bound the requested scope. The
+    // post-PR3 handler ignores the catalog (the
+    // `scopes` table is legacy / inert) and returns
+    // `scope: ""` regardless. This pins the
+    // cross-slice contract: a populated catalog does
+    // not influence the DCR response.
+    await withSingleWriter(db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO scopes (name, description, createdAt) VALUES (?, ?, ?)",
+        ["read:bi_catastro", "test", 1_700_000_000],
+      );
+    });
+    const res = await postRegister({
+      redirect_uris: ["http://127.0.0.1:8080/cb"],
+      scope: "read:bi_catastro",
+    });
+    expect(res.status).toBe(201);
+    const body = (await res.json()) as { scope: string };
+    expect(body.scope).toBe("");
   });
 
   it("persists the client in the clients table with the argon2id hash (not the plaintext)", async () => {
@@ -243,59 +317,6 @@ describe("oauth/register (RFC 7591)", () => {
     expect(res.status).toBe(400);
     const body = (await res.json()) as { error: string };
     expect(body.error).toBe("invalid_redirect_uri");
-  });
-
-  it("a `*` scope request falls back to the default scope when the catalog is empty (no self-grant)", async () => {
-    // The empty-catalog policy is "no self-grant": a
-    // request for the wildcard `*` MUST NOT return `*`
-    // when the catalog is empty. The response is 201
-    // + the default scope (the request is honored, the
-    // wildcard is silently downgraded to the default).
-    const res = await postRegister({
-      redirect_uris: ["http://127.0.0.1:8080/cb"],
-      scope: "*",
-    });
-    expect(res.status).toBe(201);
-    const body = (await res.json()) as { scope: string };
-    expect(body.scope).toBe("read:bi_catastro");
-    expect(body.scope).not.toContain("*");
-  });
-
-  it("rejects an out-of-catalog scope with 400 invalid_scope", async () => {
-    // Seed a single catalog entry.
-    await withSingleWriter(db, async (trx) => {
-      await trx.execute(
-        "INSERT INTO scopes (name, description, createdAt) VALUES (?, ?, ?)",
-        ["read:bi_catastro", "test", 1_700_000_000],
-      );
-    });
-    const res = await postRegister({
-      redirect_uris: ["http://127.0.0.1:8080/cb"],
-      scope: "call:secret",
-    });
-    expect(res.status).toBe(400);
-    const body = (await res.json()) as { error: string };
-    expect(body.error).toBe("invalid_scope");
-  });
-
-  it("grants the intersection of request and catalog when both are present", async () => {
-    await withSingleWriter(db, async (trx) => {
-      await trx.execute(
-        "INSERT INTO scopes (name, description, createdAt) VALUES (?, ?, ?)",
-        ["read:bi_catastro", "test", 1_700_000_000],
-      );
-      await trx.execute(
-        "INSERT INTO scopes (name, description, createdAt) VALUES (?, ?, ?)",
-        ["list:bi_catastro", "test", 1_700_000_000],
-      );
-    });
-    const res = await postRegister({
-      redirect_uris: ["http://127.0.0.1:8080/cb"],
-      scope: "read:bi_catastro call:secret",
-    });
-    expect(res.status).toBe(201);
-    const body = (await res.json()) as { scope: string };
-    expect(body.scope).toBe("read:bi_catastro");
   });
 
   it("rejects a non-JSON body with 400", async () => {

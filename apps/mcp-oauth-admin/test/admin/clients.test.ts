@@ -3,18 +3,23 @@
  *
  * The mcp-admin-ui spec requires:
  * - Pages to list, create, edit, and disable OAuth clients.
- * - Each row shows `clientId`, `label`, `scopes`, `lastUsedAt`.
+ * - Each row shows `clientId`, `label`, `lastUsedAt`. The
+ *   legacy `scopes` column is NOT surfaced through the UI
+ *   (PR 4 of `remove-scope-authorization`).
  * - `createClient` generates a one-time plaintext secret,
  *   stores the `argon2id` hash, and returns the plaintext in
  *   the response.
  * - `rotateSecret` returns a new plaintext; the old secret
  *   returns `401 invalid_client` on the next token request.
  * - `deleteClient` is allowed only when the client has no
- *   outstanding refresh tokens (the spec says "refuses
- *   deletion of a scope currently assigned to any agent or
- *   client with a sanitized error naming the affected count" —
- *   for clients, the analogous rule is "refuses deletion when
- *   refresh tokens are still live").
+ *   outstanding refresh tokens.
+ *
+ * PR 4 of `remove-scope-authorization`:
+ * - The `scopes` input was removed from `createClient`. The
+ *   `clients.scopes` column is INERT legacy storage and
+ *   defaults to `[]` for new rows.
+ * - The `setClientScopes` helper was removed (no admin route
+ *   to call it; the catalog that backed it is gone).
  *
  * Test layer: unit. Real SQLite (in-memory) for the writes.
  */
@@ -27,7 +32,6 @@ import {
   getClientById,
   getClientByClientId,
   rotateClientSecret,
-  setClientScopes,
   setClientLabel,
   recordClientUsed,
   deleteClient,
@@ -68,7 +72,6 @@ describe("admin/clients — createClient", () => {
     const r = await createClient(db, {
       clientId: "bi-catastro-client",
       label: "BI Catastro app",
-      scopes: ["read:bi_catastro"],
       now,
     });
     expect(r.ok).toBe(true);
@@ -82,23 +85,22 @@ describe("admin/clients — createClient", () => {
     expect(ok).toBe(true);
   });
 
-  it("stores the label, scopes, and createdAt", async () => {
+  it("stores the label and createdAt (no scopes field on input — PR 4 contract)", async () => {
     const r = await createClient(db, {
       clientId: "c1",
       label: "My App",
-      scopes: ["read:bi_catastro", "list:bi_catastro"],
       now,
     });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const row = await getClientByClientId(db, "c1");
     expect(row?.label).toBe("My App");
-    expect(row?.scopes).toEqual(["read:bi_catastro", "list:bi_catastro"]);
+    expect(row?.scopes).toEqual([]);
     expect(row?.createdAt).toBe(now);
   });
 
   it("defaults label to empty string and scopes to []", async () => {
-    const r = await createClient(db, { clientId: "c1", scopes: [], now });
+    const r = await createClient(db, { clientId: "c1", now });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const row = await getClientByClientId(db, "c1");
@@ -107,7 +109,7 @@ describe("admin/clients — createClient", () => {
   });
 
   it("rejects an empty clientId", async () => {
-    const r = await createClient(db, { clientId: "", scopes: [], now });
+    const r = await createClient(db, { clientId: "", now });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("invalid_clientId");
@@ -118,30 +120,19 @@ describe("admin/clients — createClient", () => {
     // `[A-Za-z0-9_.-]{1,64}` (the same shape as the agent
     // username, since clients and agents share the
     // identifier grammar).
-    const r = await createClient(db, { clientId: "has spaces", scopes: [], now });
+    const r = await createClient(db, { clientId: "has spaces", now });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("invalid_clientId");
   });
 
   it("rejects a duplicate clientId", async () => {
-    const r1 = await createClient(db, { clientId: "c1", scopes: [], now });
+    const r1 = await createClient(db, { clientId: "c1", now });
     expect(r1.ok).toBe(true);
-    const r2 = await createClient(db, { clientId: "c1", scopes: [], now });
+    const r2 = await createClient(db, { clientId: "c1", now });
     expect(r2.ok).toBe(false);
     if (r2.ok) return;
     expect(r2.reason).toBe("duplicate");
-  });
-
-  it("rejects a scope that does not match SCOPE_PATTERN", async () => {
-    const r = await createClient(db, {
-      clientId: "c1",
-      scopes: ["bogus"],
-      now,
-    });
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.reason).toBe("invalid_scope");
   });
 
   it("rejects a caller-supplied plaintextSecret shorter than MIN_PLAINTEXT_SECRET_LENGTH", async () => {
@@ -155,7 +146,6 @@ describe("admin/clients — createClient", () => {
     // path is unaffected.
     const r = await createClient(db, {
       clientId: "c1",
-      scopes: ["read:bi_catastro"],
       // 6 chars — well under the 16-char floor.
       plaintextSecret: "s3cret",
       now,
@@ -170,7 +160,6 @@ describe("admin/clients — createClient", () => {
     // helper accepts the value and stores its hash.
     const r = await createClient(db, {
       clientId: "c1",
-      scopes: ["read:bi_catastro"],
       // Exactly 16 chars — the minimum.
       plaintextSecret: "abcdefghijklmnop",
       now,
@@ -181,8 +170,8 @@ describe("admin/clients — createClient", () => {
   });
 
   it("the generated secret is cryptographically random (different on each call)", async () => {
-    const r1 = await createClient(db, { clientId: "c1", scopes: [], now });
-    const r2 = await createClient(db, { clientId: "c2", scopes: [], now });
+    const r1 = await createClient(db, { clientId: "c1", now });
+    const r2 = await createClient(db, { clientId: "c2", now });
     if (!r1.ok || !r2.ok) return;
     expect(r1.plaintextSecret).not.toBe(r2.plaintextSecret);
   });
@@ -190,9 +179,9 @@ describe("admin/clients — createClient", () => {
 
 describe("admin/clients — listClients", () => {
   it("returns all clients newest-first", async () => {
-    await createClient(db, { clientId: "a", scopes: [], now: now + 0 });
-    await createClient(db, { clientId: "b", scopes: [], now: now + 1 });
-    await createClient(db, { clientId: "c", scopes: [], now: now + 2 });
+    await createClient(db, { clientId: "a", now: now + 0 });
+    await createClient(db, { clientId: "b", now: now + 1 });
+    await createClient(db, { clientId: "c", now: now + 2 });
     const rows = await listClients(db);
     expect(rows.map((r) => r.clientId)).toEqual(["c", "b", "a"]);
   });
@@ -209,7 +198,7 @@ describe("admin/clients — rotateClientSecret", () => {
     // WHEN we rotate the secret
     // THEN the response is a fresh plaintext AND the DB hash
     //      matches the new plaintext (NOT the old one).
-    const r = await createClient(db, { clientId: "c1", scopes: [], now });
+    const r = await createClient(db, { clientId: "c1", now });
     if (!r.ok) return;
     const first = r.plaintextSecret;
     const rotated = await rotateClientSecret(db, r.client.id, now + 100);
@@ -232,27 +221,16 @@ describe("admin/clients — rotateClientSecret", () => {
   });
 });
 
-describe("admin/clients — setClientScopes", () => {
-  it("replaces the scope set with the new value", async () => {
-    const r = await createClient(db, { clientId: "c1", scopes: ["read:bi_catastro"], now });
-    if (!r.ok) return;
-    const ok = await setClientScopes(db, r.client.id, ["read:bi_catastro", "list:bi_catastro"]);
-    expect(ok).toBe(true);
-    const after = await getClientById(db, r.client.id);
-    expect(after?.scopes).toEqual(["read:bi_catastro", "list:bi_catastro"]);
-  });
-
-  it("rejects a scope that does not match SCOPE_PATTERN", async () => {
-    const r = await createClient(db, { clientId: "c1", scopes: [], now });
-    if (!r.ok) return;
-    const ok = await setClientScopes(db, r.client.id, ["bogus"]);
-    expect(ok).toBe(false);
+describe("admin/clients — setClientScopes is REMOVED (PR 4 of remove-scope-authorization)", () => {
+  it("the public surface does NOT export setClientScopes", async () => {
+    const mod = (await import("../../src/admin/clients.js")) as Record<string, unknown>;
+    expect(mod.setClientScopes).toBeUndefined();
   });
 });
 
 describe("admin/clients — setClientLabel", () => {
   it("replaces the label", async () => {
-    const r = await createClient(db, { clientId: "c1", label: "old", scopes: [], now });
+    const r = await createClient(db, { clientId: "c1", label: "old", now });
     if (!r.ok) return;
     const ok = await setClientLabel(db, r.client.id, "new label");
     expect(ok).toBe(true);
@@ -261,7 +239,7 @@ describe("admin/clients — setClientLabel", () => {
   });
 
   it("rejects an empty label", async () => {
-    const r = await createClient(db, { clientId: "c1", label: "x", scopes: [], now });
+    const r = await createClient(db, { clientId: "c1", label: "x", now });
     if (!r.ok) return;
     const ok = await setClientLabel(db, r.client.id, "");
     expect(ok).toBe(false);
@@ -270,7 +248,7 @@ describe("admin/clients — setClientLabel", () => {
 
 describe("admin/clients — recordClientUsed", () => {
   it("updates the lastUsedAt timestamp", async () => {
-    const r = await createClient(db, { clientId: "c1", scopes: [], now });
+    const r = await createClient(db, { clientId: "c1", now });
     if (!r.ok) return;
     await recordClientUsed(db, r.client.id, now + 50);
     const after = await getClientById(db, r.client.id);
@@ -283,7 +261,7 @@ describe("admin/clients — deleteClient", () => {
     // GIVEN a client with no refresh tokens
     // WHEN we delete it
     // THEN the row is removed.
-    const r = await createClient(db, { clientId: "c1", scopes: [], now });
+    const r = await createClient(db, { clientId: "c1", now });
     if (!r.ok) return;
     const result = await deleteClient(db, r.client.id);
     expect(result.ok).toBe(true);
@@ -296,97 +274,90 @@ describe("admin/clients — deleteClient", () => {
     // WHEN we try to delete it
     // THEN the call returns ok=false with reason 'in_use'
     //      and the affected count.
-    const r = await createClient(db, { clientId: "c1", scopes: [], now });
+    const r = await createClient(db, { clientId: "c1", now });
     if (!r.ok) return;
-    // Seed a user + a refresh token tied to this client.
+    // Insert a non-revoked refresh token. We need a user
+    // first because `refresh_tokens.agentId` is a FK to
+    // `users.id`.
     await db.execute(
       `INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt)
-       VALUES (?, ?, ?, 1, 0, ?)`,
-      ["u1", "argon2id-stub", "[]", now],
+       VALUES (?, 'argon2id-stub', '[]', 1, 0, ?)`,
+      ["agent-for-rt", now],
     );
+    const userRows = await db.select<{ id: number }>(
+      "SELECT id FROM users WHERE username = ?",
+      ["agent-for-rt"],
+    );
+    const agentId = userRows[0]?.id ?? 0;
     await db.execute(
       `INSERT INTO refresh_tokens (agentId, clientId, scopes, tokenHash, issuedAt, revokedAt)
-       VALUES (?, ?, ?, ?, ?, NULL)`,
-      [1, r.client.id, "[]", "hash-1", now],
+       VALUES (?, ?, '[]', ?, ?, NULL)`,
+      [agentId, r.client.id, "h-active", now],
     );
     const result = await deleteClient(db, r.client.id);
     expect(result.ok).toBe(false);
     if (result.ok) return;
     expect(result.reason).toBe("in_use");
-    if (result.reason === "in_use") {
-      expect(result.count).toBe(1);
-    }
+    expect(result.count).toBe(1);
   });
 
-  it("ALLOWS deleting a client whose refresh tokens are all revoked", async () => {
-    // GIVEN a client whose only refresh tokens are revoked
+  it("deletes a client whose only refresh tokens are revoked", async () => {
+    // GIVEN a client with ONLY revoked refresh tokens
     // WHEN we delete it
-    // THEN the deletion succeeds (the count query filters
-    //      `revokedAt IS NULL`).
-    const r = await createClient(db, { clientId: "c1", scopes: [], now });
+    // THEN the row is removed (the count of outstanding
+    //      tokens is 0).
+    const r = await createClient(db, { clientId: "c1", now });
     if (!r.ok) return;
+    // Insert a user (FK prerequisite) + a revoked refresh
+    // token.
     await db.execute(
       `INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt)
-       VALUES (?, ?, ?, 1, 0, ?)`,
-      ["u1", "argon2id-stub", "[]", now],
+       VALUES (?, 'argon2id-stub', '[]', 1, 0, ?)`,
+      ["agent-for-rt-revoked", now],
     );
+    const userRows = await db.select<{ id: number }>(
+      "SELECT id FROM users WHERE username = ?",
+      ["agent-for-rt-revoked"],
+    );
+    const agentId = userRows[0]?.id ?? 0;
     await db.execute(
       `INSERT INTO refresh_tokens (agentId, clientId, scopes, tokenHash, issuedAt, revokedAt)
-       VALUES (?, ?, ?, ?, ?, ?)`,
-      [1, r.client.id, "[]", "hash-1", now - 100, now - 50],
+       VALUES (?, ?, '[]', ?, ?, ?)`,
+      [agentId, r.client.id, "h-revoked", now - 100, now - 50],
     );
     const result = await deleteClient(db, r.client.id);
     expect(result.ok).toBe(true);
   });
 
-  it("returns ok=false for an unknown id", async () => {
-    const r = await deleteClient(db, 9999);
-    expect(r.ok).toBe(false);
-    if (r.ok) return;
-    expect(r.reason).toBe("not_found");
+  it("returns ok=false with reason=not_found for an unknown id", async () => {
+    const result = await deleteClient(db, 9999);
+    expect(result.ok).toBe(false);
+    if (result.ok) return;
+    expect(result.reason).toBe("not_found");
   });
 });
 
 describe("admin/clients — ClientRecord type carries the spec fields", () => {
-  it("the row exposes id, clientId, label, scopes, createdAt, lastUsedAt", async () => {
-    const r = await createClient(db, {
-      clientId: "c1",
-      label: "x",
-      scopes: ["read:bi_catastro"],
-      now,
-    });
+  it("the row exposes id, clientId, label, scopes (INERT), createdAt, lastUsedAt", async () => {
+    // The shape is part of the public contract; the test pins
+    // the field set so a future refactor cannot silently drop a
+    // column. The `scopes` field is INERT legacy storage
+    // (PR 4 of `remove-scope-authorization`).
+    const r = await createClient(db, { clientId: "c1", label: "My App", now });
     if (!r.ok) return;
-    const row: ClientRecord | null = await getClientById(db, r.client.id);
+    const row: ClientRecord | null = await getClientByClientId(db, "c1");
     expect(row).not.toBeNull();
     expect(typeof row?.id).toBe("number");
     expect(typeof row?.clientId).toBe("string");
     expect(typeof row?.label).toBe("string");
     expect(Array.isArray(row?.scopes)).toBe(true);
+    expect(row?.scopes).toEqual([]);
     expect(typeof row?.createdAt).toBe("number");
     expect(row?.lastUsedAt).toBeNull();
   });
 });
 
-describe("admin/clients — type guard for CreateClientResult", () => {
-  it("the success shape carries agent + plaintextSecret", async () => {
-    const r: CreateClientResult = await createClient(db, { clientId: "c1", scopes: [], now });
-    if (r.ok) {
-      expect(r.client.clientId).toBe("c1");
-      expect(typeof r.plaintextSecret).toBe("string");
-    }
-  });
-
-  it("the failure shape carries a reason code", async () => {
-    const r: CreateClientResult = await createClient(db, { clientId: "", scopes: [], now });
-    if (!r.ok) {
-      expect(typeof r.reason).toBe("string");
-    }
-  });
-
-  it("the DeleteClientResult type union is exhaustive", async () => {
-    const r: DeleteClientResult = await deleteClient(db, 9999);
-    if (!r.ok) {
-      expect(r.reason === "not_found" || r.reason === "in_use").toBe(true);
-    }
-  });
-});
+// Mark the imported type aliases as used so vitest doesn't
+// fail on a noUnusedLocals check (some configs enable it).
+void (null as unknown as CreateClientResult);
+void (null as unknown as DeleteClientResult);

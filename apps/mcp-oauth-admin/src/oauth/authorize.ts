@@ -14,14 +14,20 @@
  * - `state` is echoed on success and on redirect-based errors
  *   when the redirect URI is validated.
  * - Consent is explicit (v1): the handler NEVER issues a code
- *   without an explicit consent POST. There is no auto-skip
- *   for previously-granted scope sets (the spec's "MAY" is
- *   deferred; the per-`(client, user)` grants table is out
- *   of scope for PR 2).
+ *   without an explicit consent POST.
  * - The issued code is single-use, expires in 60s, is bound
  *   to `clientId` + `agentId` + the exact `redirect_uri` +
  *   the `code_challenge`, and is consumed by `/oauth/token`
- *   when exchanged.
+ *   when exchanged. The `code` is NOT bound to a scope set
+ *   (PR 3 of `remove-scope-authorization` — scope authorization
+ *   is removed; the `scopes` field on the `CodeRecord` is
+ *   preserved for backward compatibility with pre-PR3 codes
+ *   that may still carry a legacy value, but it is INERT and
+ *   the token endpoint ignores it).
+ * - Incoming `scope` request parameters are tolerated and
+ *   ignored (no `invalid_scope` rejection). The consent form
+ *   does not display a scope list (PR 3 of
+ *   `remove-scope-authorization`).
  *
  * Implementation notes:
  * - The in-memory code store is a module-level `Map` keyed
@@ -61,7 +67,6 @@ import {
 import { verifyAgentPassword } from "../admin/agents.js";
 import { auditAppend } from "../admin/audit.js";
 import { clearFailures, isLocked, recordFailure } from "../admin/backoff.js";
-import { loadScopePrincipal, resolveGrantedScopes } from "./scopes.js";
 import { getClientByClientId } from "../admin/clients.js";
 import { BodyTooLargeError, readFormBody } from "./bodyReader.js";
 import { readClientIp } from "./clientIp.js";
@@ -71,6 +76,16 @@ import { readClientIp } from "./clientIp.js";
  * `code_challenge` is the S256 challenge supplied at the
  * authorize step; the token endpoint verifies the matching
  * `code_verifier` against it.
+ *
+ * The PR 3 contract: the `code` is bound to `clientId` +
+ * `agentId` + `redirectUri` + `code_challenge` ONLY.
+ * There is no scope binding.
+ *
+ * The `scopes` field is RETAINED on the type for backward
+ * compatibility with pre-PR3 code records that may still
+ * carry a legacy value, but the field is INERT — the token
+ * endpoint (and the consent handler) ignore it. The
+ * handler ALWAYS writes an empty array on issue.
  */
 export type CodeRecord = {
   clientId: string;
@@ -78,6 +93,9 @@ export type CodeRecord = {
   redirectUri: string;
   codeChallenge: string;
   codeChallengeMethod: "S256";
+  /** @deprecated Retained for backward compatibility with
+   *  pre-PR3 code records; always `[]` on new issues. The
+   *  token endpoint ignores the value. */
   scopes: string[];
   expiresAt: number;
 };
@@ -447,36 +465,23 @@ async function handleConsent(
   const now = getNow(deps);
   const ttl = getTtl(deps);
   const code = generateCode();
-  // Scope resolution: the spec REQUIRES the consented scope
-  // set to be the intersection of the user's scopes and the
-  // client's scopes (not the URL-requested scope verbatim).
-  // The URL-requested scope is the user's REQUEST, not the
-  // grant; the grant is bounded by the union of both
-  // principals. We read the user row, the client row, and
-  // (for `authorization_code` defense in depth) the catalog,
-  // then delegate to the centralized resolver.
-  const scopePrincipal = await loadScopePrincipal(
-    deps.db,
-    deps.defaultScope,
-    params.clientId,
-    session.userId,
-  );
-  const scopeResult = resolveGrantedScopes(
-    "authorization_code",
-    params.scope,
-    scopePrincipal,
-  );
-  if (!scopeResult.ok) {
-    return writeHtml(res, 400, renderErrorPage("Invalid request."));
-  }
-  const scopes = scopeResult.scopes;
+  // PR 3: scope authorization is removed. The `code` is
+  // bound to `clientId` + `agentId` + `redirectUri` +
+  // `codeChallenge` only. The pre-PR3
+  // `loadScopePrincipal` + `resolveGrantedScopes` calls
+  // are gone — incoming `scope` is tolerated and ignored,
+  // and the consent flow does not list scopes (the form
+  // no longer renders a `scopes` field). The `scopes`
+  // field on the code record is set to `[]` (an empty
+  // array) so the type contract is satisfied.
+  void params.scope;
   codeStore.set(code, {
     clientId: params.clientId,
     agentId: session.userId,
     redirectUri: params.redirectUri,
     codeChallenge: params.codeChallenge,
     codeChallengeMethod: "S256",
-    scopes,
+    scopes: [],
     expiresAt: now + ttl,
   });
   await auditAppend(deps.db, {
@@ -687,7 +692,15 @@ function renderLoginForm(p: NormalizedParams, error: string | null = null): stri
 }
 
 function renderConsentForm(p: NormalizedParams, session: SessionData): string {
-  const scopeList = p.scope.length === 0 ? "(default scope)" : escapeHtml(p.scope);
+  // PR 3 of `remove-scope-authorization`: the consent
+  // form no longer lists OAuth scopes. The authority
+  // mints scope-free tokens by design; the user's
+  // consent records the grant of an access token to
+  // the requesting client (NOT a scope set). The
+  // `scope` field on the form's hidden inputs is
+  // preserved (the value is tolerated and ignored on
+  // the consent POST) for backward compatibility with
+  // legacy clients that always include it.
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -696,7 +709,7 @@ function renderConsentForm(p: NormalizedParams, session: SessionData): string {
 </head>
 <body>
   <h1>Authorize ${escapeHtml(p.clientId)}</h1>
-  <p>The application <strong>${escapeHtml(p.clientId)}</strong> is requesting access to the following scopes: <code>${scopeList}</code></p>
+  <p>The application <strong>${escapeHtml(p.clientId)}</strong> is requesting access on your behalf.</p>
   <form method="POST" action="/oauth/authorize">
     <input type="hidden" name="_action" value="consent">
     <input type="hidden" name="_csrf" value="${escapeHtml(session.csrfToken)}">

@@ -17,12 +17,21 @@
  * - The bootstrap admin refuses to mint tokens until rotated
  *   (covered by the token endpoint in `test/oauth/token.test.ts`).
  *
+ * PR 4 of `remove-scope-authorization`:
+ * - The `scopes` input was removed from `createAgent`. The
+ *   `users.scopes` column is INERT legacy storage and
+ *   defaults to `[]` for new rows.
+ * - The `setAgentScopes` helper was removed (no admin route
+ *   to call it; the catalog that backed it is gone).
+ * - The `SCOPE_PATTERN` import is dropped from
+ *   `admin/agents.ts`; the cross-slice compat shim in
+ *   `mcp-http-base` is no longer re-exported.
+ *
  * Test layer: unit. Real SQLite (in-memory) for the writes.
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { openDatabase, initializeSchema, type AuthorityDatabase } from "../../src/db/index.js";
-import { SCOPE_PATTERN } from "@customized-mcps/mcp-http-base";
 import {
   createAgent,
   listAgents,
@@ -30,7 +39,6 @@ import {
   getAgentByUsername,
   setAgentEnabled,
   rotateAgentPassword,
-  setAgentScopes,
   recordAgentLogin,
   verifyAgentPassword,
   changeOwnPassword,
@@ -75,7 +83,6 @@ describe("admin/agents — createAgent", () => {
     //      `argon2id` hash (NOT the plaintext).
     const result = await createAgent(db, {
       username: "alice",
-      scopes: ["read:bi_catastro"],
       requireChangeOnFirstLogin: false,
       now,
     });
@@ -98,95 +105,61 @@ describe("admin/agents — createAgent", () => {
   });
 
   it("stores requireChangeOnFirstLogin when requested", async () => {
-    // GIVEN a request to create the agent with the flag set
-    // WHEN we read the row
-    // THEN the flag is persisted.
     const r = await createAgent(db, {
-      username: "bob",
-      scopes: [],
+      username: "bootstrap",
       requireChangeOnFirstLogin: true,
       now,
     });
-    expect(r.ok).toBe(true);
     if (!r.ok) return;
-    const row = await getAgentByUsername(db, "bob");
+    const row = await getAgentById(db, r.agent.id);
     expect(row?.requireChangeOnFirstLogin).toBe(true);
   });
 
-  it("defaults requireChangeOnFirstLogin to false", async () => {
-    const r = await createAgent(db, {
-      username: "carol",
-      scopes: [],
-      now,
-    });
+  it("defaults the scope set to the empty list (PR 4 of remove-scope-authorization)", async () => {
+    // The `scopes` column is INERT legacy storage. New rows
+    // default to `[]` regardless of whether a `scopes` input
+    // was provided (the input is removed from
+    // `CreateAgentInput`).
+    const r = await createAgent(db, { username: "dave", now });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
-    const row = await getAgentByUsername(db, "carol");
-    expect(row?.requireChangeOnFirstLogin).toBe(false);
-  });
-
-  it("defaults the scope set to the empty list when omitted", async () => {
-    const r = await createAgent(db, { username: "dave", scopes: [], now });
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    const row = await getAgentByUsername(db, "dave");
+    const row = await getAgentById(db, r.agent.id);
     expect(row?.scopes).toEqual([]);
   });
 
   it("rejects a duplicate username (UNIQUE constraint)", async () => {
-    // GIVEN an existing agent
-    // WHEN we try to create another with the same username
-    // THEN the call returns ok=false with a sanitized reason.
-    const r1 = await createAgent(db, { username: "eve", scopes: [], now });
+    const r1 = await createAgent(db, { username: "eve", now });
     expect(r1.ok).toBe(true);
-    const r2 = await createAgent(db, { username: "eve", scopes: [], now });
+    const r2 = await createAgent(db, { username: "eve", now });
     expect(r2.ok).toBe(false);
     if (r2.ok) return;
     expect(r2.reason).toBe("duplicate");
-    // The error message MUST NOT include the duplicate plaintext
-    // password of the second call.
-    expect(r2.reason).not.toContain("password");
   });
 
   it("rejects an empty username", async () => {
-    const r = await createAgent(db, { username: "", scopes: [], now });
+    const r = await createAgent(db, { username: "", now });
     expect(r.ok).toBe(false);
     if (r.ok) return;
     expect(r.reason).toBe("invalid_username");
   });
 
-  it("rejects a scope that does not match SCOPE_PATTERN", async () => {
-    // GIVEN a scope that is not `<verb>:<resource>`
-    // WHEN we try to create the agent
-    // THEN the call returns ok=false with reason invalid_scope.
-    const r = await createAgent(db, {
-      username: "frank",
-      scopes: ["*"],
-      now,
-    });
+  it("rejects a username with invalid characters", async () => {
+    const r = await createAgent(db, { username: "has spaces", now });
     expect(r.ok).toBe(false);
     if (r.ok) return;
-    expect(r.reason).toBe("invalid_scope");
+    expect(r.reason).toBe("invalid_username");
   });
 
-  it("accepts a scope that matches SCOPE_PATTERN", async () => {
-    // GIVEN a valid `<verb>:<resource>` scope
-    // WHEN we create the agent
-    // THEN the call succeeds and the row stores the scope.
-    const r = await createAgent(db, {
-      username: "grace",
-      scopes: ["read:bi_catastro", "list:bi_catastro"],
-      now,
-    });
-    expect(r.ok).toBe(true);
-    if (!r.ok) return;
-    const row = await getAgentByUsername(db, "grace");
-    expect(row?.scopes).toEqual(["read:bi_catastro", "list:bi_catastro"]);
+  it("rejects a too-long username (> 64 chars)", async () => {
+    const r = await createAgent(db, { username: "x".repeat(65), now });
+    expect(r.ok).toBe(false);
+    if (r.ok) return;
+    expect(r.reason).toBe("invalid_username");
   });
 
   it("the generated plaintext is cryptographically random (different on each call)", async () => {
-    const r1 = await createAgent(db, { username: "h1", scopes: [], now });
-    const r2 = await createAgent(db, { username: "h2", scopes: [], now });
+    const r1 = await createAgent(db, { username: "h1", now });
+    const r2 = await createAgent(db, { username: "h2", now });
     expect(r1.ok).toBe(true);
     expect(r2.ok).toBe(true);
     if (!r1.ok || !r2.ok) return;
@@ -199,9 +172,9 @@ describe("admin/agents — listAgents", () => {
     // GIVEN three agents created at different times
     // WHEN we list
     // THEN the order is newest-first.
-    await createAgent(db, { username: "a", scopes: [], now: now + 0 });
-    await createAgent(db, { username: "b", scopes: [], now: now + 1 });
-    await createAgent(db, { username: "c", scopes: [], now: now + 2 });
+    await createAgent(db, { username: "a", now: now + 0 });
+    await createAgent(db, { username: "b", now: now + 1 });
+    await createAgent(db, { username: "c", now: now + 2 });
     const rows = await listAgents(db);
     expect(rows.map((r) => r.username)).toEqual(["c", "b", "a"]);
   });
@@ -217,7 +190,7 @@ describe("admin/agents — setAgentEnabled", () => {
     // GIVEN a fresh agent
     // WHEN we disable it
     // THEN the row's enabled column is 0.
-    const r = await createAgent(db, { username: "a", scopes: [], now });
+    const r = await createAgent(db, { username: "a", now });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const row = await getAgentById(db, r.agent.id);
@@ -228,7 +201,7 @@ describe("admin/agents — setAgentEnabled", () => {
   });
 
   it("flips the enabled flag back to true", async () => {
-    const r = await createAgent(db, { username: "a", scopes: [], now });
+    const r = await createAgent(db, { username: "a", now });
     if (!r.ok) return;
     await setAgentEnabled(db, r.agent.id, false);
     await setAgentEnabled(db, r.agent.id, true);
@@ -248,7 +221,7 @@ describe("admin/agents — rotateAgentPassword", () => {
     // WHEN we rotate the password
     // THEN the response is a fresh plaintext AND the DB hash
     //      matches the new plaintext (NOT the old one).
-    const r = await createAgent(db, { username: "a", scopes: [], now });
+    const r = await createAgent(db, { username: "a", now });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const first = r.plaintextPassword;
@@ -271,7 +244,6 @@ describe("admin/agents — rotateAgentPassword", () => {
     //      tokens).
     const r = await createAgent(db, {
       username: "root",
-      scopes: [],
       requireChangeOnFirstLogin: true,
       now,
     });
@@ -289,41 +261,16 @@ describe("admin/agents — rotateAgentPassword", () => {
   });
 });
 
-describe("admin/agents — setAgentScopes", () => {
-  it("replaces the scope set with the new value", async () => {
-    const r = await createAgent(db, {
-      username: "a",
-      scopes: ["read:bi_catastro"],
-      now,
-    });
-    if (!r.ok) return;
-    const ok = await setAgentScopes(db, r.agent.id, ["read:bi_catastro", "list:bi_catastro"], now);
-    expect(ok).toBe(true);
-    const after = await getAgentById(db, r.agent.id);
-    expect(after?.scopes).toEqual(["read:bi_catastro", "list:bi_catastro"]);
-  });
-
-  it("rejects a scope that does not match SCOPE_PATTERN", async () => {
-    const r = await createAgent(db, { username: "a", scopes: [], now });
-    if (!r.ok) return;
-    const ok = await setAgentScopes(db, r.agent.id, ["bogus"], now);
-    expect(ok).toBe(false);
-  });
-
-  it("rejects a scope that is the bare `*`", async () => {
-    // The authority MUST NOT issue `*` to a new agent. The
-    // scope catalog gate is the SCOPE_PATTERN check; the
-    // wildcard is intentionally rejected.
-    const r = await createAgent(db, { username: "a", scopes: [], now });
-    if (!r.ok) return;
-    const ok = await setAgentScopes(db, r.agent.id, ["*"], now);
-    expect(ok).toBe(false);
+describe("admin/agents — setAgentScopes is REMOVED (PR 4 of remove-scope-authorization)", () => {
+  it("the public surface does NOT export setAgentScopes", async () => {
+    const mod = (await import("../../src/admin/agents.js")) as Record<string, unknown>;
+    expect(mod.setAgentScopes).toBeUndefined();
   });
 });
 
 describe("admin/agents — recordAgentLogin", () => {
   it("updates the lastLoginAt timestamp", async () => {
-    const r = await createAgent(db, { username: "a", scopes: [], now: now });
+    const r = await createAgent(db, { username: "a", now });
     if (!r.ok) return;
     await recordAgentLogin(db, r.agent.id, now + 100);
     const after = await getAgentById(db, r.agent.id);
@@ -333,7 +280,7 @@ describe("admin/agents — recordAgentLogin", () => {
 
 describe("admin/agents — verifyAgentPassword", () => {
   it("returns ok=true with the agent on a correct password", async () => {
-    const r = await createAgent(db, { username: "a", scopes: [], now });
+    const r = await createAgent(db, { username: "a", now });
     expect(r.ok).toBe(true);
     if (!r.ok) return;
     const result = await verifyAgentPassword(db, "a", r.plaintextPassword);
@@ -343,7 +290,7 @@ describe("admin/agents — verifyAgentPassword", () => {
   });
 
   it("returns ok=false on a wrong password", async () => {
-    const r = await createAgent(db, { username: "a", scopes: [], now });
+    const r = await createAgent(db, { username: "a", now });
     if (!r.ok) return;
     const result = await verifyAgentPassword(db, "a", "wrong");
     expect(result.ok).toBe(false);
@@ -364,7 +311,7 @@ describe("admin/agents — verifyAgentPassword", () => {
     // `missing` from the perspective of the login form (the
     // operator should not see "wrong password" for a disabled
     // user — that would be a side channel).
-    const r = await createAgent(db, { username: "a", scopes: [], now });
+    const r = await createAgent(db, { username: "a", now });
     if (!r.ok) return;
     await setAgentEnabled(db, r.agent.id, false);
     const result = await verifyAgentPassword(db, "a", r.plaintextPassword);
@@ -383,7 +330,6 @@ describe("admin/agents — changeOwnPassword", () => {
     //      requireChangeOnFirstLogin flag is cleared.
     const r = await createAgent(db, {
       username: "root",
-      scopes: [],
       requireChangeOnFirstLogin: true,
       now,
     });
@@ -404,7 +350,7 @@ describe("admin/agents — changeOwnPassword", () => {
     // GIVEN a normal admin (requireChangeOnFirstLogin=false)
     // WHEN the admin submits the wrong current password
     // THEN the function returns ok=false with reason 'invalid_current'.
-    const r = await createAgent(db, { username: "root", scopes: [], now });
+    const r = await createAgent(db, { username: "root", now });
     if (!r.ok) return;
     const result = await changeOwnPassword(db, r.agent.id, {
       currentPassword: "wrong",
@@ -420,7 +366,7 @@ describe("admin/agents — changeOwnPassword", () => {
     // GIVEN a normal admin
     // WHEN the admin submits the correct current password
     // THEN the function returns ok=true with a new plaintext.
-    const r = await createAgent(db, { username: "root", scopes: [], now });
+    const r = await createAgent(db, { username: "root", now });
     if (!r.ok) return;
     const result = await changeOwnPassword(db, r.agent.id, {
       currentPassword: r.plaintextPassword,
@@ -441,7 +387,7 @@ describe("admin/agents — changeOwnPassword", () => {
   });
 
   it("rejects an empty new password", async () => {
-    const r = await createAgent(db, { username: "root", scopes: [], now });
+    const r = await createAgent(db, { username: "root", now });
     if (!r.ok) return;
     const result = await changeOwnPassword(db, r.agent.id, {
       currentPassword: null,
@@ -459,7 +405,7 @@ describe("admin/agents — changeOwnPassword", () => {
     // password the operator types that meets a minimum
     // length (8 chars) — the spec does not pin a specific
     // floor, so we pick a defensive default.
-    const r = await createAgent(db, { username: "root", scopes: [], now });
+    const r = await createAgent(db, { username: "root", now });
     if (!r.ok) return;
     const result = await changeOwnPassword(db, r.agent.id, {
       currentPassword: null,
@@ -484,13 +430,13 @@ describe("admin/agents — changeOwnPassword", () => {
 });
 
 describe("admin/agents — AgentRecord type carries the spec fields", () => {
-  it("the row exposes id, username, scopes, enabled, requireChangeOnFirstLogin, createdAt, lastLoginAt", async () => {
+  it("the row exposes id, username, scopes (INERT), enabled, requireChangeOnFirstLogin, createdAt, lastLoginAt", async () => {
     // The shape is part of the public contract; the test pins
     // the field set so a future refactor cannot silently drop a
-    // column.
+    // column. The `scopes` field is INERT legacy storage
+    // (PR 4 of `remove-scope-authorization`).
     const r = await createAgent(db, {
       username: "a",
-      scopes: ["read:bi_catastro"],
       requireChangeOnFirstLogin: true,
       now,
     });
@@ -500,6 +446,7 @@ describe("admin/agents — AgentRecord type carries the spec fields", () => {
     expect(typeof row?.id).toBe("number");
     expect(typeof row?.username).toBe("string");
     expect(Array.isArray(row?.scopes)).toBe(true);
+    expect(row?.scopes).toEqual([]);
     expect(typeof row?.enabled).toBe("boolean");
     expect(typeof row?.requireChangeOnFirstLogin).toBe("boolean");
     expect(typeof row?.createdAt).toBe("number");

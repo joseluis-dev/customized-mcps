@@ -24,9 +24,10 @@
  *   NOT included in the log line — audit-safe redaction).
  * - Unreachable authority → `AuthorityUnavailableError` (mapped to
  *   503 by the middleware).
- * - The `scopes` claim is normalized to `string[]` and filtered
- *   against `SCOPE_PATTERN`. Invalid entries are dropped and logged
- *   at `WARN` with the rejected value omitted.
+ * - The `scopes` claim (string or array) is IGNORED end-to-end. It
+ *   is not extracted, not normalized, not filtered, and not logged.
+ *   The returned `scopes` is always `[]` (per PR 1 of the
+ *   `remove-scope-authorization` change).
  *
  * Audit-safe redaction (per the spec):
  * - Errors MUST NOT include the supplied token, the `kid`, the
@@ -67,7 +68,6 @@ import {
   type JWTVerifyOptions,
 } from "jose";
 import { createHash } from "node:crypto";
-import { SCOPE_PATTERN } from "../auth.js";
 import {
   AuthorityUnavailableError,
   TokenInvalidError,
@@ -335,21 +335,16 @@ export class JwksAuthority implements TokenAuthority {
       }
     }
     // Map the verified JWT to the `VerifiedToken` shape:
-    // `agentId` is the `sub` claim; `scopes` is the `scopes` claim
-    // (string or array) filtered against `SCOPE_PATTERN`.
+    // `agentId` is the `sub` claim; `scopes` is the always-empty
+    // `[]` array (per PR 1 of `remove-scope-authorization`). The
+    // previous `SCOPE_PATTERN` filter on the inbound `scopes` claim
+    // is removed: the resource server no longer reads the claim in
+    // any form.
     const agentId = typeof payload.sub === "string" ? payload.sub : "";
     if (agentId.length === 0) {
       throw new TokenInvalidError("bearer token rejected: missing sub claim");
     }
-    const rawScopes = extractScopesClaim(payload);
-    const { kept, droppedCount } = filterScopes(rawScopes);
-    if (droppedCount > 0) {
-      this.logger.warn(
-        `JwksAuthority: scopes claim contained ${droppedCount} entry/entries that do not match SCOPE_PATTERN; the entries are dropped from the resolved scopes set. Update the authority to issue "<verb>:<resource>" where verb is one of {read, list, call}.`,
-        {},
-      );
-    }
-    return { agentId, scopes: kept };
+    return { agentId, scopes: [] };
   }
 
   /**
@@ -491,39 +486,4 @@ function isKidMiss(err: unknown): boolean {
     message.includes("no matching key") ||
     message.includes("jwks no matching key")
   );
-}
-
-/**
- * Extract the `scopes` claim as a `string[]`. The spec allows
- * either a single space-delimited string (the OAuth2 convention)
- * or a JSON array; we handle both.
- */
-function extractScopesClaim(payload: JWTPayload): string[] {
-  const claim = (payload as { scopes?: unknown }).scopes;
-  if (typeof claim === "string") {
-    return claim.split(/\s+/).filter((s) => s.length > 0);
-  }
-  if (Array.isArray(claim)) {
-    return claim.filter((s): s is string => typeof s === "string");
-  }
-  return [];
-}
-
-/**
- * Filter the raw `scopes` claim against `SCOPE_PATTERN`. Returns
- * the kept entries and the count of dropped entries (so the
- * caller can emit a WARN with the count, never the rejected
- * values).
- */
-function filterScopes(scopes: string[]): { kept: string[]; droppedCount: number } {
-  const kept: string[] = [];
-  let droppedCount = 0;
-  for (const scope of scopes) {
-    if (typeof scope === "string" && SCOPE_PATTERN.test(scope)) {
-      kept.push(scope);
-    } else {
-      droppedCount++;
-    }
-  }
-  return { kept, droppedCount };
 }

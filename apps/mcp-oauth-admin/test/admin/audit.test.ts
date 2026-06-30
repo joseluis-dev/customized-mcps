@@ -228,13 +228,16 @@ describe("admin/audit — listAuditRows pagination", () => {
 describe("admin/audit — listAuditRows filter", () => {
   beforeEach(async () => {
     // 6 rows: 3 with actor=root, 2 with actor=alice, 1 with actor=bob.
-    // 3 with action=agent.create, 2 with action=client.create, 1 with action=scope.delete.
+    // 3 with action=agent.create, 2 with action=client.create,
+    // 1 with action=client.delete (PR 4: the scope.delete
+    // action is no longer emitted; client.delete is the
+    // analogous "delete" audit row).
     await auditAppend(db, { ts: now + 0, actor: "root", action: "agent.create", outcome: "ok" });
     await auditAppend(db, { ts: now + 1, actor: "root", action: "agent.create", outcome: "ok" });
     await auditAppend(db, { ts: now + 2, actor: "root", action: "client.create", outcome: "ok" });
     await auditAppend(db, { ts: now + 3, actor: "alice", action: "agent.create", outcome: "denied" });
     await auditAppend(db, { ts: now + 4, actor: "alice", action: "client.rotate", outcome: "ok" });
-    await auditAppend(db, { ts: now + 5, actor: "bob", action: "scope.delete", outcome: "denied" });
+    await auditAppend(db, { ts: now + 5, actor: "bob", action: "client.delete", outcome: "denied" });
   });
 
   it("filters by actor", async () => {

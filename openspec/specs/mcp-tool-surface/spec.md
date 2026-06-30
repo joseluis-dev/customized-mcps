@@ -138,81 +138,51 @@ The tool surface (the five read-only tools, their argument shape, output shape, 
 
 ### Requirement: Per-Tool Scope Tag
 
-Every public tool exposed by an MCP app MUST declare a `requiredScope` tag on its definition. The tag MUST be a single string of the form `<verb>:<resource>`, where `<verb>` is one of `read`, `list`, `call`, and `<resource>` is either `*` or an identifier matching `[A-Za-z0-9_.-]+`. The tag MUST match `SCOPE_PATTERN` `^(read|list|call):(\*|[A-Za-z0-9_.-]+)$` exactly. A tool whose tag does not match MUST fail to register at startup, and the process MUST exit non-zero with a stderr message naming the offending tool and the offending tag.
+A `requiredScope` field on a tool definition is OPTIONAL decorative metadata. It MAY be present for documentation and operator clarity. When present, it MUST be a string of the form `<verb>:<resource>`, where `<verb>` is one of `read`, `list`, `call`, and `<resource>` is either `*` or an identifier matching `[A-Za-z0-9_.-]+`. The runtime MUST NOT use `requiredScope` (present, absent, malformed, or with a verb outside the documented set) to make an access decision. The runtime MUST NOT validate `requiredScope` against any pattern, MUST NOT normalize it, and MUST NOT emit a `WARN` because of it. The runtime MUST NOT refuse to register a tool because `requiredScope` is missing, malformed, or uses a verb outside the documented set. The runtime MUST NOT exit non-zero at startup because of any `requiredScope` value. Tools are NOT required to declare `requiredScope`; existing tools that declare one MAY keep it as inert metadata, and new tools MAY omit it entirely. Implementers MUST NOT add `requiredScope` tags to tool definitions solely to satisfy this requirement.
+(Previously: tools MUST declare `requiredScope`; missing or malformed tags failed startup. Now: optional decorative metadata, never validated, never read for authorization.)
 
-#### Scenario: Valid scope tag registers
+#### Scenario: Optional scope tag registers and is decorative
 
-- GIVEN a tool declared with `requiredScope: "read:bi_catastro"`
-- WHEN the app starts
+- GIVEN a tool declared with `requiredScope: "read:bi_catastro"` (an existing tool, no change required)
+- WHEN the app starts and a request is processed
 - THEN the tool is registered
-- AND its tag matches `SCOPE_PATTERN`.
+- AND the tag is preserved on the tool definition as-is
+- AND the tag is not compared to any agent scope to make an access decision.
 
-#### Scenario: Tool with no scope tag fails closed
+#### Scenario: Tool with no scope tag registers normally
 
-- GIVEN a tool declared without a `requiredScope` tag
+- GIVEN a tool declared without a `requiredScope` tag (a new or existing tool)
 - WHEN the app starts
-- THEN the process exits non-zero
-- AND stderr names the offending tool.
+- THEN the process starts successfully
+- AND the tool is registered
+- AND no stderr message names the tool as missing a tag.
 
-#### Scenario: Malformed scope tag fails closed
+#### Scenario: Malformed scope tag does not fail closed
 
-- GIVEN a tool declared with `requiredScope: "delete:bi_catastro"`
+- GIVEN a tool declared with `requiredScope: "delete:bi_catastro"` (a verb outside the documented set)
 - WHEN the app starts
-- THEN the process exits non-zero
-- AND stderr names the offending tool and the offending tag.
+- THEN the process starts successfully
+- AND the tool is registered with the tag preserved as-is
+- AND no `WARN` is logged for the malformed tag.
 
-#### Scenario: Verb is restricted to read/list/call
+#### Scenario: Verb is not restricted to read/list/call
 
-- GIVEN a tool declared with `requiredScope: "write:bi_catastro"`
+- GIVEN a tool declared with `requiredScope: "write:bi_catastro"` (a verb outside the documented set)
 - WHEN the app starts
-- THEN the process exits non-zero
-- AND stderr notes that verbs are restricted to `read`/`list`/`call`.
+- THEN the process starts successfully
+- AND the tool is registered with the tag preserved as-is
+- AND no stderr message names the verb as out of range.
 
-### Requirement: Scope Check At Tool Invocation
 
-For each tool invocation, the runtime MUST compare the authenticated agent's `scopes` against the tool's `requiredScope` and MUST reject the call with `403` when no scope matches. The check MUST happen after authentication (per `mcp-agent-authorization`) and before any side effect (DB connect, query parse). A wildcard scope `read:*` MUST match any `read:<resource>` tag; a literal scope MUST match only the same literal. Server-side profile allowlists and the read-only safety contract (`sqlGuard`) MUST still win over scopes per the existing `mcp-agent-authorization` rule.
-
-#### Scenario: Matching scope runs the tool
-
-- GIVEN an agent with scopes `["read:bi_catastro"]` and a tool tagged `read:bi_catastro`
-- WHEN the agent invokes the tool
-- THEN the tool runs.
-
-#### Scenario: Insufficient scope returns 403
-
-- GIVEN an agent with scopes `["read:reporting"]` and a tool tagged `read:bi_catastro`
-- WHEN the agent invokes the tool
-- THEN the response status is `403`
-- AND the body is a sanitized error that does not enumerate valid scopes or profiles.
-
-#### Scenario: Wildcard scope matches any resource
-
-- GIVEN an agent with scopes `["read:*"]`
-- WHEN the agent invokes a tool tagged `read:bi_catastro`
-- THEN the scope check passes
-- AND the server-side allowlist still applies.
-
-#### Scenario: Server-side allowlist still wins
-
-- GIVEN an agent with scope `["read:bi_catastro"]` and a profile whose allowlist excludes the requested database
-- WHEN the agent invokes `execute_read_query` against a non-allowlisted database
-- THEN the call is rejected with the standard allowlist error
-- AND scope is not a factor in the decision.
 
 ### Requirement: Sanitized 403 Body
 
-The 403 body returned for an insufficient-scope failure MUST be a minimal JSON-RPC error. It MUST NOT enumerate the agent's actual scopes, the tool's `requiredScope`, other tools' tags, or any profile. The body MUST be emitted through the existing `sanitizeError` path from `mcp-agent-authorization`.
+The `403` status code MUST NOT be produced by scope enforcement because scope authorization is removed. Tool handlers MAY still return a `403` from non-scope paths (e.g. profile allowlist mismatches); those responses continue to use the existing allowlist error contract. The previous contract for the sanitized scope-mismatch `403` body is removed.
+(Previously: a sanitized 403 body was defined for scope-mismatch failures. Now: not produced by scope enforcement.)
 
-#### Scenario: 403 body is minimal
+#### Scenario: No 403 from scope enforcement
 
-- GIVEN a scope mismatch
-- WHEN the response is generated
-- THEN the body explains the failure category only
-- AND does not list the agent's actual scopes or any other agent's scopes.
-
-#### Scenario: 403 body does not echo the tag
-
-- GIVEN a tool tagged `read:bi_catastro` and a scope mismatch
-- WHEN the response is generated
-- THEN the body does NOT contain the literal `read:bi_catastro`
-- AND does not name other tools or profiles.
+- GIVEN an authenticated request
+- WHEN the tool handler runs
+- THEN the response status is not `403` due to a scope mismatch
+- AND any non-auth failure (e.g. allowlist, sqlGuard) returns its existing sanitized error shape.

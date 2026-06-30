@@ -6,19 +6,30 @@
  *   `password`, `refresh_token`, and `authorization_code`
  *   grants.
  * - The response is an RS256 JWT with the spec claims
- *   (`iss`, `aud=mcp:<app>`, `sub`, `scope`, `iat`,
- *   `nbf`, `exp`, `kid` header) and `expires_in=3600`.
- * - Mixing `*` with a specific scope is REJECTED with
- *   `400 invalid_scope`.
- * - New agents/clients default to `read:<bound-profile>`
- *   (the authority's `defaultScope`); the default scope is
- *   NEVER `*`.
+ *   (`iss`, `aud=mcp:<app>`, `sub`, `iat`, `nbf`, `exp`,
+ *   `kid` header) and `expires_in=3600`. The JWT MUST
+ *   NOT include a `scope` or `scopes` claim (PR 3 of
+ *   `remove-scope-authorization` makes scope authorization
+ *   inert; the access token grants access solely by
+ *   being a validly issued RS256 JWT for the configured
+ *   `aud`).
+ * - The response body MUST NOT include a `scope` field.
+ *   The OAuth2-standard shape is `access_token`,
+ *   `token_type`, `expires_in`. No `scope`.
+ * - Incoming `scope` request parameters are TOLERATED
+ *   and IGNORED. The authority does NOT return
+ *   `invalid_scope` based on a `scope` request value.
  * - `refresh_token` grant REJECTS tokens whose `revokedAt`
- *   is non-null with `400 invalid_grant`.
+ *   is non-null with `400 invalid_grant`. Pre-PR3 refresh
+ *   tokens that have a `scopes` column value (legacy
+ *   storage) mint a scope-free access token — the
+ *   stored value is inert.
  * - `authorization_code` grant REQUIRES PKCE S256, the
  *   `redirect_uri` MUST be byte-equal to the value bound
  *   to the `code`, the `code` is single-use, expires in
  *   ≤ 60 seconds, and the `sub` claim is `user:<agentId>`.
+ *   Pre-PR3 codes that carry a `scopes` array (legacy
+ *   consent storage) mint a scope-free access token.
  *
  * Audit-safety: errors MUST NOT include the supplied
  * password, the resolved `agentId`, the `clientId`, the
@@ -37,7 +48,6 @@ import { importSigningPrivateKey, type SigningKeyRecord } from "./keys.js";
 import { verifyPassword } from "./passwords.js";
 import { type AuthorityDatabase } from "../db/connection.js";
 import { consumeCode, isLoopbackRedirectUri } from "./authorize.js";
-import { loadScopePrincipal, joinScopeList, resolveGrantedScopes } from "./scopes.js";
 import { BodyTooLargeError, readFormBody } from "./bodyReader.js";
 import { readClientIp } from "./clientIp.js";
 import { auditAppend } from "../admin/audit.js";
@@ -53,11 +63,25 @@ import { createLogger, type Logger } from "@customized-mcps/mcp-http-base";
  * custom clock so the TTL boundary (`expiresAt <= now`)
  * is deterministic. The value is the Unix-seconds
  * timestamp the handler passes to `consumeCode`.
+ *
+ * `defaultScope` is RETAINED as a required field for
+ * backward compatibility with the v1 wiring in
+ * `index.ts`. The field is no longer read (the PR 3
+ * token endpoint does not resolve or emit scopes), but
+ * the entrypoint still passes the value (the env
+ * `MCP_OAUTH_DEFAULT_SCOPE` is the operator's stated
+ * default for the authority; the field stays in the
+ * wiring for forward-compat). Future changes can drop
+ * the field; for this slice the field is a no-op.
  */
 export type TokenHandlerDeps = {
   db: AuthorityDatabase;
   issuer: string;
   audience: string;
+  /** @deprecated Retained for backward compatibility with
+   *  the v1 wiring in `index.ts`; the field is no longer
+   *  read (PR 3 of `remove-scope-authorization` ignores
+   *  scope). */
   defaultScope: string;
   accessTokenTtlSeconds: number;
   activeKey: SigningKeyRecord;
@@ -174,10 +198,11 @@ function readAuthHeader(req: IncomingMessage): string | null {
 
 /**
  * The `client_credentials` grant. Verifies the client_id +
- * client_secret against the `clients` table, computes the
- * granted scope (the requested scope intersected with the
- * client's allowed scopes, defaulting to `defaultScope`),
- * and mints a JWT.
+ * client_secret against the `clients` table and mints a
+ * JWT. The PR 3 contract: incoming `scope` is ignored;
+ * the minted JWT is scope-free (no `scope` / `scopes`
+ * claim); the response body does not include a `scope`
+ * field.
  *
  * The client credentials may arrive in either the form body
  * (per RFC 6749 §2.3.1) or the `Authorization: Basic`
@@ -208,6 +233,13 @@ async function handleClientCredentials(
     return writeJson(res, 400, { error: "invalid_request" });
   }
   const { clientId, clientSecret } = creds;
+  // The `scopes` column is selected for the client row
+  // because the row's other columns are read; the value
+  // itself is INERT post-PR3 (scope authorization is
+  // removed). The pre-PR3 `loadScopePrincipal` call is
+  // gone — the new policy ignores both the client's
+  // stored scopes and any incoming `scope` request
+  // value.
   const rows = await deps.db.select<{
     id: number;
     clientSecretHash: string;
@@ -246,23 +278,12 @@ async function handleClientCredentials(
     );
     return writeJson(res, 401, { error: "invalid_client" });
   }
-  const requested = params.get("scope") ?? "";
-  const principal = await loadScopePrincipal(deps.db, deps.defaultScope, clientId, null);
-  const granted = resolveGrantedScopes("client_credentials", requested, principal);
-  if (!granted.ok) {
-    await recordTokenDenied(
-      deps.db,
-      logger,
-      `client:${clientId}`,
-      null,
-      ip,
-      getNow(deps),
-      "token.client_credentials",
-    );
-    return writeJson(res, 400, { error: granted.error });
-  }
+  // Incoming `scope` is tolerated and ignored (the
+  // value is read so the parser shape is uniform, but
+  // it has NO effect on the minted token).
+  void params.get("scope");
   const sub = `client:${clientId}`;
-  const token = await mintAccessToken(deps, sub, granted.scopes);
+  const token = await mintAccessToken(deps, sub);
   await recordTokenOk(
     deps.db,
     logger,
@@ -276,26 +297,15 @@ async function handleClientCredentials(
     access_token: token,
     token_type: "Bearer",
     expires_in: deps.accessTokenTtlSeconds,
-    scope: granted.scopes.join(" "),
   });
 }
 
 /**
  * The `password` grant. Verifies the user (username +
  * password against the `users` table) and the client, then
- * mints a JWT.
- *
- * Scope policy: the granted scope is the intersection of
- * the user scopes and the client scopes (delegated to the
- * centralized `resolveGrantedScopes` helper). When either
- * side is empty, the non-empty side is used; when both are
- * empty, the authority's `defaultScope` is granted. The
- * previous implementation used the user scopes verbatim
- * (the client was verified but never enforced), which
- * created a privilege-escalation path between the user and
- * client rosters. The fix is the spec-mandated intersection
- * for the user-bound grants (`password` and
- * `authorization_code`).
+ * mints a JWT. The PR 3 contract: the pre-PR3 user/client
+ * scope intersection is gone; the minted JWT is scope-free;
+ * incoming `scope` is tolerated and ignored.
  *
  * The `requireChangeOnFirstLogin` flag is honored: when set
  * on the user row, the response is `400` (sanitized error),
@@ -342,6 +352,10 @@ async function handlePasswordGrant(
     return writeJson(res, 400, { error: "invalid_request" });
   }
   const { clientId, clientSecret } = creds;
+  // The `scopes` column on the user row is selected
+  // because the row's other columns are read; the value
+  // itself is INERT post-PR3 (scope authorization is
+  // removed).
   const userRows = await deps.db.select<{
     id: number;
     passwordHash: string;
@@ -422,26 +436,10 @@ async function handlePasswordGrant(
     );
     return writeJson(res, 401, { error: "invalid_client" });
   }
-  // Scope policy: intersect user scopes with client scopes.
-  // The resolver handles the empty-side fallbacks and the
-  // `defaultScope` fallback when both are empty.
-  const requested = params.get("scope") ?? "";
-  const principal = await loadScopePrincipal(deps.db, deps.defaultScope, clientId, user.id);
-  const granted = resolveGrantedScopes("password", requested, principal);
-  if (!granted.ok) {
-    await recordTokenDenied(
-      deps.db,
-      logger,
-      `user:${user.id}`,
-      null,
-      ip,
-      getNow(deps),
-      "token.password",
-    );
-    return writeJson(res, 400, { error: granted.error });
-  }
+  // Incoming `scope` is tolerated and ignored.
+  void params.get("scope");
   const sub = `user:${user.id}`;
-  const token = await mintAccessToken(deps, sub, granted.scopes);
+  const token = await mintAccessToken(deps, sub);
   await recordTokenOk(
     deps.db,
     logger,
@@ -455,7 +453,6 @@ async function handlePasswordGrant(
     access_token: token,
     token_type: "Bearer",
     expires_in: deps.accessTokenTtlSeconds,
-    scope: granted.scopes.join(" "),
   });
 }
 
@@ -465,18 +462,12 @@ async function handlePasswordGrant(
  * revoked tokens with `400 invalid_grant`, and mints a
  * new access token.
  *
- * The minted token's scope is the intersection of:
- *   - the refresh token's bound scopes (the original
- *     grant's set);
- *   - the current user + client intersection.
- *
- * This is the same defense-in-depth rule as the
- * `authorization_code` grant: a future rotation of either
- * side shrinks the refresh-minted token, never broadens
- * it. The pre-2026 implementation used the refresh
- * token's bound scopes verbatim, which is the same
- * privilege-escalation surface the `authorization_code`
- * fix closes.
+ * The PR 3 contract: the minted access token is
+ * scope-free regardless of the refresh token's `scopes`
+ * column value. Pre-PR3 refresh tokens that carry a
+ * `scopes` JSON array (legacy consent storage) mint
+ * scope-free access tokens — the stored value is
+ * INERT. Incoming `scope` is tolerated and ignored.
  *
  * Client credentials may arrive in the body or the
  * `Authorization: Basic` header (same as the other
@@ -522,6 +513,10 @@ async function handleRefreshTokenGrant(
   }
   const { clientId, clientSecret } = creds;
   const tokenHash = createHash("sha256").update(refreshToken, "utf8").digest("hex");
+  // The `scopes` column on the refresh_tokens row is
+  // selected for the same reason as the other tables;
+  // the value is INERT post-PR3 (scope authorization is
+  // removed).
   const rows = await deps.db.select<{
     id: number;
     agentId: number;
@@ -588,57 +583,10 @@ async function handleRefreshTokenGrant(
     );
     return writeJson(res, 401, { error: "invalid_client" });
   }
-  // Defense in depth: re-resolve the refresh token's bound
-  // scopes against the current principal (user + client)
-  // intersection. The pre-2026 implementation used the refresh
-  // token's bound scopes verbatim; the pre-PR2 implementation
-  // intersected them with the recomputed principal set but
-  // PRESERVED `*` even when neither principal currently allows
-  // it (a privilege-escalation side channel). The fix is to
-  // delegate to the centralized `resolveGrantedScopes` helper
-  // with the stored scopes as the requested string. The helper
-  // honors the `*` policy: a `*` request is only granted when
-  // the principal allows `*`; mixing `*` with specific scopes
-  // is rejected; a `*` request against a principal without `*`
-  // returns `invalid_scope`. The granted set is the
-  // recomputed intersection (never broader than the stored set
-  // or the principal's allowed set).
-  //
-  // NOTE: this handler does NOT rotate the refresh token. The
-  // v1 spec accepts non-rotation: a refresh token is single-
-  // bound to its agent + client, and the recomputed scope
-  // intersection (the defense-in-depth check above) is the
-  // spec's chosen mitigation. If a future revision adds
-  // rotation, the rotation MUST (1) mark the old row
-  // `revokedAt=now`, (2) insert a new row with a fresh
-  // `tokenHash`, and (3) return the new plaintext in the
-  // response so the client persists the rotation.
-  const refreshRequested = joinScopeList(row.scopes);
-  const principal = await loadScopePrincipal(deps.db, deps.defaultScope, clientId, row.agentId);
-  const granted = resolveGrantedScopes("password", refreshRequested, principal);
-  if (!granted.ok) {
-    // The refresh token's bound scopes no longer match what
-    // the principal allows. The spec's defense-in-depth rule
-    // shrinks the granted set; when the intersection is
-    // empty, the request is `invalid_grant` (the refresh
-    // token no longer authorises a useful scope). Using
-    // `invalid_scope` here would leak the fact that the
-    // scopes changed (a side channel); `invalid_grant` is
-    // the sanitized shape every other refresh failure uses.
-    await recordTokenDenied(
-      deps.db,
-      logger,
-      `user:${row.agentId}`,
-      null,
-      ip,
-      getNow(deps),
-      "token.refresh_token",
-    );
-    return writeJson(res, 400, { error: "invalid_grant" });
-  }
-  const finalScopes = granted.scopes;
+  // Incoming `scope` is tolerated and ignored.
+  void params.get("scope");
   const sub = `user:${row.agentId}`;
-  const token = await mintAccessToken(deps, sub, finalScopes);
+  const token = await mintAccessToken(deps, sub);
   await recordTokenOk(
     deps.db,
     logger,
@@ -652,7 +600,6 @@ async function handleRefreshTokenGrant(
     access_token: token,
     token_type: "Bearer",
     expires_in: deps.accessTokenTtlSeconds,
-    scope: finalScopes.join(" "),
   });
 }
 
@@ -678,20 +625,15 @@ async function handleRefreshTokenGrant(
  *    `base64url(sha256(code_verifier))` and compares it
  *    to the `code_challenge` bound to the `code`. A
  *    mismatch is `400 invalid_grant`.
- * 6. The consented scopes are the intersection of the
- *    user scopes and the client scopes (the consent
- *    handler already computed this at issue time, but
- *    we re-derive it at exchange time as defense in
- *    depth — a future rotation of either roster
- *    between the issue and exchange does not mint a
- *    token with a scope the principal no longer
- *    allows). If the recomputed set differs from the
- *    code's bound set, the token is minted with the
- *    recomputed (tighter) set.
+ * 6. (Removed in PR 3) The pre-PR3 code re-derived a
+ *    granted scope set at exchange time. The PR 3
+ *    contract: the code's bound `scopes` field is
+ *    INERT (legacy / compat-only); the minted access
+ *    token is always scope-free.
  * 7. On success, the handler mints an RS256 JWT with
  *    `sub = user:<agentId>`. The response is the standard
  *    OAuth2 token shape (`access_token`, `token_type`,
- *    `expires_in`, `scope`).
+ *    `expires_in`) — NO `scope` field.
  *
  * Audit-safety: every error path returns
  * `{ error: "invalid_grant" }` with no internal detail.
@@ -853,66 +795,17 @@ async function handleAuthorizationCodeGrant(
     );
     return writeJson(res, 400, { error: "invalid_grant" });
   }
-  // Defense in depth: re-derive the granted scope set at
-  // exchange time. The consent handler already bound the
-  // code's `scopes` to the intersection of user and
-  // client scopes at issue time, but a future rotation
-  // could shrink either side; the recomputed (tighter)
-  // set is the safe one. We delegate to the centralized
-  // `resolveGrantedScopes` helper with the stored code
-  // scopes as the request — the helper enforces the `*`
-  // rules (a `*` request is only granted when the
-  // principal allows `*`; mixing `*` with specific scopes
-  // is rejected). The pre-PR2 implementation preserved
-  // `*` even when neither principal currently allowed it
-  // (a privilege-escalation side channel); the helper
-  // closes that gap.
-  //
-  // When the recomputed set is empty (the user / client
-  // no longer allows any of the consented scopes), the
-  // response is `invalid_grant` — NOT `invalid_scope` —
-  // because `invalid_scope` would leak the fact that a
-  // valid code's scopes were narrowed after issue. Every
-  // other auth-code failure on this path is already
-  // `invalid_grant`; the sanitized shape is uniform.
-  //
-  // `record.scopes` is already a `string[]` (the
-  // consent handler stored the resolved set
-  // verbatim). The previous implementation ran it
-  // through a JSON.stringify → joinScopeList
-  // round-trip; the round-trip is dead weight —
-  // `.join(" ")` is the direct mapping.
-  const codeRequested = record.scopes.join(" ");
-  const principal = await loadScopePrincipal(
-    deps.db,
-    deps.defaultScope,
-    clientId,
-    record.agentId,
-  );
-  const grantedResult = resolveGrantedScopes(
-    "authorization_code",
-    codeRequested,
-    principal,
-  );
-  if (!grantedResult.ok) {
-    await recordTokenDenied(
-      deps.db,
-      logger,
-      `user:${record.agentId}`,
-      null,
-      ip,
-      getNow(deps),
-      "token.authorization_code",
-    );
-    return writeJson(res, 400, { error: "invalid_grant" });
-  }
-  const granted = grantedResult.scopes;
+  // PR 3: the code's bound `scopes` field is INERT.
+  // The minted access token is scope-free regardless
+  // of any pre-PR3 `scopes` value the code may carry.
+  void record.scopes;
+  // Incoming `scope` is tolerated and ignored.
+  void params.get("scope");
   // Mint the JWT. The `sub` is `user:<agentId>` so the
   // resource server can resolve the agent without an
-  // extra DB lookup. The consented scopes are the
-  // recomputed intersection (NOT the raw code scopes).
+  // extra DB lookup. The minted token is scope-free.
   const sub = `user:${record.agentId}`;
-  const token = await mintAccessToken(deps, sub, granted);
+  const token = await mintAccessToken(deps, sub);
   await recordTokenOk(
     deps.db,
     logger,
@@ -926,7 +819,6 @@ async function handleAuthorizationCodeGrant(
     access_token: token,
     token_type: "Bearer",
     expires_in: deps.accessTokenTtlSeconds,
-    scope: granted.join(" "),
   });
 }
 
@@ -977,17 +869,18 @@ function extractClientCredentials(
  * - `aud` (= `mcp:<app>` — the per-app audience)
  * - `sub` (the agent id; `client:<id>` for client_credentials,
  *   `user:<id>` for password/refresh)
- * - `scope` (space-delimited; the `scopes` claim is the
- *   same data, but `scope` is the canonical OAuth2 form
- *   for introspection)
  * - `iat` / `nbf` / `exp` (TTL = 3600s by default)
+ *
+ * The PR 3 contract: the JWT MUST NOT include a `scope`
+ * or `scopes` claim. The pre-PR3 `scopes: string[]`
+ * argument is dropped — the new helper takes only the
+ * `sub` and the granted set is always `[]`.
  *
  * The header includes `alg`, `kid`, `typ`.
  */
 async function mintAccessToken(
   deps: TokenHandlerDeps,
   sub: string,
-  scopes: string[],
 ): Promise<string> {
   const privateKey = await importSigningPrivateKey(deps.activeKey);
   // The `iat` / `nbf` / `exp` claims are derived from the
@@ -1000,8 +893,6 @@ async function mintAccessToken(
     iss: deps.issuer,
     aud: deps.audience,
     sub,
-    scope: scopes.join(" "),
-    scopes: scopes, // also include as array (resource servers can pick)
     iat: now,
     nbf: now,
     exp: now + deps.accessTokenTtlSeconds,

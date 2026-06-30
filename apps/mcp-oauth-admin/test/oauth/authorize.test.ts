@@ -546,12 +546,14 @@ describe("oauth/authorize (integration)", () => {
     expect(res.status).toBe(200);
   });
 
-  it("consent: a `*` URL scope is REJECTED when the client does not allow `*`", async () => {
-    // Pre-2026 regression: the consent handler
-    // bound URL-requested scopes to the code
-    // verbatim. A crafted `scope=*` URL would have
-    // produced a code with `scope=["*"]`. The fix
-    // is the intersection rule.
+  it("consent: a `*` URL scope is TOLERATED and IGNORED (the consent succeeds, the code's `scopes` is `[]`)", async () => {
+    // PR 3 of `remove-scope-authorization`: the consent
+    // handler does NOT validate the URL-requested
+    // scope. The `*` value is tolerated, the consent
+    // succeeds (302), and the issued code has
+    // `scopes: []` (the pre-PR3 intersection rule is
+    // gone). The minted access token (exchanged via
+    // the `/oauth/token` endpoint) is scope-free.
     const loginBody = new URLSearchParams({
       _action: "login",
       username,
@@ -591,17 +593,31 @@ describe("oauth/authorize (integration)", () => {
         cookie: sessionCookie,
       },
       body: consentBody,
+      redirect: "manual",
     });
-    // The intersection rule returns invalid_scope
-    // (the client has `read:bi_catastro`, not `*`).
-    expect(consentRes.status).toBe(400);
+    // The pre-PR3 intersection rule is gone. The
+    // consent succeeds (302 to the redirect URI).
+    expect(consentRes.status).toBe(302);
+    const location = consentRes.headers.get("location") ?? "";
+    const locUrl = new URL(location);
+    const code = locUrl.searchParams.get("code");
+    expect(code).toBeTruthy();
+    // The code is bound with `scopes: []` (the field
+    // is INERT post-PR3 but retained on the type for
+    // backward compatibility).
+    const now = Math.floor(Date.now() / 1000);
+    const rec = consumeCode(code!, now);
+    expect(rec).not.toBeNull();
+    expect(rec!.scopes).toEqual([]);
   });
 
-  it("consent: a scope outside both the user + client intersection is REJECTED", async () => {
-    // Privilege-escalation regression: a user with
-    // `read:bi_catastro` cannot consent to
-    // `call:secret` even when the client allows
-    // `call:secret` (the user is the bottleneck).
+  it("consent: a scope outside both the user + client intersection is TOLERATED (no `invalid_scope`)", async () => {
+    // PR 3 contract: the consent handler does NOT
+    // validate the URL-requested scope. A user with
+    // `read:bi_catastro` and a client with
+    // `call:secret` can consent to `call:secret` —
+    // the request is tolerated, the consent
+    // succeeds, and the code's `scopes` is `[]`.
     await withSingleWriter(db, async (trx) => {
       await trx.execute(
         "UPDATE users SET scopes = ? WHERE id = ?",
@@ -651,8 +667,9 @@ describe("oauth/authorize (integration)", () => {
         cookie: sessionCookie,
       },
       body: consentBody,
+      redirect: "manual",
     });
-    expect(consentRes.status).toBe(400);
+    expect(consentRes.status).toBe(302);
   });
 
   it("GET /oauth/authorize with a redirect_uri NOT in the client's stored list is rejected (RFC 7591 enforcement)", async () => {
@@ -712,12 +729,14 @@ describe("oauth/authorize (integration)", () => {
     expect(res.status).toBe(200);
   });
 
-  it("consent: the granted scope is the intersection of the user + client scope sets", async () => {
-    // End-to-end: the user has `read` + `list`,
-    // the client has `read` + `call`. The consent
-    // for `read list call` produces a code with
-    // `scope=[read]` (the only scope both
-    // principals allow).
+  it("consent: the granted code is bound with `scopes: []` regardless of the URL-requested scope (PR 3 contract)", async () => {
+    // End-to-end: the user has `read` + `list`, the
+    // client has `read` + `call`, and the consent
+    // includes a URL-requested `scope=read list call`.
+    // The PR 3 contract: the code is bound with
+    // `scopes: []` (the pre-PR3 intersection rule is
+    // gone; the `scopes` field on the code is INERT
+    // and the token endpoint ignores it).
     await withSingleWriter(db, async (trx) => {
       await trx.execute(
         "UPDATE users SET scopes = ? WHERE id = ?",
@@ -783,7 +802,9 @@ describe("oauth/authorize (integration)", () => {
     const now = Math.floor(Date.now() / 1000);
     const rec = consumeCode(code!, now);
     expect(rec).not.toBeNull();
-    expect(rec!.scopes).toEqual(["read:bi_catastro"]);
+    // The `scopes` field is `[]` (NOT the pre-PR3
+    // intersection `[read:bi_catastro]`).
+    expect(rec!.scopes).toEqual([]);
   });
 });
 

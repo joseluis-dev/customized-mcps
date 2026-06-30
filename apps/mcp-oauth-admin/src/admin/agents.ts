@@ -16,6 +16,14 @@
  *   `requireChangeOnFirstLogin` flag so the admin can mint
  *   tokens (see `src/oauth/token.ts` password grant).
  *
+ * PR 4 of `remove-scope-authorization`:
+ * - The `users.scopes` column is INERT legacy storage. The
+ *   `createAgent` / `rotateAgentPassword` paths no longer
+ *   validate against the scope-pattern grammar (the column
+ *   defaults to `[]` for new rows). The `setAgentScopes`
+ *   helper is removed — there is no admin route to call it,
+ *   and the catalog that backed it is gone.
+ *
  * Audit-safety:
  * - The `verifyAgentPassword` function does NOT log the
  *   supplied password. The caller is responsible for the
@@ -28,7 +36,6 @@
  */
 
 import { randomBytes } from "node:crypto";
-import { SCOPE_PATTERN } from "@customized-mcps/mcp-http-base";
 import { withSingleWriter, type AuthorityDatabase } from "../db/connection.js";
 import { hashPassword, verifyPassword } from "../oauth/passwords.js";
 
@@ -37,6 +44,12 @@ import { hashPassword, verifyPassword } from "../oauth/passwords.js";
  * `users` with the JSON `scopes` column decoded. We do NOT
  * include `passwordHash` — that is internal state and MUST
  * NEVER reach the admin UI.
+ *
+ * The `scopes` field is INERT legacy storage (PR 4 of
+ * `remove-scope-authorization`). It is read so the
+ * `AgentRecord` shape stays BC-compatible with the
+ * `users` table; it is NOT validated, NOT exposed through
+ * the admin UI, and NOT surfaced on any rendered page.
  */
 export type AgentRecord = {
   id: number;
@@ -48,16 +61,21 @@ export type AgentRecord = {
   lastLoginAt: number | null;
 };
 
+/**
+ * `CreateAgentInput` no longer carries `scopes`. The agent
+ * is created with the inert default `[]`; the column is
+ * legacy storage. The field is removed from the public
+ * input to make the removal observable at the type level.
+ */
 export type CreateAgentInput = {
   username: string;
-  scopes: string[];
   requireChangeOnFirstLogin?: boolean;
   now: number;
 };
 
 export type CreateAgentResult =
   | { ok: true; agent: AgentRecord; plaintextPassword: string }
-  | { ok: false; reason: "invalid_username" | "invalid_scope" | "duplicate" };
+  | { ok: false; reason: "invalid_username" | "duplicate" };
 
 export type RotatePasswordResult =
   | { ok: true; plaintextPassword: string }
@@ -92,12 +110,16 @@ function generatePassword(): string {
  * Create a new agent. Returns a one-time plaintext password;
  * the DB row stores only the `argon2id` hash.
  *
+ * PR 4 of `remove-scope-authorization`: the `scopes` input
+ * was removed. The `users.scopes` column is inert legacy
+ * storage and defaults to `[]` for new rows. The catalog /
+ * pattern validation that used to gate agent creation is
+ * gone.
+ *
  * Validation:
  * - `username` must be non-empty, ≤ 64 chars, and contain only
  *   `[A-Za-z0-9_.-]` (the same shape we accept in the auth
  *   module's `keyHash`/`id` fields).
- * - Each scope in `scopes` MUST match `SCOPE_PATTERN`. The
- *   authority MUST NOT grant bare `*` (the spec is explicit).
  */
 export async function createAgent(
   db: AuthorityDatabase,
@@ -106,11 +128,6 @@ export async function createAgent(
   const username = input.username.trim();
   if (username.length === 0 || username.length > 64 || !/^[A-Za-z0-9_.-]+$/.test(username)) {
     return { ok: false, reason: "invalid_username" };
-  }
-  for (const scope of input.scopes) {
-    if (!SCOPE_PATTERN.test(scope)) {
-      return { ok: false, reason: "invalid_scope" };
-    }
   }
   const plaintext = generatePassword();
   let passwordHash: string;
@@ -126,11 +143,10 @@ export async function createAgent(
     const inserted = await withSingleWriter(db, async (trx) => {
       const result = await trx.execute(
         `INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt)
-         VALUES (?, ?, ?, 1, ?, ?)`,
+         VALUES (?, ?, '[]', 1, ?, ?)`,
         [
           username,
           passwordHash,
-          JSON.stringify(input.scopes),
           requireChange,
           input.now,
         ],
@@ -151,7 +167,7 @@ export async function createAgent(
     const agent: AgentRecord = {
       id: inserted,
       username,
-      scopes: [...input.scopes],
+      scopes: [],
       enabled: true,
       requireChangeOnFirstLogin: input.requireChangeOnFirstLogin === true,
       createdAt: input.now,
@@ -376,36 +392,6 @@ export async function changeOwnPassword(
 }
 
 /**
- * Replace an agent's scope set. Returns `true` on success,
- * `false` when the scope set is invalid (one or more scopes
- * fail `SCOPE_PATTERN`) or the id is unknown. An empty
- * array is allowed (the agent has no scopes; the token
- * endpoint falls back to the default scope for that grant).
- */
-export async function setAgentScopes(
-  db: AuthorityDatabase,
-  id: number,
-  scopes: string[],
-  _now: number,
-): Promise<boolean> {
-  for (const scope of scopes) {
-    if (!SCOPE_PATTERN.test(scope)) return false;
-  }
-  return withSingleWriter(db, async (trx) => {
-    const existing = await trx.select<{ id: number }>(
-      "SELECT id FROM users WHERE id = ?",
-      [id],
-    );
-    if (existing.length === 0) return false;
-    await trx.execute("UPDATE users SET scopes = ? WHERE id = ?", [
-      JSON.stringify(scopes),
-      id,
-    ]);
-    return true;
-  });
-}
-
-/**
  * Update the `lastLoginAt` timestamp. Called on a successful
  * admin login. Returns `true` on success, `false` when the
  * id is unknown.
@@ -472,6 +458,8 @@ function rowToAgent(r: {
   return {
     id: r.id,
     username: r.username,
+    // INERT legacy column — read for BC shape, never validated
+    // or surfaced through the admin UI.
     scopes: parseScopeList(r.scopes),
     enabled: r.enabled === 1,
     requireChangeOnFirstLogin: r.requireChangeOnFirstLogin === 1,

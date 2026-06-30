@@ -1,14 +1,17 @@
 schema: spec-driven
 
 context: |
-  Workspace: pnpm + uv monorepo for hosting multiple MCP apps (TypeScript and Python).
-  Architecture: workspace root is non-deployable; each MCP app lives in apps/<app-name>/ and owns
-  its own manifest, source, tests, .env.example, and build artifact.
-  The current change is apps/mcp-readonly-sql — a TypeScript ESM package (Node >=20, TS 5.7,
-  NodeNext modules, vitest 2.1) that exposes a read-only MCP SQL server over stdio.
-  Future Python MCPs will live in apps/<py-app>/ and are invoked with `uv --project apps/<py-app>`.
-  All apply/verify commands target ONE app at a time via `pnpm --filter <app-name>` (TS) or
-  `uv --project apps/<py-app>` (Python). No command resolves to the whole repo.
+  Workspace: pnpm monorepo hosting multiple TypeScript MCP packages (Node >=20, TS 5.7,
+  NodeNext modules, strict mode, vitest 2.1).
+  Architecture: workspace root is non-deployable. Each app lives in apps/<app-name>/,
+  each shared library in packages/<pkg-name>/, each owning manifest, source, tests, and build.
+  Current packages:
+    - apps/mcp-readonly-sql — Read-only SQL MCP server (PostgreSQL, MySQL, SQL Server, SQLite)
+    - apps/mcp-oauth-admin — OAuth2 authorization server + SQLite identity store + admin UI
+    - packages/mcp-http-base — Shared Streamable HTTP transport, auth, health, logging, shutdown
+  Future Python MCPs will live in apps/<py-app>/ and are invoked via `uv --project apps/<py-app>`.
+  Commands target a specific package via `pnpm --filter <name>`. Root fallback
+  (`pnpm test`, `pnpm typecheck`, `pnpm build`) runs recursively across the workspace.
 
 rules:
   proposal:
@@ -29,17 +32,37 @@ rules:
   apply:
     settings:
       tdd: true
-      test_command: pnpm --filter mcp-readonly-sql test
-      build_command: pnpm --filter mcp-readonly-sql build
+      test_command:
+        mcp-readonly-sql: pnpm --filter mcp-readonly-sql test
+        mcp-oauth-admin: pnpm --filter mcp-oauth-admin test
+        mcp-http-base: pnpm --filter @customized-mcps/mcp-http-base test
+        root: pnpm test
+      build_command:
+        mcp-readonly-sql: pnpm --filter mcp-readonly-sql build
+        mcp-oauth-admin: pnpm --filter mcp-oauth-admin build
+        mcp-http-base: pnpm --filter @customized-mcps/mcp-http-base build
+        root: pnpm build
     rules:
       - "Follow existing app module layout: apps/<app-name>/src/{config,db,security,tools}."
       - "New SQL guard rules MUST ship with vitest cases in apps/<app-name>/test/sqlGuard.test.ts first."
       - "Never edit the workspace root's src/ or test/ directories — apps own their own source tree."
   verify:
     settings:
-      test_command: pnpm --filter mcp-readonly-sql test
-      build_command: pnpm --filter mcp-readonly-sql build
-      typecheck_command: pnpm --filter mcp-readonly-sql typecheck
+      test_command:
+        mcp-readonly-sql: pnpm --filter mcp-readonly-sql test
+        mcp-oauth-admin: pnpm --filter mcp-oauth-admin test
+        mcp-http-base: pnpm --filter @customized-mcps/mcp-http-base test
+        root: pnpm test
+      build_command:
+        mcp-readonly-sql: pnpm --filter mcp-readonly-sql build
+        mcp-oauth-admin: pnpm --filter mcp-oauth-admin build
+        mcp-http-base: pnpm --filter @customized-mcps/mcp-http-base build
+        root: pnpm build
+      typecheck_command:
+        mcp-readonly-sql: pnpm --filter mcp-readonly-sql typecheck
+        mcp-oauth-admin: pnpm --filter mcp-oauth-admin typecheck
+        mcp-http-base: pnpm --filter @customized-mcps/mcp-http-base typecheck
+        root: pnpm typecheck
       coverage_threshold: 0
     rules:
       - Confirm TypeScript strictness still passes (noUncheckedIndexedAccess + noImplicitOverride).
@@ -51,19 +74,30 @@ rules:
 testing:
   strict_tdd: true
   runner: vitest
-  runner_command: pnpm --filter mcp-readonly-sql test
-  watch_command: pnpm --filter mcp-readonly-sql test:watch
+  runner_command:
+    mcp-readonly-sql: pnpm --filter mcp-readonly-sql test
+    mcp-oauth-admin: pnpm --filter mcp-oauth-admin test
+    mcp-http-base: pnpm --filter @customized-mcps/mcp-http-base test
+    root: pnpm test
+  watch_command:
+    mcp-readonly-sql: pnpm --filter mcp-readonly-sql test:watch
+    mcp-oauth-admin: pnpm --filter mcp-oauth-admin test:watch
+    mcp-http-base: pnpm --filter @customized-mcps/mcp-http-base test:watch
   layers:
     unit: true
     integration: false
     e2e: false
   coverage_available: false
   coverage_command: ""
-  typecheck_command: pnpm --filter mcp-readonly-sql typecheck
+  typecheck_command:
+    mcp-readonly-sql: pnpm --filter mcp-readonly-sql typecheck
+    mcp-oauth-admin: pnpm --filter mcp-oauth-admin typecheck
+    mcp-http-base: pnpm --filter @customized-mcps/mcp-http-base typecheck
+    root: pnpm typecheck
   lint_command: ""
   format_command: ""
   notes:
-    - "Vitest 2.1 is the only test framework declared; no playwright/cypress/supertest present."
+    - "All packages use vitest 2.1 with identical config: node env, test/**/*.test.ts, forbidOnly, no globals."
     - "@vitest/coverage is not in devDependencies — coverage tooling is unavailable until added."
     - "No ESLint, Prettier, or editorconfig files are present; style is enforced by tsc + manual review."
-    - "Tests run from the app directory because pnpm `--filter` sets cwd to the app's package root; vitest config include path is `test/**/*.test.ts` (relative to the app)."
+    - "Tests run from the package directory because pnpm `--filter` sets cwd to the package root; vitest config include path is `test/**/*.test.ts` (relative to package)."

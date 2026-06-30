@@ -15,15 +15,18 @@
  *   strips whatever leaks, but this handler is the primary
  *   defense.
  * - The response shape is the canonical RFC 7662 fields:
- *   `active`, `sub`, `aud`, `iss`, `scope`, `exp`, `iat`.
- *   We do NOT return the token, the `kid`, or any
- *   private JWK component.
+ *   `active`, `sub`, `aud`, `iss`, `iat`, `exp`. PR 3 of
+ *   `remove-scope-authorization` removes `scope` from
+ *   the response body — the field is OMITTED (not set
+ *   to an empty string) so a legacy client that still
+ *   expects `scope` will see `undefined`. We do NOT
+ *   return the token, the `kid`, or any private JWK
+ *   component.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { jwtVerify, errors as joseErrors } from "jose";
 import { importSigningPrivateKey, loadActiveSigningKey } from "./keys.js";
-import { SCOPE_PATTERN } from "@customized-mcps/mcp-http-base";
 import type { AuthorityDatabase } from "../db/connection.js";
 import { BodyTooLargeError, readFormBody } from "./bodyReader.js";
 
@@ -117,20 +120,25 @@ export async function introspect(
       algorithms: ["RS256"],
     });
     const payload = verified.payload;
-    const rawScopes = (() => {
-      const v = (payload as { scopes?: unknown }).scopes;
-      if (Array.isArray(v)) return v.filter((s): s is string => typeof s === "string");
-      const s = (payload as { scope?: unknown }).scope;
-      if (typeof s === "string") return s.split(/\s+/).filter((x) => x.length > 0);
-      return [];
-    })();
-    const kept = rawScopes.filter((s) => SCOPE_PATTERN.test(s));
+    // PR 3 of `remove-scope-authorization`: the response
+    // body does NOT include a `scope` field. The pre-PR3
+    // implementation extracted the `scope` / `scopes`
+    // claim from the JWT payload, filtered through
+    // `SCOPE_PATTERN`, and joined the result into a
+    // space-delimited `scope` field. The new contract
+    // is the canonical RFC 7662 shape WITHOUT `scope`
+    // — the field is omitted from the response. The
+    // payload's `scope` / `scopes` claim is read-only
+    // to maintain type compatibility with pre-PR3
+    // tokens; the value is never echoed into the
+    // response.
+    void (payload as { scope?: unknown }).scope;
+    void (payload as { scopes?: unknown }).scopes;
     return {
       active: true,
       sub: typeof payload.sub === "string" ? payload.sub : undefined,
       aud: payload.aud,
       iss: payload.iss,
-      scope: kept.join(" "),
       iat: payload.iat,
       exp: payload.exp,
     };

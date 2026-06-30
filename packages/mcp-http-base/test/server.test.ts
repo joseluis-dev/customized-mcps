@@ -391,7 +391,6 @@ describe("createHttpMcpServer", () => {
       const { handle, port } = await startServer(
         makeOptions({
           resourceServerUrl: "https://mcp.example.com",
-          scopeCatalog: () => ["read:bi_catastro", "list:bi_catastro"],
         }),
       );
       stopHandle = handle;
@@ -412,10 +411,11 @@ describe("createHttpMcpServer", () => {
       expect(body.resource).toBe("https://mcp.example.com");
       expect(body.authorization_servers).toEqual([TEST_AUTHORITY_URL]);
       expect(body.bearer_methods_supported).toEqual(["header"]);
-      expect(body.scopes_supported).toEqual([
-        "read:bi_catastro",
-        "list:bi_catastro",
-      ]);
+      // PR 1 of `remove-scope-authorization`: the resource server
+      // always advertises `scopes_supported: []` regardless of any
+      // legacy scope storage. The previous `scopeCatalog` option is
+      // removed.
+      expect(body.scopes_supported).toEqual([]);
     });
 
     it("uses the request Host as the `resource` value when no MCP_RESOURCE_SERVER_URL is set", async () => {
@@ -431,7 +431,12 @@ describe("createHttpMcpServer", () => {
       expect(body.resource).toBe(`http://127.0.0.1:${port}`);
     });
 
-    it("defaults scopes_supported to [] when no scopeCatalog is provided", async () => {
+    it("always returns scopes_supported: [] (PR 1 task 1.5: scopeCatalog option removed)", async () => {
+      // The previous contract had a `scopeCatalog` option that
+      // contributed entries to `scopes_supported`. The
+      // `remove-scope-authorization` change makes `scopes_supported`
+      // always `[]` — the field is retained for RFC 9728 schema
+      // compliance, not as a source of authorization.
       const { handle, port } = await startServer(makeOptions());
       stopHandle = handle;
       const res = await http(

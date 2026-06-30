@@ -1,17 +1,20 @@
 /**
  * Public API of @customized-mcps/mcp-http-base.
  *
- * The package is consumed by MCP apps in this workspace (PR2 wires
- * mcp-readonly-sql against it). The exports below are the only surface
- * the apps are expected to use.
+ * The package is consumed by MCP apps in this workspace. The exports
+ * below are the only surface the apps are expected to use.
  *
  * Canonical types:
  * - `LogFormat` is defined in `./config.ts` and re-exported by `./logging.ts`
  *   so the public surface has a single source of truth.
- * - `Scope` / `SCOPE_PATTERN` / `isValidScope` / `matchScope` are defined
- *   in `./auth.ts` and consumed by the authority implementations
- *   (`./authority/jwks.ts` and the OAuth admin apps) so the public
- *   surface has a single source of truth on the scope grammar.
+ * - The previous scope-grammar surface (`Scope` / `SCOPE_PATTERN` /
+ *   `isValidScope` / `matchScope`) was REMOVED in PR 1 of the
+ *   `remove-scope-authorization` change, and the PR 3 cross-slice
+ *   compat shim (`SCOPE_PATTERN` / `isValidScope` / `Scope`) was
+ *   removed in PR 4. Scope authorization is inert:
+ *   `TokenAuthority.verify` returns `scopes: []` for every successful
+ *   call, and downstream code MUST NOT consult that field for
+ *   access decisions.
  *
  * Application error codes (named JSON-RPC -3200x) live on `JSON_RPC_ERROR_CODES`
  * in `./errors.ts` so the envelope factories and any consumer code share
@@ -28,13 +31,6 @@ export {
   type ProtectedResourceMetadata,
   type ResourceServerRequestLike,
 } from "./config.js";
-
-export {
-  matchScope,
-  isValidScope,
-  SCOPE_PATTERN,
-  type Scope,
-} from "./auth.js";
 
 /**
  * Phase 1a of `external-token-authority-verification` introduces the
@@ -88,3 +84,4 @@ export {
   type McpServerFactory,
   type SessionMode,
 } from "./server.js";
+

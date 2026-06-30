@@ -2,27 +2,29 @@
 
 ## Purpose
 
-Defines the per-agent identity, token validation, and scope enforcement that every HTTP-served MCP in this workspace MUST apply. Authorization runs in middleware before the request reaches the MCP transport, so unauthorized traffic never reaches a tool handler. Stdio traffic is unaffected.
+Defines the per-agent identity and token validation that every HTTP-served MCP in this workspace MUST apply. Authentication runs in middleware before the request reaches the MCP transport, so unauthenticated traffic never reaches a tool handler. Scope authorization is removed; any authenticated agent has access to all MCP capabilities. Stdio traffic is unaffected.
 
 ## Requirements
 
 ### Requirement: Per-Agent Identity Records
 
-The app MUST load per-agent identity through the selected `TokenAuthority`. When the local backend is selected, the source is `MCP_AGENTS_JSON` (path to a JSON file) or `MCP_AGENTS_INLINE` (raw JSON string in env). When `MCP_AGENTS_JSON` is set, it wins over `MCP_AGENTS_INLINE`. Each local record MUST include `id` (stable string, opaque to the agent), `keyHash` (server-side HMAC of the agent's bearer token, hex-encoded), and `scopes` (array of strings matching `SCOPE_PATTERN`). The plaintext bearer token MUST never be persisted on the server; only its HMAC is stored. The format MUST support third-party agents as ordinary records (no special "first-party" class). When the JWKS backend is selected, the identity record is the JWT subject and the `scopes` claim, both delivered by the authority.
+The app MUST load per-agent identity through the selected `TokenAuthority`. When the local backend is selected, the source is `MCP_AGENTS_JSON` (path to a JSON file) or `MCP_AGENTS_INLINE` (raw JSON string in env). When `MCP_AGENTS_JSON` is set, it wins over `MCP_AGENTS_INLINE`. Each local record MUST include `id` (stable string, opaque to the agent) and `keyHash` (server-side HMAC of the agent's bearer token, hex-encoded). The `scopes` field on a local record is treated as decorative/legacy: the runtime MUST NOT use its value to gate access. The plaintext bearer token MUST never be persisted on the server; only its HMAC is stored. The format MUST support third-party agents as ordinary records (no special "first-party" class). When the JWKS backend is selected, the identity record is the JWT subject; the `scopes` claim (if any) is treated as decorative/legacy and is not used for authorization.
+(Previously: `scopes` was an enforced authorization field. Now decorative/legacy.)
 
 #### Scenario: Third-party agent onboards on local backend
 
 - GIVEN an operator adds a record `{ "id": "third-party-x", "keyHash": "<hmac-of-token>", "scopes": ["read:bi_catastro"] }` to `MCP_AGENTS_JSON`
 - WHEN `third-party-x` sends a request with a valid bearer token
 - THEN the request is accepted by `LocalRosterAuthority`
-- AND the request is denied only on the rules that apply to that agent's scopes.
+- AND the legacy `scopes` field does not influence which tools the agent can call.
 
 #### Scenario: Third-party agent onboards on JWKS backend
 
-- GIVEN a third-party agent registered at the authority with `agentId=third-party-x` and `scopes=["read:bi_catastro"]`
+- GIVEN a third-party agent registered at the authority with `agentId=third-party-x` and `scopes=["read:bi_catastro"]` (legacy field)
 - WHEN the agent sends a JWT with `sub=third-party-x`
-- THEN `JwksAuthority.verify` returns `{ agentId: "third-party-x", scopes: ["read:bi_catastro"] }`
-- AND no `.agents.local.json` is required.
+- THEN `JwksAuthority.verify` returns `{ agentId: "third-party-x", scopes: [] }`
+- AND no `.agents.local.json` is required
+- AND the `scopes` claim is treated as decorative and not used to gate access.
 
 #### Scenario: Missing agent config fails closed on local backend
 
@@ -40,7 +42,8 @@ The app MUST load per-agent identity through the selected `TokenAuthority`. When
 
 ### Requirement: Per-Record Validation At Startup
 
-The app MUST validate each agent record's `keyHash` and `scopes` at startup and refuse to start (exit non-zero with a stderr message naming the offending record) if either is malformed. `keyHash` MUST be exactly 64 lowercase or uppercase hex characters (the SHA-256 hex digest of the agent's bearer token under the server's HMAC secret). `scopes` MUST each match the grammar `<verb>:<resource>` where `<verb>` is one of `read`, `list`, `call` and `<resource>` is either `*` or an identifier made of `[A-Za-z0-9_.-]+`. v1 does not wildcard verbs; only resources.
+The app MUST validate each agent record's `keyHash` at startup and refuse to start (exit non-zero with a stderr message naming the offending record) if it is malformed. `keyHash` MUST be exactly 64 lowercase or uppercase hex characters (the SHA-256 hex digest of the agent's bearer token under the server's HMAC secret). The `scopes` field on a local record MUST be tolerated in any shape (array, missing, wrong-typed) and MUST NOT cause startup to fail. The `SCOPE_PATTERN` grammar check is removed for `scopes` fields on local records; the `SCOPE_PATTERN` constant is itself deprecated.
+(Previously: malformed scopes failed startup. Now: tolerated.)
 
 #### Scenario: Malformed keyHash fails closed
 
@@ -49,12 +52,12 @@ The app MUST validate each agent record's `keyHash` and `scopes` at startup and 
 - THEN the process exits non-zero
 - AND stderr names the offending record index and explains the format.
 
-#### Scenario: Malformed scope fails closed
+#### Scenario: Malformed or missing scopes field does not fail startup
 
-- GIVEN an agent record whose `scopes` include a value that is not `<read|list|call>:<resource>` (e.g. `delete:foo`, `readfoo`, `read:`, `:foo`)
+- GIVEN an agent record whose `scopes` field is missing, set to `null`, set to a string, or contains values that would not have matched the old `SCOPE_PATTERN` (e.g. `delete:foo`)
 - WHEN the app starts in HTTP mode
-- THEN the process exits non-zero
-- AND stderr names the offending record and the offending scope.
+- THEN the process starts successfully
+- AND the malformed `scopes` value is treated as decorative/legacy and never read for authorization.
 
 ### Requirement: Bearer Token Validation
 
@@ -74,39 +77,10 @@ Clients present `Authorization: Bearer <token>` on every request. Tokens MAY be 
 - WHEN the middleware validates it
 - THEN the response is `401` and the body is a sanitized JSON-RPC error with no token value.
 
-### Requirement: Scope-Based Authorization
-
-Each scope string MUST be of the form `<verb>:<resource>`, where `<verb>` is one of `read`, `list`, `call`, and `<resource>` is either a profile alias or the wildcard `*`. An agent MUST hold a scope that matches the resource for the call to proceed. The server-side profile allowlist (from `mcp-tool-surface`) and the read-only safety contract (`sqlGuard`) ALWAYS win over scopes; an agent with the right scope MUST still be blocked by a database allowlist mismatch or a non-read SQL keyword.
-
-#### Scenario: Read scope on a known profile
-
-- GIVEN an agent with scopes `["read:bi_catastro"]`
-- WHEN the agent calls `execute_read_query` against `bi_catastro`
-- THEN the tool runs.
-
-#### Scenario: Insufficient scope returns 403
-
-- GIVEN an agent with scopes `["read:reporting"]`
-- WHEN the agent calls `execute_read_query` against `bi_catastro`
-- THEN the response status is `403`
-- AND the body is a sanitized error that does not enumerate valid scopes or profiles.
-
-#### Scenario: Wildcard scope
-
-- GIVEN an agent with scopes `["read:*"]`
-- WHEN the agent calls `execute_read_query` against any profile
-- THEN the tool is permitted to run (subject to the server-side allowlist).
-
-#### Scenario: Server-side allowlist still wins
-
-- GIVEN an agent with scope `["read:bi_catastro"]` and a profile whose allowlist excludes the requested database
-- WHEN the agent calls `execute_read_query` against a non-allowlisted database
-- THEN the call is rejected with the standard allowlist error from `mcp-tool-surface`
-- AND scope is not a factor in the decision.
-
 ### Requirement: Audit-Safe Error Responses
 
-All 401, 403, and 503 responses MUST be sanitized. They MUST NOT include the supplied token, the agent's `id`, the agent's `keyHash`, the resolved `keyHash`, the HMAC secret, the list of valid agents, or the list of valid scopes. Errors MUST be emitted through the existing `sanitizeError` path so the same guarantees that protect DB credentials also protect auth state.
+All `401` and `503` responses MUST be sanitized. They MUST NOT include the supplied token, the agent's `id`, the agent's `keyHash`, the resolved `keyHash`, the HMAC secret, the list of valid agents, or any other internal auth state. Errors MUST be emitted through the existing `sanitizeError` path so the same guarantees that protect DB credentials also protect auth state. The `403` status code is no longer produced by scope enforcement because scope authorization is removed.
+(Previously: the contract also covered `403` responses for scope mismatches. Now: only `401`/`503` apply to authentication; `403` is no longer used for scope decisions.)
 
 #### Scenario: 401 body is minimal
 
@@ -115,12 +89,12 @@ All 401, 403, and 503 responses MUST be sanitized. They MUST NOT include the sup
 - THEN the body is `{ "error": "unauthorized" }` (or equivalent minimal JSON-RPC error)
 - AND the body contains no token fragment and no agent metadata.
 
-#### Scenario: 403 body does not enumerate
+#### Scenario: No 403 from scope enforcement
 
-- GIVEN a scope mismatch
-- WHEN the response is generated
-- THEN the body explains the failure category only
-- AND does not list the agent's actual scopes or any other agent's scopes.
+- GIVEN any authenticated request (regardless of legacy `scopes` field on the agent record or `scopes` claim on the JWT)
+- WHEN the request is processed
+- THEN the response MUST NOT be `403` due to a scope mismatch (scope enforcement is removed)
+- AND any non-auth failure (e.g. profile allowlist) returns the existing allowlist error, not a scope error.
 
 ### Requirement: Third-Party Agent Constraints
 
@@ -172,15 +146,17 @@ JWT signature verification and the `mcp-oauth-authority` endpoints (token, intro
 
 ### Requirement: TokenAuthority Interface Contract
 
-The app MUST verify every HTTP request through a `TokenAuthority` implementation supplied by `mcp-http-base`. The middleware MUST call `authority.verify(token)` and MUST attach `{ agentId, scopes }` to the request context on success. The middleware MUST NOT call `validateBearer` directly; that function is now an implementation detail of `LocalRosterAuthority`. The middleware MUST map `TokenInvalidError` to `401` and `AuthorityUnavailableError` to `503`, reusing the audit-safe error path.
+The app MUST verify every HTTP request through a `TokenAuthority` implementation supplied by `mcp-http-base`. The middleware MUST call `authority.verify(token)` and MUST attach `{ agentId, scopes: [] }` to the request context on success (the `scopes` field is retained on the context for backward compatibility with downstream code but is always `[]` and MUST NOT be used for authorization). The middleware MUST NOT call `validateBearer` directly; that function is now an implementation detail of `LocalRosterAuthority`. The middleware MUST map `TokenInvalidError` to `401` and `AuthorityUnavailableError` to `503`, reusing the audit-safe error path.
+(Previously: `req.auth` carried the agent's `scopes` for downstream authorization. Now: the field is present but always empty and not consulted for access.)
 
 #### Scenario: Middleware delegates to authority
 
 - GIVEN any configured `TokenAuthority`
 - WHEN an HTTP request arrives with a bearer token
 - THEN the middleware calls `authority.verify(token)`
-- AND attaches `{ agentId, scopes }` to the request context on success
-- AND returns `401` on `TokenInvalidError` and `503` on `AuthorityUnavailableError`.
+- AND attaches `{ agentId, scopes: [] }` to the request context on success
+- AND returns `401` on `TokenInvalidError` and `503` on `AuthorityUnavailableError`
+- AND the `scopes` value on the context is never inspected to make an authorization decision.
 
 ### Requirement: Backend Selection By Environment
 
@@ -202,7 +178,8 @@ When `MCP_AUTHORITY_URL` is unset, the runtime MUST instantiate `LocalRosterAuth
 
 ### Requirement: Local Backend Boundary
 
-`LocalRosterAuthority` is the dev/offline fallback. The app's `.env.example` and `deploy/README.md` MUST mark the local backend as dev/offline-only and MUST recommend `JwksAuthority` for production and shared deployments. The `SCOPE_PATTERN` regex `^(read|list|call):(\*|[A-Za-z0-9_.-]+)$` MUST apply to scopes from both backends; `loadAgents` MUST parse the authority's `scopes` claim as well as the local roster, and entries that fail to match MUST be dropped and logged at `WARN`.
+`LocalRosterAuthority` is the dev/offline fallback. The app's `.env.example` and `deploy/README.md` MUST mark the local backend as dev/offline-only and MUST recommend `JwksAuthority` for production and shared deployments. The `SCOPE_PATTERN` regex `^(read|list|call):(\*|[A-Za-z0-9_.-]+)$` is deprecated and is no longer used to validate `scopes` from either backend. The `loadAgents` parser MUST tolerate a `scopes` field of any shape (missing, non-string-array, or containing non-pattern values) and MUST NOT drop or warn on a record solely because of its `scopes` value. The local roster is unaffected by OAuth authority defaults and vice versa.
+(Previously: `SCOPE_PATTERN` applied to scopes from both backends; mismatched entries were dropped and warned. Now: the pattern is unused.)
 
 #### Scenario: Local backend documented as fallback
 
@@ -211,28 +188,13 @@ When `MCP_AUTHORITY_URL` is unset, the runtime MUST instantiate `LocalRosterAuth
 - THEN the local backend is labeled `dev/offline only`
 - AND the JWKS backend is labeled `recommended for production and shared deployments`.
 
-#### Scenario: Scope grammar uniform across backends
+#### Scenario: Any scopes shape is tolerated
 
-- GIVEN a JWT with `scopes` claim `["read:bi_catastro", "delete:foo"]`
-- WHEN `JwksAuthority.verify` returns
-- THEN only `["read:bi_catastro"]` is returned as `scopes`
-- AND the invalid entry is dropped and logged at `WARN` (value omitted).
-
-### Requirement: Resource Server Scope Claims Are Authoritative
-
-The JWKS/resource-server path MUST authorize from verified JWT claims only. Resource servers MUST NOT add scopes from env vars, local config, or deployment defaults. If a required scope is absent from the claim, the existing authorization failure applies; no fallback grants. The local roster is self-contained and unaffected by OAuth authority defaults.
-
-#### Scenario: Claim is the only authority
-
-- GIVEN an agent whose JWT `scopes` claim is `["list:bi_catastro"]` and a tool requiring `read:bi_catastro`
-- WHEN the agent calls the tool
-- THEN the call is permitted only if `read:bi_catastro` is in the claim; no env-var, config, or default widens the authorization.
-
-#### Scenario: Missing scope denies; local roster unaffected
-
-- GIVEN the local backend is active, or the JWKS backend is active with a claim lacking the required scope
-- WHEN an agent makes a request
-- THEN the local roster's `scopes` field is the only authority on the local backend, and on the JWKS backend the call is denied with the standard authorization failure (no fallback).
+- GIVEN a JWT or local record with `scopes` set to `["read:bi_catastro", "delete:foo", 42, null]` or omitted entirely
+- WHEN the backend parses the value
+- THEN the request proceeds
+- AND no record is dropped because of the `scopes` value
+- AND no `WARN` is emitted for the `scopes` value.
 
 ### Requirement: Local Roster Deprecation Notice
 

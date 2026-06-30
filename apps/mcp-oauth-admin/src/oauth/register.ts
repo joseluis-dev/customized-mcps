@@ -20,15 +20,19 @@
  *   `client_id_issued_at`, `client_secret_expires_at` (0 for
  *   non-expiring), `redirect_uris`, `grant_types`,
  *   `response_types`, `token_endpoint_auth_method`, and
- *   `scope`.
+ *   `scope: ""` (the empty string, retained for RFC 7591
+ *   compatibility; PR 3 of `remove-scope-authorization`
+ *   makes scope authorization inert and the DCR response
+ *   always returns `scope: ""` regardless of the request's
+ *   `scope` value or the catalog state).
  * - The endpoint generates a 32-byte random `client_id`
  *   and a 32-byte random `client_secret`. The plaintext
  *   secret is returned exactly once in the response; the
  *   DB row stores only the `argon2id` hash.
- * - Requested `scope` is bounded against the authority
- *   scope catalog (or the `defaultScope` when the catalog
- *   is empty). Unauthenticated registration MUST NOT
- *   self-grant arbitrary scopes.
+ * - Incoming `scope` request parameters are TOLERATED and
+ *   IGNORED (no `invalid_scope` rejection; the response is
+ *   always `201` with `scope: ""`). The pre-PR3
+ *   `boundRegistrationScope` + catalog gate is gone.
  * - Errors are sanitized: secrets are NEVER echoed in the
  *   response body, regardless of failure mode.
  * - Successful registrations are appended to the `audit_log`
@@ -73,8 +77,6 @@ import { type AuthorityDatabase } from "../db/connection.js";
 import { auditAppend } from "../admin/audit.js";
 import { createClient } from "../admin/clients.js";
 import { isLoopbackRedirectUri } from "./authorize.js";
-import { boundRegistrationScope } from "./scopes.js";
-import { listScopes } from "../admin/scopes.js";
 import { BodyTooLargeError, readJsonBody } from "./bodyReader.js";
 import { readClientIp } from "./clientIp.js";
 import { createLogger, type Logger } from "@customized-mcps/mcp-http-base";
@@ -87,9 +89,11 @@ import { createLogger, type Logger } from "@customized-mcps/mcp-http-base";
  */
 export type RegisterHandlerDeps = {
   db: AuthorityDatabase;
-  /** The authority's default scope (used when the catalog
-   *  is empty or the request omits `scope`). */
-  defaultScope: string;
+  /** @deprecated Retained for backward compatibility with
+   *  the v1 wiring in `index.ts`; the field is no longer
+   *  read (PR 3 of `remove-scope-authorization` ignores
+   *  scope). */
+  defaultScope?: string;
   /** Test-injection point for the client_id / client_secret
    *  generator. Production callers omit it. */
   generateId?: () => string;
@@ -378,26 +382,20 @@ export function createRegisterHandler(
         });
         return writeJson(res, 400, { error: authMethod.error });
       }
-      // 5. Bound the requested scope against the catalog
-      //    (or the default scope when the catalog is empty).
-      const catalog = await listScopes(deps.db);
-      const scopeResult = boundRegistrationScope(
-        typeof parsed.scope === "string" ? parsed.scope : "",
-        catalog.map((s) => s.name),
-        deps.defaultScope,
-      );
-      if (!scopeResult.ok) {
-        await recordDeniedAttempt(deps.db, logger, {
-          ts: now,
-          actor,
-          ip,
-          action: "client.register",
-          outcome: "denied",
-          reason: "invalid_scope",
-        });
-        return writeJson(res, 400, { error: "invalid_scope" });
-      }
-      const grantedScope = scopeResult.granted;
+      // 5. PR 3 of `remove-scope-authorization`: incoming
+      //    `scope` is tolerated and ignored. The
+      //    `boundRegistrationScope` + catalog gate is
+      //    gone; the response is always `201` with
+      //    `scope: ""` (the empty string, retained for
+      //    RFC 7591 compatibility). The newly-registered
+      //    client's `scopes` column is empty
+      //    (legacy/inert).
+      //    (The `parsed.scope` is read for shape
+      //    uniformity; the value is not echoed into the
+      //    response and is not used to bound the
+      //    registration.)
+      void parsed.scope;
+      const grantedScope = "";
       // 6. Generate the credentials.
       const clientId = generateId();
       const clientSecret = generateId();
@@ -407,11 +405,12 @@ export function createRegisterHandler(
       //    returned to the caller; the DB row stores the
       //    hash only. The pre-generated `clientSecret` is
       //    passed through so the stored hash matches the
-      //    value in the registration response.
+      //    value in the registration response. The
+      //    client's `scopes` column is `[]` (empty
+      //    array) — the field is INERT post-PR3.
       const result = await createClient(deps.db, {
         clientId,
         label: typeof parsed.client_name === "string" ? parsed.client_name : "",
-        scopes: parseScopeListFromString(grantedScope),
         redirectUris,
         plaintextSecret: clientSecret,
         now,
@@ -458,7 +457,8 @@ export function createRegisterHandler(
       // 9. Build the RFC 7591 response. The `client_secret`
       //    is the plaintext; the caller is responsible for
       //    showing it once to the operator and never
-      //    persisting it.
+      //    persisting it. The `scope` field is the empty
+      //    string (PR 3 of `remove-scope-authorization`).
       const response: RegistrationResponse = {
         client_id: clientId,
         client_secret: clientSecret,
@@ -663,16 +663,6 @@ function parseAuthMethod(
     return { ok: false, error: "invalid_client_metadata" };
   }
   return { ok: true, value: raw };
-}
-
-/**
- * Parse a space-delimited scope string into a list. Empty
- * input is `[]`. Duplicates are preserved (the same
- * dedup-free policy the other scope helpers use).
- */
-function parseScopeListFromString(raw: string): string[] {
-  if (raw.length === 0) return [];
-  return raw.split(/\s+/).filter((s) => s.length > 0);
 }
 
 /**

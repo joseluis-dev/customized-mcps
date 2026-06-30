@@ -69,7 +69,6 @@ describe("public API surface (value-level exports)", () => {
     expect(typeof PublicApi.createShutdownController).toBe("function");
     expect(typeof PublicApi.createLogger).toBe("function");
     expect(typeof PublicApi.parseHttpConfig).toBe("function");
-    expect(typeof PublicApi.matchScope).toBe("function");
     expect(typeof PublicApi.redactSensitive).toBe("function");
   });
 
@@ -90,6 +89,67 @@ describe("public API surface (value-level exports)", () => {
     // backend. Only the OAuth / JWKS authorities remain.
     expect((PublicApi as Record<string, unknown>).LocalRosterAuthority).toBeUndefined();
     expect((PublicApi as Record<string, unknown>).LocalRosterAuthorityOptions).toBeUndefined();
+  });
+
+  it("does NOT re-export `matchScope` (PR 1 task 1.2: the resolver has zero production callers)", () => {
+    // The `remove-scope-authorization` change (PR 1) deletes the
+    // `matchScope` resolver from the shared base. The previous
+    // contract — the resource server no longer matches scopes;
+    // the admin app resolves them on its own. Public consumers
+    // MUST NOT find `matchScope` on the package surface.
+    //
+    // PR 4 of the same chain removes the cross-slice compat
+    // shim (`SCOPE_PATTERN` / `isValidScope` / `Scope`) that
+    // was kept in PR 3 so the mcp-oauth-admin admin module
+    // could keep compiling until PR 4 wires out the admin-side
+    // scope CRUD. The compat shim is GONE in PR 4.
+    const api = PublicApi as Record<string, unknown>;
+    expect(api.matchScope).toBeUndefined();
+    expect(api.SCOPE_PATTERN).toBeUndefined();
+    expect(api.isValidScope).toBeUndefined();
+
+    // The same absence MUST hold in the on-disk source — a future
+    // re-export would fail this test even if the .d.ts was stale.
+    const here = packageRoot();
+    const indexSrc = readFileSync(join(here, "src", "index.ts"), "utf8");
+    const code = indexSrc
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    expect(code).not.toMatch(/\bmatchScope\b/);
+    // `SCOPE_PATTERN` and `isValidScope` are not in the index
+    // exports after PR 4. The substring `Scope` may appear in
+    // other identifiers (e.g. the `dcrScopesSupported`
+    // property names), so we assert specifically the
+    // identifier shape that the compat shim would have used.
+    expect(code).not.toMatch(/\bSCOPE_PATTERN\b/);
+    expect(code).not.toMatch(/\bisValidScope\b/);
+    // The `type Scope` re-export is gone. We use a word-boundary
+    // match against `Scope` as a bare identifier (no dot or
+    // other separators), which catches both `type Scope` and
+    // the lone `Scope` token from the PR 3 compat shim.
+    expect(code).not.toMatch(/\bScope\b/);
+  });
+
+  it("PR 4 contract: auth.ts is a no-op (the compat shim is fully removed)", () => {
+    // PR 4 of `remove-scope-authorization`: the
+    // `SCOPE_PATTERN` regex, the `isValidScope` predicate,
+    // and the `Scope` type alias are no longer in
+    // `packages/mcp-http-base/src/auth.ts` either. The
+    // admin module's `agents.ts` / `clients.ts` /
+    // `router.ts` no longer import any of them. This
+    // test pins the on-disk removal so a future regression
+    // that re-introduces the shim is caught.
+    const here = packageRoot();
+    const authSrc = readFileSync(join(here, "src", "auth.ts"), "utf8");
+    const code = authSrc
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/^\s*\/\/.*$/gm, "");
+    expect(code).not.toMatch(/\bSCOPE_PATTERN\b/);
+    expect(code).not.toMatch(/\bisValidScope\b/);
+    // `Scope` as a type alias: `type Scope` or `type Scope =`. We
+    // do NOT match the bare `Scope` token because the JSDoc may
+    // contain the word in prose (e.g. "scope authorization").
+    expect(code).not.toMatch(/type\s+Scope\b/);
   });
 });
 
@@ -139,7 +199,6 @@ describe("public API surface (type-level exports via declaration source)", () =>
     const here = packageRoot();
     const indexSrc = readFileSync(join(here, "src", "index.ts"), "utf8");
     expect(indexSrc).toMatch(/JSON_RPC_ERROR_CODES/);
-    expect(indexSrc).toMatch(/isValidScope/);
   });
 
   it("sanity: the .d.ts file exists after build", () => {

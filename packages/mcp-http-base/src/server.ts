@@ -120,12 +120,6 @@ export type HttpMcpServerOptions = {
    * derive from this value.
    */
   resourceServerUrl?: string;
-  /**
-   * Optional scope catalog. The well-known handler invokes this on
-   * every request so the value is always fresh; defaults to `() => []`
-   * when unset.
-   */
-  scopeCatalog?: () => string[];
 };
 
 export type HttpMcpServerHandle = {
@@ -683,22 +677,24 @@ export function createHttpMcpServer(options: HttpMcpServerOptions): HttpMcpServe
    * `resource` is the resource server's own public base URL (per-request
    * `Host` fallback applies); `authorization_servers` is the authority's
    * issuer URL; `bearer_methods_supported` is `["header"]`; `scopes_supported`
-   * is the optional `scopeCatalog` result (defaulting to `[]`).
+   * is hardcoded to `[]` (per PR 1 of `remove-scope-authorization`).
+   * The previous `scopeCatalog` option is removed: scope authorization
+   * is inert and the well-known field is retained for RFC 9728 schema
+   * compliance, not as a source of authorization.
    */
   function handleProtectedResourceMetadata(req: IncomingMessage, res: ServerResponse): void {
     const baseUrl = resolveBaseUrlFor(req);
-    const scopes = options.scopeCatalog?.() ?? [];
     const body: ProtectedResourceMetadata = {
       resource: baseUrl,
       authorization_servers: [options.authorityUrl],
       bearer_methods_supported: ["header"],
-      scopes_supported: scopes,
+      scopes_supported: [],
     };
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json; charset=utf-8");
-    // The metadata is dynamic (per-request `Host` fallback + per-request
-    // catalog). `no-store` prevents a stale `resource` from leaking
-    // after a deployment that flips the env var.
+    // The metadata is dynamic (per-request `Host` fallback). `no-store`
+    // prevents a stale `resource` from leaking after a deployment that
+    // flips the env var.
     res.setHeader("Cache-Control", "no-store");
     res.end(JSON.stringify(body));
   }

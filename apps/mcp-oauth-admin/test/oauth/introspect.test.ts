@@ -12,6 +12,15 @@
  * `{ error: "invalid_request" }`, which the
  * wrapper rejected as an unexpected body shape.
  *
+ * PR 3 of `remove-scope-authorization` additionally
+ * removes the `scope` field from the introspection
+ * response body. The introspect endpoint MUST return
+ * the canonical RFC 7662 shape (`active`, `sub`,
+ * `aud`, `iss`, `iat`, `exp`) WITHOUT a `scope`
+ * field. A legacy client that still expects `scope`
+ * will see `undefined` (the field is omitted from
+ * the JSON).
+ *
  * Test layer: integration. We mount the
  * introspect handler on a real `node:http`
  * listener and POST form-encoded bodies.
@@ -20,8 +29,8 @@
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { openDatabase, initializeSchema } from "../../../mcp-oauth-admin/dist/db/index.js";
-import { createIntrospectHandler, type IntrospectHandlerDeps } from "../../../mcp-oauth-admin/dist/oauth/introspect.js";
+import { openDatabase, initializeSchema } from "../../src/db/index.js";
+import { createIntrospectHandler, type IntrospectHandlerDeps } from "../../src/oauth/introspect.js";
 
 function postForm(
   port: number,
@@ -168,5 +177,100 @@ describe("oauth/introspect — empty token regression (PR 3 W4-style)", () => {
       },
     );
     expect(res.status).toBe(405);
+  });
+});
+
+describe("oauth/introspect — response body has no `scope` field (PR 3 of remove-scope-authorization)", () => {
+  // The mcp-oauth-authority spec requires the
+  // introspection response to omit `scope`:
+  //   "Introspection: `active`, `sub`, `aud`, `iss`,
+  //    `iat`, `exp`. No `scope`."
+  //
+  // The endpoint returns the canonical RFC 7662
+  // shape with the `scope` field omitted. This
+  // describe pins the contract for a non-empty
+  // (active) token: even when the token's payload
+  // has a `scope` / `scopes` claim (e.g. a
+  // pre-PR3 token), the introspection body MUST NOT
+  // include `scope`.
+  let server: Server;
+  let port: number;
+  let db: ReturnType<typeof openDatabase>;
+  let deps: IntrospectHandlerDeps;
+
+  beforeEach(async () => {
+    db = openDatabase({ path: ":memory:" });
+    await initializeSchema(db);
+    deps = {
+      db,
+      issuer: "http://127.0.0.1:3002",
+      audience: "mcp:readonly-sql",
+    };
+    const handler = createIntrospectHandler(deps);
+    server = createServer((req, res) => {
+      if (req.url === "/oauth/introspect") {
+        return handler(req, res);
+      }
+      res.statusCode = 404;
+      res.setHeader("Content-Type", "application/json");
+      res.end(JSON.stringify({ error: "not_found" }));
+    });
+    await new Promise<void>((resolveP) =>
+      server.listen(0, "127.0.0.1", () => resolveP()),
+    );
+    port = (server.address() as AddressInfo).port;
+  });
+
+  afterEach(async () => {
+    await new Promise<void>((resolveP, rejectP) => {
+      server.close((err) => (err ? rejectP(err) : resolveP()));
+    });
+    await db.close();
+  });
+
+  it("does NOT include a `scope` field in the response body, even when the token's payload would have a `scope` claim (defensive shape)", async () => {
+    // Synthesize a JWT whose payload has a `scope`
+    // claim (a legacy token shape). The introspect
+    // endpoint MUST NOT echo the `scope` claim into
+    // the response body.
+    const { generateKeyPair, exportJWK, exportPKCS8, calculateJwkThumbprint, SignJWT, importPKCS8 } = await import("jose");
+    const { setActiveSigningKey } = await import("../../src/oauth/keys.js");
+    const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
+    const publicJwk = await exportJWK(publicKey);
+    const kid = await calculateJwkThumbprint(publicJwk);
+    publicJwk.kid = kid;
+    publicJwk.alg = "RS256";
+    publicJwk.use = "sig";
+    const privatePem = await exportPKCS8(privateKey);
+    await setActiveSigningKey(db, {
+      id: kid,
+      algorithm: "RS256",
+      publicJwk,
+      privatePem,
+    });
+    const now = Math.floor(Date.now() / 1000);
+    const token = await new SignJWT({
+      sub: "user:1",
+      aud: "mcp:readonly-sql",
+      iss: "http://127.0.0.1:3002",
+      // The legacy `scope` and `scopes` claims are
+      // present in the payload, but the introspect
+      // endpoint MUST NOT surface them.
+      scope: "read:bi_catastro",
+      scopes: ["read:bi_catastro"],
+      iat: now,
+      nbf: now,
+      exp: now + 3600,
+    })
+      .setProtectedHeader({ alg: "RS256", kid, typ: "JWT" })
+      .sign(await importPKCS8(privatePem, "RS256"));
+
+    const res = await postForm(port, `token=${encodeURIComponent(token)}`);
+    expect(res.status).toBe(200);
+    expect(res.body).toBeDefined();
+    // The `active` field is present.
+    expect(res.body["active"]).toBe(true);
+    // The `scope` field is OMITTED from the body.
+    expect(res.body["scope"]).toBeUndefined();
   });
 });
