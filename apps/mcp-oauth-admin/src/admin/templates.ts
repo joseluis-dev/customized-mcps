@@ -74,6 +74,23 @@ export function escapeHtml(value: string | number | null | undefined): string {
  * for the `X-CSRF-Token` header. For the current
  * form-based flow, the meta tag is informational; the
  * server's actual check uses the `_csrf` form input.
+ *
+ * The page is dark-only (the mcp-admin-ui spec is
+ * explicit). The `<meta name="color-scheme" content="dark">`
+ * tag tells the user agent to render form controls,
+ * scrollbars, and the canvas in dark mode before any
+ * CSS loads. The `:root { color-scheme: dark }` rule
+ * is the matching CSS hook for any nested element /
+ * pseudo class that doesn't inherit from the meta tag.
+ * The two together guarantee the page renders dark
+ * regardless of the user's system preference.
+ *
+ * Class names are preserved from the previous light
+ * theme so the existing inline forms (warn, error,
+ * muted, btn, btn-danger, nav, code) keep styling after
+ * the CSS swap. The colors below are GitHub Dark tokens
+ * (the spec's reference palette); text vs. background
+ * contrast is WCAG AA.
  */
 export function renderLayout(options: {
   title: string;
@@ -87,22 +104,32 @@ export function renderLayout(options: {
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="color-scheme" content="dark">
 <title>${escapeHtml(options.title)}</title>
 ${meta}
 <style>
-body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2rem; max-width: 1100px; color: #1a1a1a; }
-h1, h2, h3 { font-weight: 600; }
+:root { color-scheme: dark; }
+html, body { background: #0d1117; color: #e6edf3; }
+body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; margin: 2rem; max-width: 1100px; }
+h1, h2, h3 { font-weight: 600; color: #e6edf3; }
+a { color: #58a6ff; }
+a:visited { color: #8b949e; }
 table { border-collapse: collapse; width: 100%; margin: 1rem 0; }
-th, td { border: 1px solid #d0d0d0; padding: 0.5rem 0.75rem; text-align: left; vertical-align: top; }
-th { background: #f6f6f6; }
-.warn { background: #fff8e1; border: 1px solid #f0c040; padding: 1rem; margin: 1rem 0; }
-.error { background: #fde8e8; border: 1px solid #c0392b; color: #7d1f1f; padding: 0.75rem 1rem; margin: 1rem 0; }
-.muted { color: #666; font-size: 0.9em; }
-.btn { display: inline-block; padding: 0.4rem 0.9rem; background: #2563eb; color: white; border: 0; border-radius: 4px; cursor: pointer; text-decoration: none; }
-.btn-danger { background: #b91c1c; }
+th, td { border: 1px solid #30363d; padding: 0.5rem 0.75rem; text-align: left; vertical-align: top; }
+th { background: #161b22; color: #e6edf3; }
+.warn { background: #1c2128; border: 1px solid #d29922; color: #e6edf3; padding: 1rem; margin: 1rem 0; }
+.error { background: #1c2128; border: 1px solid #f85149; color: #f85149; padding: 0.75rem 1rem; margin: 1rem 0; }
+.muted { color: #7d8590; font-size: 0.9em; }
+.btn { display: inline-block; padding: 0.4rem 0.9rem; background: #238636; color: #ffffff; border: 1px solid #30363d; border-radius: 4px; cursor: pointer; text-decoration: none; }
+.btn:hover { background: #2ea043; }
+.btn-danger { background: #6e1212; color: #ffffff; }
+.btn-danger:hover { background: #8b1a1a; }
 nav { margin-bottom: 1.5rem; }
 nav a { margin-right: 1rem; }
-code { background: #f0f0f0; padding: 0.1rem 0.3rem; border-radius: 3px; }
+code { background: #161b22; color: #e6edf3; padding: 0.1rem 0.3rem; border-radius: 3px; }
+input, select, textarea { background: #0d1117; color: #e6edf3; border: 1px solid #30363d; padding: 0.3rem 0.5rem; border-radius: 3px; }
+input[type="submit"], input[type="button"] { background: #238636; color: #ffffff; cursor: pointer; }
+label { color: #e6edf3; }
 </style>
 </head>
 <body>
@@ -183,7 +210,7 @@ export function renderAgentsList(options: {
 }): string {
   const rows =
     options.agents.length === 0
-      ? `<tr><td colspan="6" class="muted">No agents yet.</td></tr>`
+      ? `<tr><td colspan="7" class="muted">No agents yet.</td></tr>`
       : options.agents
           .map(
             (a) => `
@@ -193,6 +220,13 @@ export function renderAgentsList(options: {
   <td>${a.enabled ? "yes" : "no"}</td>
   <td>${a.requireChangeOnFirstLogin ? "yes" : "no"}</td>
   <td>${escapeHtml(formatDate(a.createdAt))}</td>
+  <td>
+    <form action="/admin/agents/${a.id}/scopes" method="POST" style="display:inline">
+      <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
+      <input type="text" name="scopes" value="${escapeHtml(a.scopes.join(" "))}" size="20" placeholder="read:resource">
+      <button type="submit" class="btn">Save scopes</button>
+    </form>
+  </td>
   <td>
     <form action="/admin/agents/${a.id}/${a.enabled ? "disable" : "enable"}" method="POST" style="display:inline">
       <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
@@ -217,7 +251,7 @@ export function renderAgentsList(options: {
 </nav>
 <h1>Agents</h1>
 <table>
-  <thead><tr><th>Username</th><th>Scopes</th><th>Enabled</th><th>Rotation required</th><th>Created</th><th>Actions</th></tr></thead>
+  <thead><tr><th>Username</th><th>Current scopes</th><th>Enabled</th><th>Rotation required</th><th>Created</th><th>Edit scopes</th><th>Actions</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>
 <h2>Create agent</h2>
@@ -258,7 +292,7 @@ export function renderClientsList(options: {
 }): string {
   const rows =
     options.clients.length === 0
-      ? `<tr><td colspan="5" class="muted">No clients yet.</td></tr>`
+      ? `<tr><td colspan="6" class="muted">No clients yet.</td></tr>`
       : options.clients
           .map(
             (c) => `
@@ -268,6 +302,13 @@ export function renderClientsList(options: {
   <td>${c.scopes.map(escapeHtml).join(", ")}</td>
   <td>${escapeHtml(formatDate(c.createdAt))}</td>
   <td>${c.lastUsedAt === null ? "<span class=\"muted\">never</span>" : escapeHtml(formatDate(c.lastUsedAt))}</td>
+  <td>
+    <form action="/admin/clients/${c.id}/scopes" method="POST" style="display:inline">
+      <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
+      <input type="text" name="scopes" value="${escapeHtml(c.scopes.join(" "))}" size="20" placeholder="read:resource">
+      <button type="submit" class="btn">Save scopes</button>
+    </form>
+  </td>
   <td>
     <form action="/admin/clients/${c.id}/rotate" method="POST" style="display:inline">
       <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
@@ -292,7 +333,7 @@ export function renderClientsList(options: {
 </nav>
 <h1>OAuth clients</h1>
 <table>
-  <thead><tr><th>clientId</th><th>Label</th><th>Scopes</th><th>Created</th><th>Last used</th><th>Actions</th></tr></thead>
+  <thead><tr><th>clientId</th><th>Label</th><th>Current scopes</th><th>Created</th><th>Last used</th><th>Edit scopes</th><th>Actions</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>
 <h2>Create client</h2>
@@ -329,17 +370,26 @@ export function renderClientCreated(options: {
 /** Render the scope catalog. */
 export function renderScopesList(options: {
   scopes: ScopeRecord[];
+  /**
+   * Map of scope name → in-use count (number of agents
+   * + clients currently bound to the scope). The router
+   * computes the counts via `scopeInUse(name)` and
+   * passes them in one shot. Missing entries default to
+   * `0` so the template never throws on a stale map.
+   */
+  inUse: Record<string, number>;
   csrfToken: string;
 }): string {
   const rows =
     options.scopes.length === 0
-      ? `<tr><td colspan="3" class="muted">No scopes in the catalog.</td></tr>`
+      ? `<tr><td colspan="4" class="muted">No scopes in the catalog.</td></tr>`
       : options.scopes
           .map(
             (s) => `
 <tr>
   <td><code>${escapeHtml(s.name)}</code></td>
   <td>${escapeHtml(s.description)}</td>
+  <td class="inuse">${escapeHtml(String(options.inUse[s.name] ?? 0))}</td>
   <td>
     <form action="/admin/scopes/${encodeURIComponent(s.name)}/delete" method="POST" style="display:inline" onsubmit="return confirm('Delete scope ${escapeHtml(s.name)}?')">
       <input type="hidden" name="_csrf" value="${escapeHtml(options.csrfToken)}">
@@ -360,7 +410,7 @@ export function renderScopesList(options: {
 </nav>
 <h1>Scope catalog</h1>
 <table>
-  <thead><tr><th>Name</th><th>Description</th><th>Actions</th></tr></thead>
+  <thead><tr><th>Name</th><th>Description</th><th>In use</th><th>Actions</th></tr></thead>
   <tbody>${rows}</tbody>
 </table>
 <h2>Add scope</h2>

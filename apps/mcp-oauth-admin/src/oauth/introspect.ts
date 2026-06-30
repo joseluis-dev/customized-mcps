@@ -25,6 +25,7 @@ import { jwtVerify, errors as joseErrors } from "jose";
 import { importSigningPrivateKey, loadActiveSigningKey } from "./keys.js";
 import { SCOPE_PATTERN } from "@customized-mcps/mcp-http-base";
 import type { AuthorityDatabase } from "../db/connection.js";
+import { BodyTooLargeError, readFormBody } from "./bodyReader.js";
 
 /**
  * The dependencies the introspect handler needs. We share
@@ -52,7 +53,19 @@ export function createIntrospectHandler(
     if (req.method !== "POST") {
       return writeJson(res, 405, { error: "invalid_request" });
     }
-    const params = await readFormBody(req);
+    let params: URLSearchParams;
+    try {
+      params = await readFormBody(req);
+    } catch (e) {
+      // Mirror the token handler's typed error boundary:
+      // an oversized body is `400 invalid_request`, NOT a
+      // connection reset. The stream is paused so we can
+      // write the response cleanly.
+      if (e instanceof BodyTooLargeError) {
+        return writeJson(res, 400, { error: "invalid_request" });
+      }
+      throw e;
+    }
     const token = params.get("token") ?? "";
     // Empty / missing `token` is a valid RFC 7662 request:
     // the spec says the server MUST return
@@ -134,28 +147,6 @@ export async function introspect(
     if (e instanceof joseErrors.JWSSignatureVerificationFailed) return { active: false };
     return { active: false };
   }
-}
-
-async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
-  return new Promise((resolveP, rejectP) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    const cap = 64 * 1024;
-    req.on("data", (chunk: Buffer) => {
-      total += chunk.length;
-      if (total > cap) {
-        rejectP(new Error("request body too large"));
-        req.destroy();
-        return;
-      }
-      chunks.push(chunk);
-    });
-    req.on("end", () => {
-      const text = Buffer.concat(chunks).toString("utf8");
-      resolveP(new URLSearchParams(text));
-    });
-    req.on("error", rejectP);
-  });
 }
 
 function writeJson(

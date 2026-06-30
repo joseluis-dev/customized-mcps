@@ -50,6 +50,8 @@ import { setActiveSigningKey } from "./oauth/keys.js";
 import { createJwksHandler, createOidcDiscoveryHandler } from "./oauth/jwks.js";
 import { createTokenHandler, type TokenHandlerDeps } from "./oauth/token.js";
 import { createIntrospectHandler, type IntrospectHandlerDeps } from "./oauth/introspect.js";
+import { createAuthorizeHandler, type AuthorizeDeps } from "./oauth/authorize.js";
+import { createRegisterHandler, type RegisterHandlerDeps } from "./oauth/register.js";
 import { createAdminRouter, type AdminRouterDeps } from "./admin/router.js";
 import { generateSessionSecret } from "./admin/session.js";
 import { ensureBootstrapAdmin, resolveBootstrapEnv, shouldWarnBootstrapEnv } from "./admin/bootstrap.js";
@@ -98,6 +100,13 @@ function readHttpConfig(): ReturnType<typeof parseHttpConfig> {
     MCP_AUTHORITY_JWKS_TTL_S: undefined,
     MCP_AUTHORITY_LEEWAY_S: undefined,
     MCP_AUTHORITY_FETCH_TIMEOUT_MS: undefined,
+    // Resource-server-side env var; the authority does not act as a
+    // resource server so the value is intentionally undefined (the
+    // shared base falls back to the per-request `Host` header when
+    // needed). Keeping the field present keeps the type contract
+    // honest — a future maintainer who copies one of these lines
+    // sees the "intentionally undefined" comment in context.
+    MCP_RESOURCE_SERVER_URL: undefined,
   });
 }
 
@@ -134,7 +143,19 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
   // Session secret: regenerated on every restart (so
   // sessions are invalidated). The secret is NEVER logged.
   const sessionSecret = generateSessionSecret();
-  // OAuth endpoint deps.
+  // OAuth endpoint deps. The `trustProxy` flag is the
+  // single opt-in that activates the `X-Forwarded-For`
+  // audit / rate-limit IP path. The flag is wired from
+  // `MCP_HTTP_BEHIND_PROXY=true` (the same env that
+  // `parseHttpConfig` uses to allow non-loopback binds).
+  // When the operator runs the authority behind a
+  // TLS-terminating reverse proxy, they MUST set the
+  // env so the audit `ip` column reflects the real
+  // client IP and not the proxy's loopback peer. The
+  // default is `false` so a spoofed XFF cannot bypass
+  // the per-IP DCR rate-limit or distort the audit
+  // attribution on a direct-bind deployment.
+  const trustProxy = httpConfig.behindProxy;
   const tokenDeps: TokenHandlerDeps = {
     db,
     issuer: `http://${httpConfig.host}:${httpConfig.port}`,
@@ -142,11 +163,34 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
     defaultScope: process.env.MCP_OAUTH_DEFAULT_SCOPE ?? "read:bi_catastro",
     accessTokenTtlSeconds: 3600,
     activeKey,
+    trustProxy,
   };
   const introspectDeps: IntrospectHandlerDeps = {
     db,
     issuer: `http://${httpConfig.host}:${httpConfig.port}`,
     audience: tokenDeps.audience,
+  };
+  // Authorize handler deps. The handler reuses the admin
+  // session secret (the spec's "one login surface" rule)
+  // and the authority's `defaultScope` for the consented
+  // scope set when the request omits one. `secure` mirrors
+  // the admin router's flag so the session cookie is marked
+  // `Secure` on non-loopback deployments.
+  const authorizeDeps: AuthorizeDeps = {
+    db,
+    sessionSecret,
+    secure: !["127.0.0.1", "::1", "localhost"].includes(httpConfig.host),
+    defaultScope: tokenDeps.defaultScope,
+    trustProxy,
+  };
+  // Dynamic Client Registration (RFC 7591) deps. The
+  // handler is unauthenticated; the default scope is the
+  // authority's `defaultScope` and is used when the
+  // scope catalog is empty.
+  const registerDeps: RegisterHandlerDeps = {
+    db,
+    defaultScope: tokenDeps.defaultScope,
+    trustProxy,
   };
   // Admin router deps.
   const adminDeps: AdminRouterDeps = {
@@ -190,6 +234,8 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
   const adminRouter = createAdminRouter(adminDeps);
   const tokenHandler = createTokenHandler(tokenDeps);
   const introspectHandler = createIntrospectHandler(introspectDeps);
+  const authorizeHandler = createAuthorizeHandler(authorizeDeps);
+  const registerHandler = createRegisterHandler(registerDeps);
   const jwksHandler = createJwksHandler({ db });
   const oidcHandler = createOidcDiscoveryHandler({ issuer: tokenDeps.issuer });
   const server = createServer((req, res) => {
@@ -203,11 +249,17 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
     if (url === "/.well-known/openid-configuration") {
       return oidcHandler(req, res);
     }
+    if (url.startsWith("/oauth/authorize")) {
+      return authorizeHandler(req, res);
+    }
     if (url === "/oauth/token") {
       return tokenHandler(req, res);
     }
     if (url === "/oauth/introspect") {
       return introspectHandler(req, res);
+    }
+    if (url === "/oauth/register") {
+      return registerHandler(req, res);
     }
     res.statusCode = 404;
     res.setHeader("Content-Type", "application/json");

@@ -32,13 +32,19 @@ import { withSingleWriter, type AuthorityDatabase } from "../db/connection.js";
 import { hashPassword } from "../oauth/passwords.js";
 
 /** The public client record. The shape is the row read from
- *  `clients` with the JSON `scopes` column decoded. We do NOT
- *  include `clientSecretHash` — that is internal state. */
+ *  `clients` with the JSON `scopes` + `redirectUris` columns
+ *  decoded. We do NOT include `clientSecretHash` — that is
+ *  internal state. The `redirectUris` list is `[]` for
+ *  pre-registered clients that pre-date the DCR work; the
+ *  authorize handler treats the empty list as "use the
+ *  loopback-only rule" (RFC 8252 §7.3). The DCR path is the
+ *  only path that populates the list with one or more entries. */
 export type ClientRecord = {
   id: number;
   clientId: string;
   label: string;
   scopes: string[];
+  redirectUris: string[];
   createdAt: number;
   lastUsedAt: number | null;
 };
@@ -47,12 +53,27 @@ export type CreateClientInput = {
   clientId: string;
   label?: string;
   scopes: string[];
+  /** Optional: DCR-supplied redirect URI list. Empty when the
+   *  client is pre-registered (the admin UI does not surface
+   *  this field). Each URI MUST satisfy the loopback rule
+   *  (RFC 8252 §7.3); the caller validates the list before
+   *  passing it in. */
+  redirectUris?: string[];
+  /** Optional: caller-supplied plaintext secret. When
+   *  present, the helper stores the `argon2id` hash of
+   *  the supplied value (the plaintext is NOT
+   *  regenerated). When absent, a fresh secret is
+   *  generated. The DCR handler passes its
+   *  pre-generated secret here so the value returned
+   *  in the registration response is the same one
+   *  whose hash is persisted. */
+  plaintextSecret?: string;
   now: number;
 };
 
 export type CreateClientResult =
   | { ok: true; client: ClientRecord; plaintextSecret: string }
-  | { ok: false; reason: "invalid_clientId" | "invalid_label" | "invalid_scope" | "duplicate" };
+  | { ok: false; reason: "invalid_clientId" | "invalid_label" | "invalid_scope" | "invalid_secret" | "duplicate" };
 
 export type RotateSecretResult =
   | { ok: true; plaintextSecret: string }
@@ -67,6 +88,25 @@ function generateClientSecret(): string {
   // 32 bytes → 43 base64url chars. ~192 bits of entropy.
   return randomBytes(32).toString("base64url");
 }
+
+/**
+ * The minimum acceptable length for a caller-supplied
+ * `plaintextSecret`. The auto-generated secret is 43
+ * base64url chars (32 random bytes); the minimum allows
+ * for a caller that generates a slightly shorter but
+ * still strong secret while rejecting obvious mistakes
+ * (empty string, single word, etc.). 16 chars is the
+ * floor for ≈ 128 bits at typical printable-ASCII
+ * entropy; a caller that knows the right answer will
+ * pass the auto-generated value.
+ *
+ * When the caller-supplied value is too short, the helper
+ * returns `{ ok: false, reason: "invalid_secret" }` so
+ * the DCR / admin router can surface a sanitized 400.
+ * The constant is exported so tests can pin the contract
+ * without duplicating the magic number.
+ */
+export const MIN_PLAINTEXT_SECRET_LENGTH = 16;
 
 /**
  * Create a new OAuth client. Returns a one-time plaintext
@@ -86,14 +126,26 @@ export async function createClient(
       return { ok: false, reason: "invalid_scope" };
     }
   }
-  const plaintext = generateClientSecret();
+  // Sanity-check a caller-supplied plaintext secret. The
+  // check fires only when the caller passed a value
+  // (the DCR handler / admin UI's auto-generated path
+  // omits the field; the check is silent on that path).
+  // The `invalid_secret` reason is a stable code (the
+  // router / DCR handler map it to a sanitized 400); the
+  // response body NEVER echoes the supplied value.
+  if (typeof input.plaintextSecret === "string" &&
+      input.plaintextSecret.length < MIN_PLAINTEXT_SECRET_LENGTH) {
+    return { ok: false, reason: "invalid_secret" };
+  }
+  const plaintext = input.plaintextSecret ?? generateClientSecret();
   const secretHash = await hashPassword(plaintext);
+  const redirectUris = input.redirectUris ?? [];
   try {
     const inserted = await withSingleWriter(db, async (trx) => {
       await trx.execute(
-        `INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt)
-         VALUES (?, ?, ?, ?, ?)`,
-        [clientId, secretHash, label, JSON.stringify(input.scopes), input.now],
+        `INSERT INTO clients (clientId, clientSecretHash, label, scopes, redirectUris, createdAt)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [clientId, secretHash, label, JSON.stringify(input.scopes), JSON.stringify(redirectUris), input.now],
       );
       const rows = await trx.select<{ id: number }>(
         "SELECT id FROM clients WHERE clientId = ?",
@@ -110,6 +162,7 @@ export async function createClient(
       clientId,
       label,
       scopes: [...input.scopes],
+      redirectUris: [...redirectUris],
       createdAt: input.now,
       lastUsedAt: null,
     };
@@ -129,10 +182,11 @@ export async function listClients(db: AuthorityDatabase): Promise<ClientRecord[]
     clientId: string;
     label: string;
     scopes: string;
+    redirectUris: string;
     createdAt: number;
     lastUsedAt: number | null;
   }>(
-    `SELECT id, clientId, label, scopes, createdAt, lastUsedAt
+    `SELECT id, clientId, label, scopes, redirectUris, createdAt, lastUsedAt
      FROM clients ORDER BY createdAt DESC, id DESC LIMIT 1000`,
   );
   return rows.map(rowToClient);
@@ -147,10 +201,11 @@ export async function getClientById(
     clientId: string;
     label: string;
     scopes: string;
+    redirectUris: string;
     createdAt: number;
     lastUsedAt: number | null;
   }>(
-    `SELECT id, clientId, label, scopes, createdAt, lastUsedAt
+    `SELECT id, clientId, label, scopes, redirectUris, createdAt, lastUsedAt
      FROM clients WHERE id = ? LIMIT 1`,
     [id],
   );
@@ -167,10 +222,11 @@ export async function getClientByClientId(
     clientId: string;
     label: string;
     scopes: string;
+    redirectUris: string;
     createdAt: number;
     lastUsedAt: number | null;
   }>(
-    `SELECT id, clientId, label, scopes, createdAt, lastUsedAt
+    `SELECT id, clientId, label, scopes, redirectUris, createdAt, lastUsedAt
      FROM clients WHERE clientId = ? LIMIT 1`,
     [clientId],
   );
@@ -305,6 +361,7 @@ function rowToClient(r: {
   clientId: string;
   label: string;
   scopes: string;
+  redirectUris?: string;
   createdAt: number;
   lastUsedAt: number | null;
 }): ClientRecord {
@@ -313,6 +370,7 @@ function rowToClient(r: {
     clientId: r.clientId,
     label: r.label,
     scopes: parseScopeList(r.scopes),
+    redirectUris: parseScopeList(r.redirectUris ?? "[]"),
     createdAt: r.createdAt,
     lastUsedAt: r.lastUsedAt,
   };

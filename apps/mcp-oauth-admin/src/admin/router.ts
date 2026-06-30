@@ -45,6 +45,7 @@
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { randomBytes } from "node:crypto";
+import { SCOPE_PATTERN } from "@customized-mcps/mcp-http-base";
 import { withSingleWriter, type AuthorityDatabase } from "../db/connection.js";
 import {
   buildSetCookieHeader,
@@ -85,6 +86,7 @@ import {
   getClientById,
   listClients,
   rotateClientSecret,
+  setClientScopes,
   type ClientRecord,
 } from "./clients.js";
 import {
@@ -223,6 +225,9 @@ export function createAdminRouter(
       if (url.startsWith("/admin/agents/") && url.endsWith("/rotate") && req.method === "POST") {
         return handleRotateAgent(deps, req, res, session, url);
       }
+      if (url.startsWith("/admin/agents/") && url.endsWith("/scopes") && req.method === "POST") {
+        return handleSetAgentScopes(deps, body, req, res, session, url);
+      }
       if (url === ADMIN_PATHS.CLIENTS && req.method === "GET") {
         return serveClientsList(deps, res, session);
       }
@@ -234,6 +239,9 @@ export function createAdminRouter(
       }
       if (url.startsWith("/admin/clients/") && url.endsWith("/rotate") && req.method === "POST") {
         return handleRotateClient(deps, req, res, session, url);
+      }
+      if (url.startsWith("/admin/clients/") && url.endsWith("/scopes") && req.method === "POST") {
+        return handleSetClientScopes(deps, body, req, res, session, url);
       }
       if (url.startsWith("/admin/clients/") && url.endsWith("/delete") && req.method === "POST") {
         return handleDeleteClient(deps, req, res, session, url);
@@ -586,7 +594,12 @@ async function handleCreateAgent(
     return writeHtml(
       res,
       400,
-      appendError(renderAgentsList({ agents, csrfToken: session.csrfToken }), message),
+      renderListWithError(
+        "Agents",
+        renderAgentsList({ agents, csrfToken: session.csrfToken }),
+        message,
+        session.csrfToken,
+      ),
     );
   }
   await auditAppend(deps.db, {
@@ -644,9 +657,11 @@ async function serveAgentCreated(
     return writeHtml(
       res,
       200,
-      appendError(
+      renderListWithError(
+        "Agents",
         renderAgentsList({ agents, csrfToken: session.csrfToken }),
         "The one-time secret has been consumed. Refresh to see the agents list.",
+        session.csrfToken,
       ),
     );
   }
@@ -721,6 +736,60 @@ async function handleRotateAgent(
   return redirect(res, `/admin/agents/created?username=${encodeURIComponent(agent.username)}`);
 }
 
+async function handleSetAgentScopes(
+  deps: AdminRouterDeps,
+  body: URLSearchParams | null,
+  req: IncomingMessage,
+  res: ServerResponse,
+  session: AdminSession,
+  url: string,
+): Promise<void> {
+  // The route is `/admin/agents/:id/scopes`. The id MUST
+  // be a positive integer (same shape as the other
+  // agent routes).
+  const m = url.match(/^\/admin\/agents\/(\d+)\/scopes$/);
+  if (!m) return writeJson(res, 404, { error: "not_found" });
+  const id = Number(m[1]);
+  if (!Number.isInteger(id) || id <= 0) return writeJson(res, 404, { error: "not_found" });
+  // Parse the form: `scopes` is a space-separated list.
+  // An empty string is allowed (the agent has no scopes).
+  const params = body ?? new URLSearchParams();
+  const raw = (params.get("scopes") ?? "").trim();
+  const scopes = raw.length === 0 ? [] : raw.split(/\s+/);
+  // Validate against `SCOPE_PATTERN` BEFORE any DB write.
+  // An invalid scope MUST be rejected with a sanitized
+  // 400 and MUST NOT write to the audit log (the
+  // authority's contract: failed validation is a UI
+  // problem, not a state change).
+  for (const scope of scopes) {
+    if (!SCOPE_PATTERN.test(scope)) {
+      const agents = await listAgents(deps.db);
+      return writeHtml(
+        res,
+        400,
+        renderListWithError(
+          "Agents",
+          renderAgentsList({ agents, csrfToken: session.csrfToken }),
+          "One or more scopes are not valid.",
+          session.csrfToken,
+        ),
+      );
+    }
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const ok = await setAgentScopes(deps.db, id, scopes, now);
+  if (!ok) return writeJson(res, 404, { error: "not_found" });
+  await auditAppend(deps.db, {
+    ts: now,
+    actor: session.username,
+    action: "agent.set_scopes",
+    target: `user:${id}`,
+    ip: readIp(req),
+    outcome: "ok",
+  });
+  return redirect(res, "/admin/agents");
+}
+
 // -----------------------------------------------------------------------
 // Clients
 // -----------------------------------------------------------------------
@@ -763,7 +832,12 @@ async function handleCreateClient(
     return writeHtml(
       res,
       400,
-      appendError(renderClientsList({ clients, csrfToken: session.csrfToken }), message),
+      renderListWithError(
+        "Clients",
+        renderClientsList({ clients, csrfToken: session.csrfToken }),
+        message,
+        session.csrfToken,
+      ),
     );
   }
   await auditAppend(deps.db, {
@@ -812,9 +886,11 @@ async function serveClientCreated(
     return writeHtml(
       res,
       200,
-      appendError(
+      renderListWithError(
+        "Clients",
         renderClientsList({ clients, csrfToken: session.csrfToken }),
         "The one-time secret has been consumed. Refresh to see the clients list.",
+        session.csrfToken,
       ),
     );
   }
@@ -864,6 +940,54 @@ async function handleRotateClient(
   return redirect(res, `/admin/clients/created?client_id=${encodeURIComponent(client.clientId)}`);
 }
 
+async function handleSetClientScopes(
+  deps: AdminRouterDeps,
+  body: URLSearchParams | null,
+  req: IncomingMessage,
+  res: ServerResponse,
+  session: AdminSession,
+  url: string,
+): Promise<void> {
+  // Symmetric to `handleSetAgentScopes`. The id MUST be
+  // a positive integer; the form's `scopes` field is a
+  // space-separated list (an empty string is allowed).
+  const m = url.match(/^\/admin\/clients\/(\d+)\/scopes$/);
+  if (!m) return writeJson(res, 404, { error: "not_found" });
+  const id = Number(m[1]);
+  if (!Number.isInteger(id) || id <= 0) return writeJson(res, 404, { error: "not_found" });
+  const params = body ?? new URLSearchParams();
+  const raw = (params.get("scopes") ?? "").trim();
+  const scopes = raw.length === 0 ? [] : raw.split(/\s+/);
+  // Validate against `SCOPE_PATTERN` BEFORE any DB write.
+  for (const scope of scopes) {
+    if (!SCOPE_PATTERN.test(scope)) {
+      const clients = await listClients(deps.db);
+      return writeHtml(
+        res,
+        400,
+        renderListWithError(
+          "Clients",
+          renderClientsList({ clients, csrfToken: session.csrfToken }),
+          "One or more scopes are not valid.",
+          session.csrfToken,
+        ),
+      );
+    }
+  }
+  const now = Math.floor(Date.now() / 1000);
+  const ok = await setClientScopes(deps.db, id, scopes);
+  if (!ok) return writeJson(res, 404, { error: "not_found" });
+  await auditAppend(deps.db, {
+    ts: now,
+    actor: session.username,
+    action: "client.set_scopes",
+    target: `client:${id}`,
+    ip: readIp(req),
+    outcome: "ok",
+  });
+  return redirect(res, "/admin/clients");
+}
+
 async function handleDeleteClient(
   deps: AdminRouterDeps,
   req: IncomingMessage,
@@ -890,9 +1014,11 @@ async function handleDeleteClient(
       return writeHtml(
         res,
         409,
-        appendError(
+        renderListWithError(
+          "Clients",
           renderClientsList({ clients, csrfToken: session.csrfToken }),
           `Client has ${result.count} outstanding refresh token(s); revoke them first.`,
+          session.csrfToken,
         ),
       );
     }
@@ -919,7 +1045,24 @@ async function serveScopesList(
   session: AdminSession,
 ): Promise<void> {
   const scopes = await listScopes(deps.db);
-  writeHtml(res, 200, renderScopesList({ scopes, csrfToken: session.csrfToken }));
+  // The mcp-admin-ui spec requires the scopes list to
+  // show the in-use count (number of agents + clients
+  // currently bound to each scope). We call `scopeInUse`
+  // per scope and pass the counts in a name→count map.
+  // The helper is a single SQL COUNT per scope; the
+  // total is bounded by the catalog size, so the cost
+  // is O(scopes) and acceptable for the admin UI's
+  // small-scale catalog.
+  const inUse: Record<string, number> = {};
+  for (const s of scopes) {
+    const usage = await scopeInUse(deps.db, s.name);
+    inUse[s.name] = usage.count;
+  }
+  writeHtml(
+    res,
+    200,
+    renderScopesList({ scopes, inUse, csrfToken: session.csrfToken }),
+  );
 }
 
 async function handleCreateScope(
@@ -1126,14 +1269,41 @@ function writeHtmlInline(html: string): string {
   return html;
 }
 
-function appendError(html: string, message: string): string {
-  // Insert the error div right after the `<body>` tag.
-  // The templates always render the body as the second
-  // line; the regex is intentionally narrow.
-  return html.replace(
-    "<body>\n",
-    `<body>\n<div class="error">${escapeHtml(message)}</div>\n`,
-  );
+function appendError(body: string, message: string): string {
+  // Prepend the error div to the body content. The
+  // caller is expected to wrap the result with
+  // `renderLayout` (i.e., `body` is the inner content,
+  // not a full HTML document). Inserting the error at
+  // the top of the body keeps the visual placement
+  // consistent with the previous "right after <body>"
+  // intent — every existing call site already passes
+  // body content (not full HTML), so the previous
+  // implementation never actually matched `<body>\n`.
+  return `<div class="error">${escapeHtml(message)}</div>\n${body}`;
+}
+
+/**
+ * Render a list page (e.g. agents, clients) with an
+ * inline error banner prepended to the body. Wraps the
+ * result with `renderLayout` so the response is a
+ * complete HTML document (the previous `appendError`
+ * helper returned body content that was passed to
+ * `writeHtml` as full HTML, leaving the error div
+ * outside the `<body>` tag — a latent bug fixed as
+ * part of PR3's scope-edit routes which actually
+ * assert the error renders).
+ */
+function renderListWithError(
+  title: string,
+  body: string,
+  message: string,
+  csrfToken: string,
+): string {
+  return renderLayout({
+    title,
+    body: appendError(body, message),
+    csrfToken,
+  });
 }
 
 function readIp(req: IncomingMessage): string | null {
@@ -1172,12 +1342,13 @@ async function readFormBody(req: IncomingMessage): Promise<URLSearchParams> {
   });
 }
 
-// Mark `withSingleWriter` and `setAgentScopes` as used so
-// the linter doesn't complain. They are part of the
-// router's documented surface but not exercised by
-// PR 2's HTTP routes; future PR 3 routes will use them.
+// Mark `withSingleWriter` as used so the linter doesn't
+// complain. It is part of the router's documented surface
+// for the few transactions that bypass the typed helpers
+// (the scope-edit PR3 routes reuse the typed helpers
+// `setAgentScopes` / `setClientScopes` so the marker for
+// `setAgentScopes` is no longer needed here).
 void withSingleWriter;
-void setAgentScopes;
 
 // Mark type-only imports as used.
 void (null as unknown as AgentRecord);

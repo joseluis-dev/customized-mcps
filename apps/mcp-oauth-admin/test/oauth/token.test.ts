@@ -25,16 +25,16 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { createHash, randomBytes } from "node:crypto";
 import { generateKeyPair, exportJWK, exportPKCS8, calculateJwkThumbprint, jwtVerify, importPKCS8 } from "jose";
-import { createHmac } from "node:crypto";
-import { createHash } from "node:crypto";
 import { openDatabase, initializeSchema, withSingleWriter } from "../../src/db/index.js";
 import { createTokenHandler, type TokenHandlerDeps } from "../../src/oauth/token.js";
 import { createIntrospectHandler } from "../../src/oauth/introspect.js";
 import { setActiveSigningKey, type SigningKeyRecord } from "../../src/oauth/keys.js";
-import { hashPassword, verifyPassword } from "../../src/oauth/passwords.js";
+import { hashPassword } from "../../src/oauth/passwords.js";
+import { _resetCodeStore, getCodeStore, type CodeRecord } from "../../src/oauth/authorize.js";
 
 async function makeTestKey(): Promise<SigningKeyRecord> {
   const { privateKey, publicKey } = await generateKeyPair("RS256", { extractable: true });
@@ -55,12 +55,14 @@ async function setupApp(opts: {
   audience: string;
   issuer: string;
   defaultScope: string;
-}): Promise<{ baseUrl: string; db: ReturnType<typeof openDatabase>; key: SigningKeyRecord; server: Server }> {
+  now?: () => number;
+}): Promise<{ baseUrl: string; db: ReturnType<typeof openDatabase>; key: SigningKeyRecord; server: Server; now: () => number }> {
   const db = openDatabase({ path: ":memory:" });
   await initializeSchema(db);
   const key = await makeTestKey();
   await setActiveSigningKey(db, key);
 
+  const now = opts.now ?? (() => Math.floor(Date.now() / 1000));
   const deps: TokenHandlerDeps = {
     db,
     issuer: opts.issuer,
@@ -68,6 +70,7 @@ async function setupApp(opts: {
     defaultScope: opts.defaultScope,
     accessTokenTtlSeconds: 3600,
     activeKey: key,
+    now,
   };
   const tokenHandler = createTokenHandler(deps);
   const introspectHandler = createIntrospectHandler(deps);
@@ -84,7 +87,7 @@ async function setupApp(opts: {
   await new Promise<void>((resolveP) => server.listen(0, "127.0.0.1", () => resolveP()));
   const port = (server.address() as AddressInfo).port;
   const baseUrl = `http://127.0.0.1:${port}`;
-  return { baseUrl, db, key, server };
+  return { baseUrl, db, key, server, now };
 }
 
 async function teardownApp(ctx: { db: ReturnType<typeof openDatabase>; server: Server }): Promise<void> {
@@ -118,8 +121,6 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     //   - exp - iat = 3600 (TTL)
     const clientId = "client-a";
     const clientSecret = "s3cret";
-    const clientSecretHash = createHmac("sha256", clientSecret).update("").digest("hex");
-    void clientSecretHash;
     // Use the password module's hash for the client secret
     // (the token endpoint verifies against the stored hash).
     const stored = await makeArgonHash(clientSecret);
@@ -453,6 +454,1053 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
     );
     expect(verified.payload.aud).toBe("mcp:readonly-sql");
+  });
+});
+
+describe("oauth/token (authorization_code grant — PKCE S256)", () => {
+  let ctx: Awaited<ReturnType<typeof setupApp>>;
+  let userId: number;
+  let clientId: string;
+  const clientSecret = "s3cret";
+  const redirectUri = "http://127.0.0.1:8080/cb";
+  let verifier: string;
+  let challenge: string;
+  let nowRef: { value: number };
+
+  beforeEach(async () => {
+    _resetCodeStore();
+    // Use a recent past second as the base. The
+    // `mintAccessToken` helper derives the JWT `iat` /
+    // `nbf` / `exp` claims from the injected clock
+    // (the deterministic-clock change in `token.ts`).
+    // The pre-PR code used `Date.now()` directly, so
+    // this value could be any fixed past time. The new
+    // code uses the injected clock, so a fixed past
+    // time would mint a JWT whose `exp` is in the past
+    // by the time the test calls `jwtVerify`.
+    nowRef = { value: Math.floor(Date.now() / 1000) - 60 };
+    ctx = await setupApp({
+      audience: "mcp:readonly-sql",
+      issuer: "http://127.0.0.1:3002",
+      defaultScope: "read:bi_catastro",
+      now: () => nowRef.value,
+    });
+    // Pre-register the user + client. The agent's id is
+    // captured for the `sub=user:<id>` assertion.
+    const userHash = await makeArgonHash("p4ssw0rd");
+    const clientHash = await makeArgonHash(clientSecret);
+    clientId = "client-a";
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        ["alice", userHash, JSON.stringify(["read:bi_catastro"]), 1, 0, nowRef.value],
+      );
+      const userRows = await trx.select<{ id: number }>(
+        "SELECT id FROM users WHERE username = ?",
+        ["alice"],
+      );
+      userId = userRows[0]!.id;
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        [clientId, clientHash, "test", JSON.stringify(["read:bi_catastro"]), nowRef.value],
+      );
+    });
+    verifier = randomBytes(32).toString("base64url");
+    challenge = createHash("sha256").update(verifier).digest("base64url");
+  });
+
+  afterEach(async () => {
+    _resetCodeStore();
+    await teardownApp(ctx);
+  });
+
+  function seedCode(overrides: Partial<CodeRecord> = {}): string {
+    const code = `code-${Math.random().toString(36).slice(2, 10)}`;
+    getCodeStore().set(code, {
+      clientId,
+      agentId: userId,
+      redirectUri,
+      codeChallenge: challenge,
+      codeChallengeMethod: "S256",
+      scopes: ["read:bi_catastro"],
+      expiresAt: nowRef.value + 60,
+      ...overrides,
+    });
+    return code;
+  }
+
+  it("happy path: returns a JWT with sub=user:<agentId> and the consented scopes", async () => {
+    // GIVEN a freshly-issued code
+    // WHEN we POST grant_type=authorization_code with
+    //      the matching code_verifier
+    // THEN the response is 200 + a JWT whose:
+    //   - sub is `user:<id>` (the agent's id)
+    //   - scope matches the consented scope set
+    //   - aud and iss match the authority config
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as {
+      access_token: string;
+      token_type: string;
+      expires_in: number;
+      scope: string;
+    };
+    expect(json.token_type).toBe("Bearer");
+    expect(json.expires_in).toBe(3600);
+    expect(json.scope).toBe("read:bi_catastro");
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      {
+        issuer: "http://127.0.0.1:3002",
+        audience: "mcp:readonly-sql",
+        algorithms: ["RS256"],
+      },
+    );
+    expect(verified.payload.sub).toBe(`user:${userId}`);
+    expect(verified.payload.iss).toBe("http://127.0.0.1:3002");
+    expect(verified.payload.aud).toBe("mcp:readonly-sql");
+    expect(verified.payload.scope).toBe("read:bi_catastro");
+  });
+
+  it("PKCE S256: wrong code_verifier returns 400 invalid_grant (sanitized)", async () => {
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: "a-wrong-verifier-of-sufficient-length-for-the-grammar",
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body.error).toBe("invalid_grant");
+    // Sanitized: no code, no verifier, no challenge, no
+    // authority / JWKS URL leaked.
+    expect(JSON.stringify(body)).not.toMatch(/code/i);
+    expect(JSON.stringify(body)).not.toMatch(/verifier/i);
+    expect(JSON.stringify(body)).not.toMatch(/challenge/i);
+    expect(JSON.stringify(body)).not.toMatch(/127\.0\.0\.1/);
+    expect(JSON.stringify(body)).not.toMatch(/mcp:readonly-sql/);
+    // No access_token.
+    expect(body.access_token).toBeUndefined();
+  });
+
+  it("redirect_uri byte-equal: a different redirect_uri returns 400 invalid_grant", async () => {
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "http://127.0.0.1:9999/different",
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("client_id mismatch: a code bound to client-a is rejected when exchanged by client-b", async () => {
+    // Pre-register a second client.
+    const otherHash = await makeArgonHash("s3cret-b");
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-b", otherHash, "test", JSON.stringify(["read:bi_catastro"]), nowRef.value],
+      );
+    });
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: "client-b",
+        client_secret: "s3cret-b",
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("single-use: the second call with the same code returns 400 invalid_grant", async () => {
+    const code = seedCode();
+    const body = new URLSearchParams({
+      grant_type: "authorization_code",
+      code,
+      redirect_uri: redirectUri,
+      client_id: clientId,
+      client_secret: clientSecret,
+      code_verifier: verifier,
+    });
+    const res1 = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body,
+    });
+    expect(res1.status).toBe(200);
+    const res2 = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      // Build a fresh body — `URLSearchParams` is single-shot.
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res2.status).toBe(400);
+    const body2 = (await res2.json()) as { error: string };
+    expect(body2.error).toBe("invalid_grant");
+  });
+
+  it("expiry: a code past expiresAt returns 400 invalid_grant", async () => {
+    // Issue with a 1-second TTL; advance the clock past
+    // the boundary; the second call returns invalid_grant.
+    const code = seedCode({ expiresAt: nowRef.value + 1 });
+    // Move the clock past expiry (60s + 1 per the spec
+    // is the boundary; we use 2s past to avoid edge
+    // flakiness).
+    nowRef.value += 2;
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("missing required fields (no code, no redirect_uri) returns 400 invalid_request", async () => {
+    // No code, no redirect_uri → 400 invalid_request.
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_request");
+  });
+
+  it("non-loopback redirect_uri on the token request is rejected (400 invalid_grant)", async () => {
+    // The token handler MUST enforce the same loopback
+    // rule as the authorize handler. A non-loopback
+    // redirect_uri on the token request is rejected
+    // with sanitized `invalid_grant`.
+    const code = seedCode();
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: "https://attacker.example/cb",
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("defense in depth: a rotation of the client scope after issue shrinks the granted set", async () => {
+    // The consent handler bound the code's `scopes`
+    // to the user+client intersection at issue time
+    // (a `read:bi_catastro` consent). The token
+    // endpoint re-derives the intersection at
+    // exchange time so a future rotation that
+    // REMOVES the scope from the client shrinks
+    // the granted set (NOT broadens it).
+    const code = seedCode({ scopes: ["read:bi_catastro", "list:bi_catastro"] });
+    // Rotate the client to have only `read:bi_catastro`.
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "UPDATE clients SET scopes = ? WHERE clientId = ?",
+        [JSON.stringify(["read:bi_catastro"]), clientId],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { scope: string };
+    // The re-derived set is `read:bi_catastro` only.
+    expect(json.scope).toBe("read:bi_catastro");
+  });
+});
+
+describe("oauth/token — client_secret_basic (RFC 6749 §2.3.1)", () => {
+  let ctx: Awaited<ReturnType<typeof setupApp>>;
+  const clientId = "client-basic";
+  const clientSecret = "basic-secret";
+
+  beforeEach(async () => {
+    ctx = await setupApp({
+      audience: "mcp:readonly-sql",
+      issuer: "http://127.0.0.1:3002",
+      defaultScope: "read:bi_catastro",
+    });
+    const stored = await makeArgonHash(clientSecret);
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        [clientId, stored, "test", JSON.stringify(["read:bi_catastro"]), Math.floor(Date.now() / 1000)],
+      );
+    });
+  });
+
+  afterEach(async () => {
+    await teardownApp(ctx);
+  });
+
+  it("accepts client credentials via the Authorization: Basic header", async () => {
+    const basic = Buffer.from(`${clientId}:${clientSecret}`, "utf8").toString("base64");
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${basic}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+      }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { scope: string };
+    expect(json.scope).toBe("read:bi_catastro");
+  });
+
+  it("rejects a malformed Basic header (falls back to no-creds error)", async () => {
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: "Basic !!!not-base64!!!",
+      },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_request");
+  });
+
+  it("header credentials take precedence over body credentials", async () => {
+    // The header carries the right secret; the
+    // body carries the WRONG secret. The header
+    // wins (RFC 6749 §2.3.1: when both are present,
+    // exactly one MUST be used; the convention is
+    // header-first).
+    const basic = Buffer.from(`${clientId}:${clientSecret}`, "utf8").toString("base64");
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${basic}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: clientId,
+        client_secret: "wrong-body-secret",
+      }),
+    });
+    expect(res.status).toBe(200);
+  });
+});
+
+describe("oauth/token — password grant scope intersection (user AND client)", () => {
+  let ctx: Awaited<ReturnType<typeof setupApp>>;
+
+  beforeEach(async () => {
+    ctx = await setupApp({
+      audience: "mcp:readonly-sql",
+      issuer: "http://127.0.0.1:3002",
+      defaultScope: "read:bi_catastro",
+    });
+  });
+
+  afterEach(async () => {
+    await teardownApp(ctx);
+  });
+
+  it("rejects a `*` request when the client does not allow `*` (privilege escalation closed)", async () => {
+    // Pre-2026 regression: a user with `*` could
+    // mint a `*` token through a client with no
+    // scopes. The fix is the intersection.
+    const passwordHash = await makeArgonHash("p4ssw0rd");
+    const clientHash = await makeArgonHash("s3cret");
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        ["alice", passwordHash, JSON.stringify(["*"]), 1, 0, Math.floor(Date.now() / 1000)],
+      );
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-a", clientHash, "test", JSON.stringify(["read:bi_catastro"]), Math.floor(Date.now() / 1000)],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "password",
+        username: "alice",
+        password: "p4ssw0rd",
+        client_id: "client-a",
+        client_secret: "s3cret",
+        scope: "*",
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_scope");
+  });
+
+  it("grants the intersection of the user's and the client's scope sets", async () => {
+    const passwordHash = await makeArgonHash("p4ssw0rd");
+    const clientHash = await makeArgonHash("s3cret");
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        ["alice", passwordHash, JSON.stringify(["read:bi_catastro", "list:bi_catastro"]), 1, 0, Math.floor(Date.now() / 1000)],
+      );
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-a", clientHash, "test", JSON.stringify(["read:bi_catastro", "call:foo"]), Math.floor(Date.now() / 1000)],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "password",
+        username: "alice",
+        password: "p4ssw0rd",
+        client_id: "client-a",
+        client_secret: "s3cret",
+        scope: "read:bi_catastro list:bi_catastro call:foo",
+      }),
+    });
+    expect(res.status).toBe(200);
+    const json = (await res.json()) as { scope: string };
+    expect(json.scope).toBe("read:bi_catastro");
+  });
+
+  it("rejects a request when the user has the scope but the client does not", async () => {
+    const passwordHash = await makeArgonHash("p4ssw0rd");
+    const clientHash = await makeArgonHash("s3cret");
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        ["alice", passwordHash, JSON.stringify(["call:secret"]), 1, 0, Math.floor(Date.now() / 1000)],
+      );
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-a", clientHash, "test", JSON.stringify(["read:bi_catastro"]), Math.floor(Date.now() / 1000)],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "password",
+        username: "alice",
+        password: "p4ssw0rd",
+        client_id: "client-a",
+        client_secret: "s3cret",
+        scope: "call:secret",
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_scope");
+  });
+});
+
+describe("oauth/token — refresh_token + authorization_code scope defense in depth (no `*` bypass)", () => {
+  // Regression coverage for the review finding: the
+  // pre-PR2 implementation preserved `*` on
+  // refresh-token and authorization-code grants even
+  // when neither principal currently allowed `*`. The
+  // fix delegates to the centralized
+  // `resolveGrantedScopes` helper with the stored
+  // scopes as the request string, so the `*` rules
+  // apply uniformly.
+  let ctx: Awaited<ReturnType<typeof setupApp>>;
+  let userId: number;
+  let clientId: string;
+  const clientSecret = "s3cret";
+  const redirectUri = "http://127.0.0.1:8080/cb";
+  let verifier: string;
+  let challenge: string;
+  let nowRef: { value: number };
+
+  beforeEach(async () => {
+    _resetCodeStore();
+    // Use a recent past second as the base. See the
+    // note on the other `nowRef` initial value for why
+    // a fixed past time no longer works (the
+    // deterministic-clock change in `token.ts`).
+    nowRef = { value: Math.floor(Date.now() / 1000) - 60 };
+    ctx = await setupApp({
+      audience: "mcp:readonly-sql",
+      issuer: "http://127.0.0.1:3002",
+      defaultScope: "read:bi_catastro",
+      now: () => nowRef.value,
+    });
+    const userHash = await makeArgonHash("p4ssw0rd");
+    const clientHash = await makeArgonHash(clientSecret);
+    clientId = "client-a";
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        ["alice", userHash, JSON.stringify(["read:bi_catastro"]), 1, 0, nowRef.value],
+      );
+      const userRows = await trx.select<{ id: number }>(
+        "SELECT id FROM users WHERE username = ?",
+        ["alice"],
+      );
+      userId = userRows[0]!.id;
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        [clientId, clientHash, "test", JSON.stringify(["read:bi_catastro"]), nowRef.value],
+      );
+    });
+    verifier = randomBytes(32).toString("base64url");
+    challenge = createHash("sha256").update(verifier).digest("base64url");
+  });
+
+  afterEach(async () => {
+    _resetCodeStore();
+    await teardownApp(ctx);
+  });
+
+  it("refresh_token: a stored `*` scope is REJECTED when the principal does not allow `*`", async () => {
+    // The refresh token's `scopes` is `["*"]` (a
+    // pre-existing token issued under a more permissive
+    // policy). After a rotation that narrows both
+    // principals, the recomputed set MUST NOT include
+    // `*`. The endpoint returns `invalid_grant` (NOT
+    // a token with `*`).
+    const refreshPlaintext = "stale-wildcard-refresh";
+    const refreshHash = createHash("sha256").update(refreshPlaintext).digest("hex");
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO refresh_tokens (agentId, clientId, scopes, tokenHash, issuedAt, revokedAt) VALUES (?, ?, ?, ?, ?, ?)",
+        [userId, 1, JSON.stringify(["*"]), refreshHash, nowRef.value - 60, null],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshPlaintext,
+        client_id: clientId,
+        client_secret: clientSecret,
+      }),
+    });
+    // The recomputed set is empty (the principal does
+    // not allow `*`); the endpoint MUST return
+    // `invalid_grant`. Using `invalid_scope` here
+    // would leak the wildcard state — `invalid_grant`
+    // is the sanitized shape every other refresh
+    // failure uses.
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("authorization_code: a stored `*` scope is REJECTED when the principal does not allow `*`", async () => {
+    // Same regression on the authorization_code
+    // path: the code's `scopes` is `["*"]` (an
+    // older consent form permitted wildcard). After
+    // a rotation that narrows both principals, the
+    // exchange MUST fail with `invalid_grant` (NOT
+    // mint a `*` token, NOT `invalid_scope`).
+    const code = `code-${Math.random().toString(36).slice(2, 10)}`;
+    getCodeStore().set(code, {
+      clientId,
+      agentId: userId,
+      redirectUri,
+      codeChallenge: challenge,
+      codeChallengeMethod: "S256",
+      scopes: ["*"],
+      expiresAt: nowRef.value + 60,
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code,
+        redirect_uri: redirectUri,
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: verifier,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+
+  it("refresh_token: a mixed `*` + specific stored scope is REJECTED (the policy rejects mixing)", async () => {
+    // The pre-PR2 implementation could mint a token
+    // with a mixed set. The fix delegates to the
+    // centralized resolver, which rejects mixed
+    // `*` + specific requests with `invalid_scope`.
+    // The endpoint maps this to `invalid_grant` for
+    // the same reason as the previous case: the
+    // response shape MUST NOT leak the wildcard
+    // state of the stored scopes.
+    const refreshPlaintext = "mixed-wildcard-refresh";
+    const refreshHash = createHash("sha256").update(refreshPlaintext).digest("hex");
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO refresh_tokens (agentId, clientId, scopes, tokenHash, issuedAt, revokedAt) VALUES (?, ?, ?, ?, ?, ?)",
+        [userId, 1, JSON.stringify(["*", "read:bi_catastro"]), refreshHash, nowRef.value - 60, null],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: refreshPlaintext,
+        client_id: clientId,
+        client_secret: clientSecret,
+      }),
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_grant");
+  });
+});
+
+describe("oauth/token — sanitized audit_log rows for grants (success + denial)", () => {
+  // The pre-PR review found that the token endpoint
+  // had no audit logging at all. The fix appends
+  // sanitized rows for every grant on the success
+  // AND the denial path. The action set is stable:
+  //   - `token.client_credentials`
+  //   - `token.password`
+  //   - `token.refresh_token`
+  //   - `token.authorization_code`
+  //   - `token.unknown_grant` (unrecognized grant_type)
+  // The outcome is `ok` for success and `denied` for
+  // every failure mode. The actor is the principal on
+  // success (`client:<id>` or `user:<id>`) and
+  // `system:token:<ip>` on denial when no principal
+  // is known. The `ip` column is the trust-controlled
+  // client IP (the helper gates XFF on `trustProxy`).
+  let ctx: Awaited<ReturnType<typeof setupApp>>;
+
+  beforeEach(async () => {
+    ctx = await setupApp({
+      audience: "mcp:readonly-sql",
+      issuer: "http://127.0.0.1:3002",
+      defaultScope: "read:bi_catastro",
+    });
+  });
+
+  afterEach(async () => {
+    await teardownApp(ctx);
+  });
+
+  async function readAuditRows(actionPrefix: string): Promise<
+    Array<{ action: string; outcome: string; actor: string; target: string | null; ip: string | null }>
+  > {
+    return ctx.db.select<{
+      action: string;
+      outcome: string;
+      actor: string;
+      target: string | null;
+      ip: string | null;
+    }>(
+      `SELECT action, outcome, actor, target, ip FROM audit_log
+       WHERE action LIKE ? ORDER BY id ASC`,
+      [`${actionPrefix}%`],
+    );
+  }
+
+  it("client_credentials success → audit row with action=token.client_credentials and outcome=ok", async () => {
+    const clientSecret = "s3cret";
+    const stored = await makeArgonHash(clientSecret);
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-a", stored, "test", JSON.stringify(["read:bi_catastro"]), Math.floor(Date.now() / 1000)],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: "client-a",
+        client_secret: clientSecret,
+      }),
+    });
+    expect(res.status).toBe(200);
+    const rows = await readAuditRows("token.");
+    const okRow = rows.find(
+      (r) => r.action === "token.client_credentials" && r.outcome === "ok",
+    );
+    expect(okRow).toBeDefined();
+    // The actor is the principal (`client:<id>`). The
+    // target is null for `client_credentials` (no user).
+    expect(okRow!.actor).toBe("client:client-a");
+    expect(okRow!.target).toBeNull();
+    // The IP is the loopback peer (the test binds to
+    // 127.0.0.1). The shape is the Node socket value
+    // (`::ffff:127.0.0.1` or `127.0.0.1`).
+    expect(okRow!.ip).toMatch(/^127\.0\.0\.1|^::ffff:127\.0\.0\.1$|^::1$/);
+  });
+
+  it("client_credentials denied → audit row with outcome=denied and the actor is the IP", async () => {
+    // No client registered. The supplied `client_id` is
+    // NEVER echoed in the actor (an attacker probing for
+    // valid clientIds would otherwise learn which IDs
+    // exist from the audit log).
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: "ghost-client",
+        client_secret: "s3cret",
+      }),
+    });
+    expect(res.status).toBe(401);
+    const rows = await readAuditRows("token.");
+    const deniedRow = rows.find(
+      (r) => r.action === "token.client_credentials" && r.outcome === "denied",
+    );
+    expect(deniedRow).toBeDefined();
+    expect(deniedRow!.actor).toMatch(/^system:token:/);
+    // The supplied `client_id` is NOT in the actor.
+    expect(deniedRow!.actor).not.toContain("ghost-client");
+  });
+
+  it("password denied → audit row with outcome=denied (no body, no password in any field)", async () => {
+    // The user exists but the password is wrong.
+    const passwordHash = await makeArgonHash("right");
+    const clientHash = await makeArgonHash("s3cret");
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO users (username, passwordHash, scopes, enabled, requireChangeOnFirstLogin, createdAt) VALUES (?, ?, ?, ?, ?, ?)",
+        ["alice", passwordHash, JSON.stringify(["read:bi_catastro"]), 1, 0, Math.floor(Date.now() / 1000)],
+      );
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-a", clientHash, "test", JSON.stringify(["read:bi_catastro"]), Math.floor(Date.now() / 1000)],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "password",
+        username: "alice",
+        password: "wrong",
+        client_id: "client-a",
+        client_secret: "s3cret",
+      }),
+    });
+    expect(res.status).toBe(400);
+    // The audit row exists; the supplied password is
+    // NEVER in any audit column.
+    const rows = await readAuditRows("token.");
+    const deniedRow = rows.find(
+      (r) => r.action === "token.password" && r.outcome === "denied",
+    );
+    expect(deniedRow).toBeDefined();
+    // The row's `actor`, `target`, `ip` fields MUST NOT
+    // contain the password plaintext, the username, the
+    // raw scope, the client secret, or any other
+    // attacker-controlled value.
+    const text = JSON.stringify(deniedRow);
+    expect(text).not.toContain("wrong");
+    expect(text).not.toContain("alice");
+    expect(text).not.toContain("s3cret");
+  });
+
+  it("refresh_token denied (unknown token) → audit row with action=token.refresh_token outcome=denied", async () => {
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: "this-token-does-not-exist",
+        client_id: "any",
+        client_secret: "any",
+      }),
+    });
+    expect(res.status).toBe(400);
+    const rows = await readAuditRows("token.");
+    const deniedRow = rows.find(
+      (r) => r.action === "token.refresh_token" && r.outcome === "denied",
+    );
+    expect(deniedRow).toBeDefined();
+    // The supplied refresh token is NEVER in the actor.
+    const text = JSON.stringify(deniedRow);
+    expect(text).not.toContain("this-token-does-not-exist");
+  });
+
+  it("authorization_code denied (bad code) → audit row with action=token.authorization_code outcome=denied", async () => {
+    // Pre-register a client so the request gets past the
+    // `invalid_client` gate and reaches the code-consume
+    // check. The code itself is unknown, so the handler
+    // returns `invalid_grant` (the spec's mandated shape).
+    const clientId = "client-a";
+    const clientSecret = "s3cret";
+    const stored = await makeArgonHash(clientSecret);
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        [clientId, stored, "test", JSON.stringify(["read:bi_catastro"]), Math.floor(Date.now() / 1000)],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: "code-that-does-not-exist",
+        redirect_uri: "http://127.0.0.1:8080/cb",
+        client_id: clientId,
+        client_secret: clientSecret,
+        code_verifier: "v".repeat(43),
+      }),
+    });
+    expect(res.status).toBe(400);
+    const rows = await readAuditRows("token.");
+    const deniedRow = rows.find(
+      (r) => r.action === "token.authorization_code" && r.outcome === "denied",
+    );
+    expect(deniedRow).toBeDefined();
+    // The supplied code + verifier are NEVER in the actor.
+    const text = JSON.stringify(deniedRow);
+    expect(text).not.toContain("code-that-does-not-exist");
+    expect(text).not.toContain("v".repeat(20));
+  });
+
+  it("unsupported grant_type → audit row with action=token.unknown_grant outcome=denied", async () => {
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:fake",
+      }),
+    });
+    expect(res.status).toBe(400);
+    const rows = await readAuditRows("token.");
+    const deniedRow = rows.find(
+      (r) => r.action === "token.unknown_grant" && r.outcome === "denied",
+    );
+    expect(deniedRow).toBeDefined();
+  });
+});
+
+describe("oauth/token — audit timestamps use the injected clock (deterministic)", () => {
+  // The pre-PR `recordTokenOk` / `recordTokenDenied` helpers
+  // used `Math.floor(Date.now() / 1000)` directly. That
+  // bypassed the handler's injected clock, so the audit
+  // `ts` could land seconds AFTER the JWT `iat` / `nbf`
+  // claim — defeating the deterministic-clock contract that
+  // the rest of the token endpoint honors. The fix routes
+  // the audit `ts` through the same `getNow(deps)` helper
+  // the JWT claims use, so the verifier phase can pin a
+  // single instant and assert that the audit row + the
+  // JWT `iat` are bitwise-equal.
+  let ctx: Awaited<ReturnType<typeof setupApp>>;
+  let nowRef: { value: number };
+
+  beforeEach(async () => {
+    // Pick a recent past second (60s before the test
+    // start). The JWT `exp` is `now + 3600` (1 hour
+    // ahead) so it stays in the future throughout the
+    // test; the `iat` / `nbf` stay in the past, which
+    // is the standard shape. Using a fixed-past value
+    // like 1_700_000_000 (Nov 2023) would mint a JWT
+    // whose `exp` is in the past by the time
+    // `jwtVerify` runs in 2026.
+    nowRef = { value: Math.floor(Date.now() / 1000) - 60 };
+    ctx = await setupApp({
+      audience: "mcp:readonly-sql",
+      issuer: "http://127.0.0.1:3002",
+      defaultScope: "read:bi_catastro",
+      now: () => nowRef.value,
+    });
+  });
+
+  afterEach(async () => {
+    await teardownApp(ctx);
+  });
+
+  it("success audit row's `ts` equals the injected clock (matches the JWT `iat` claim)", async () => {
+    // GIVEN a registered client
+    // WHEN we POST grant_type=client_credentials
+    // THEN the audit row's `ts` is the injected clock —
+    //      bitwise-equal to the JWT `iat` claim (the same
+    //      `getNow(deps)` drives both). The pre-PR code
+    //      used `Date.now()` for the audit row, so the
+    //      values could diverge by the test runtime.
+    const clientSecret = "s3cret";
+    const stored = await makeArgonHash(clientSecret);
+    await withSingleWriter(ctx.db, async (trx) => {
+      await trx.execute(
+        "INSERT INTO clients (clientId, clientSecretHash, label, scopes, createdAt) VALUES (?, ?, ?, ?, ?)",
+        ["client-a", stored, "test", JSON.stringify(["read:bi_catastro"]), nowRef.value],
+      );
+    });
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: "client-a",
+        client_secret: clientSecret,
+      }),
+    });
+    expect(res.status).toBe(200);
+    // Read the audit row.
+    const rows = await ctx.db.select<{ ts: number; outcome: string }>(
+      "SELECT ts, outcome FROM audit_log WHERE action = 'token.client_credentials' AND outcome = 'ok'",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.ts).toBe(nowRef.value);
+    // The JWT `iat` claim is the same `getNow(deps)`. The
+    // bitwise-equal `ts === iat` is the deterministic-clock
+    // contract the verifier phase depends on.
+    const json = (await res.json()) as { access_token: string };
+    const verified = await jwtVerify(
+      json.access_token,
+      await importPKCS8(ctx.key.privatePem, "RS256"),
+      {
+        issuer: "http://127.0.0.1:3002",
+        audience: "mcp:readonly-sql",
+        algorithms: ["RS256"],
+      },
+    );
+    expect(verified.payload.iat).toBe(rows[0]!.ts);
+  });
+
+  it("denied audit row's `ts` equals the injected clock", async () => {
+    // GIVEN a request with no client credentials
+    // WHEN we POST grant_type=client_credentials
+    // THEN the denied audit row's `ts` is the injected
+    //      clock (NOT `Date.now()`).
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "client_credentials",
+        client_id: "ghost-client",
+        client_secret: "s3cret",
+      }),
+    });
+    expect(res.status).toBe(401);
+    const rows = await ctx.db.select<{ ts: number; outcome: string }>(
+      "SELECT ts, outcome FROM audit_log WHERE action = 'token.client_credentials' AND outcome = 'denied'",
+    );
+    expect(rows).toHaveLength(1);
+    expect(rows[0]!.ts).toBe(nowRef.value);
+  });
+});
+
+describe("oauth/token — oversized body returns sanitized 400 (not connection reset)", () => {
+  // The pre-PR review found that `token.ts` used
+  // `req.destroy()` on the body-cap-exceeded path,
+  // converting a 400 into a connection reset. The
+  // fix pauses the stream and returns a sanitized
+  // 400 JSON. The test below pins the contract.
+  let ctx: Awaited<ReturnType<typeof setupApp>>;
+
+  beforeEach(async () => {
+    ctx = await setupApp({
+      audience: "mcp:readonly-sql",
+      issuer: "http://127.0.0.1:3002",
+      defaultScope: "read:bi_catastro",
+    });
+  });
+
+  afterEach(async () => {
+    await teardownApp(ctx);
+  });
+
+  it("a 100 KiB body returns 400 + { error: 'invalid_request' } (no socket reset)", async () => {
+    // 100 KiB body — well over the 64 KiB cap.
+    const oversized = "x".repeat(100 * 1024);
+    const res = await fetch(`${ctx.baseUrl}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: oversized,
+    });
+    // The handler MUST NOT crash the listener with a
+    // connection reset. The response is a sanitized
+    // 400 JSON.
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toBe("invalid_request");
+    // The body is JSON, not a connection-reset.
+    expect(res.headers.get("content-type")).toMatch(/application\/json/);
   });
 });
 

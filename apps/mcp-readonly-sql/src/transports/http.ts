@@ -8,10 +8,16 @@
  * - the `/healthz` endpoint
  * - the SIGTERM/SIGINT graceful shutdown controller
  * - request body size limits and structured logging
+ * - the `/.well-known/oauth-protected-resource` handler (PR1) — the
+ *   catalog source-of-truth comes from the app via `scopeCatalog`
+ *   (PR4 task 4.1)
  *
  * The app side owns:
  * - the McpServer factory (the five read-only tools + connection pool)
  * - the env-to-config mapping (`config/http.ts`)
+ * - the scope catalog builder (`config/scopeCatalog.ts` — derives
+ *   `read:<alias>` + `list:<alias>` per profile OR honors
+ *   `MCP_RESOURCE_SCOPES` env override)
  * - the dispatcher (`dispatcher.ts`) that picks this vs stdio
  *
  * Per PR1 re-review, the v1 default is stateless (per-request transports)
@@ -42,6 +48,17 @@ export type RunHttpTransportOptions = {
    */
   serverFactory: () => McpServer;
   /**
+   * Optional scope catalog for the `/.well-known/oauth-protected-resource`
+   * `scopes_supported` field (RFC 9728). The shared base invokes the
+   * closure on every well-known request so the value is always fresh.
+   * The app side derives the catalog from profile aliases +
+   * `MCP_RESOURCE_SCOPES` env override (see `config/scopeCatalog.ts`).
+   * When unset, the shared base falls back to the documented default of
+   * `() => []` (the catalog is the resource server's responsibility,
+   * not the shared base's).
+   */
+  scopeCatalog?: () => string[];
+  /**
    * Test hook: receives the options object just before it is handed to
    * the shared base. Production code does NOT pass this; tests use it
    * to assert on the wiring (e.g. sessionMode literal) without starting
@@ -57,7 +74,7 @@ export type HttpTransportHandle = {
 };
 
 export function runHttpTransport(options: RunHttpTransportOptions): HttpTransportHandle {
-  const { config, serverFactory, onOptionsBuilt } = options;
+  const { config, serverFactory, scopeCatalog, onOptionsBuilt } = options;
 
   const logger: Logger = createLogger({ format: config.logFormat });
 
@@ -77,6 +94,19 @@ export function runHttpTransport(options: RunHttpTransportOptions): HttpTranspor
     // Phase 1b: the audit-safe label that `/healthz` exposes.
     // "oauth" when the OAuth admin authority is selected.
     authorityBackend: config.authorityBackend,
+    // PR1 (mcp-http-base): the public URL of the OAuth authority.
+    // The shared base advertises this URL as the sole entry of
+    // `authorization_servers` in the
+    // `/.well-known/oauth-protected-resource` document per RFC 9728.
+    // Required so the well-known route can advertise a non-empty list.
+    authorityUrl: config.authorityUrl ?? "",
+    // PR1 (mcp-http-base): the resource server's own public base URL.
+    // When unset, the shared base falls back to the per-request `Host`
+    // header (with `x-forwarded-proto`) — see
+    // `resolveResourceServerBaseUrl`. The 401 `WWW-Authenticate`
+    // header and the well-known `resource` field both derive from this
+    // value.
+    resourceServerUrl: config.resourceServerUrl,
     sessionMode: config.sessionMode,
     logger,
     shutdownTimeoutMs: config.shutdownTimeoutMs,
@@ -99,6 +129,16 @@ export function runHttpTransport(options: RunHttpTransportOptions): HttpTranspor
       // to drain in-flight queries, then calls shared.stop() and pool.destroyAll().
     },
   };
+
+  // PR4 task 4.1: forward the app-derived scope catalog to the
+  // shared base. The shared base invokes this on every well-known
+  // request so the value is always fresh (e.g. a profile added at
+  // startup is reflected without a process restart). The catalog is
+  // derived in the entrypoint (`config/scopeCatalog.ts`) from
+  // profile aliases + `MCP_RESOURCE_SCOPES` env override.
+  if (scopeCatalog) {
+    sharedOptions.scopeCatalog = scopeCatalog;
+  }
 
   // Test-only hook. The signature is unconditional so production code
   // never has to branch on its presence.

@@ -44,6 +44,15 @@ export type HttpConfigInput = {
   MCP_AUTHORITY_JWKS_TTL_S: string | undefined;
   MCP_AUTHORITY_LEEWAY_S: string | undefined;
   MCP_AUTHORITY_FETCH_TIMEOUT_MS: string | undefined;
+  /**
+   * The resource server's own public base URL. The 401
+   * `WWW-Authenticate` header and the `/.well-known/oauth-protected-resource`
+   * body MUST point at the resource server's own base URL (RFC 9728 §5.1,
+   * RFC 6750 §3), NOT the authority issuer. When unset, the server falls
+   * back to the per-request `Host` header + `x-forwarded-proto` via
+   * `resolveResourceServerBaseUrl` below.
+   */
+  MCP_RESOURCE_SERVER_URL: string | undefined;
 };
 
 export type HttpConfig = {
@@ -70,6 +79,15 @@ export type HttpConfig = {
   authorityJwksTtlSeconds: number;
   authorityLeewaySeconds: number;
   authorityFetchTimeoutMs: number;
+  /**
+   * The operator-configured resource server base URL. `undefined` means
+   * the per-request `Host` header is the source of truth (see
+   * `resolveResourceServerBaseUrl`). The shared config layer does NOT
+   * default this to the authority URL — the resource server and
+   * authorization server are separate origins, and the RFC 9728 metadata
+   * MUST point at the resource server itself.
+   */
+  resourceServerUrl: string | undefined;
 };
 
 export class HttpConfigError extends Error {
@@ -184,6 +202,13 @@ export function parseHttpConfig(input: HttpConfigInput): HttpConfig {
     Number.MAX_SAFE_INTEGER,
   );
 
+  // The shared layer is transparent on `MCP_RESOURCE_SERVER_URL`: it
+  // stores the value verbatim (post-trim). The per-request resolution
+  // (config vs. `Host` + `x-forwarded-proto` fallback) lives in
+  // `resolveResourceServerBaseUrl` so it can be unit-tested without
+  // spinning up a real HTTP server.
+  const resourceServerUrl = nonEmpty(input.MCP_RESOURCE_SERVER_URL);
+
   return {
     host,
     port,
@@ -199,7 +224,89 @@ export function parseHttpConfig(input: HttpConfigInput): HttpConfig {
     authorityJwksTtlSeconds,
     authorityLeewaySeconds,
     authorityFetchTimeoutMs,
+    resourceServerUrl,
   };
+}
+
+/**
+ * Minimal structural request shape consumed by `resolveResourceServerBaseUrl`.
+ * Exposing only `headers` keeps the resolver unit-testable from a plain
+ * vitest test and reusable from the server (which has the real
+ * `IncomingMessage` in scope).
+ */
+export type ResourceServerRequestLike = {
+  headers: Record<string, string | string[] | undefined>;
+};
+
+/**
+ * RFC 9728 protected-resource metadata document. `resource` is the
+ * resource server's own public base URL; `authorization_servers` lists
+ * OAuth authority issuers; `bearer_methods_supported` is hard-coded to
+ * `["header"]` (token-in-query / token-in-body are out of scope for v1).
+ */
+export type ProtectedResourceMetadata = {
+  resource: string;
+  authorization_servers: string[];
+  bearer_methods_supported: string[];
+  scopes_supported: string[];
+};
+
+/**
+ * Resolve the resource server's public base URL for a single request.
+ *
+ * Source of truth (in order):
+ * 1. `config.resourceServerUrl` (the operator's `MCP_RESOURCE_SERVER_URL`).
+ *    Trailing slashes are stripped so concatenation with the
+ *    well-known path produces exactly one `/`.
+ * 2. Per-request `Host` header, prefixed with the `x-forwarded-proto`
+ *    scheme when the request came through a TLS-terminating proxy;
+ *    otherwise `http://`. `x-forwarded-proto` may be a string or an
+ *    array of strings; the first value wins.
+ *
+ * Throws `HttpConfigError` when neither source is available. The
+ * resource server MUST be able to advertise an absolute URL — a
+ * silent empty string would let a client fall through to a
+ * relative-path well-known request that 404s.
+ */
+export function resolveResourceServerBaseUrl(
+  config: Pick<HttpConfig, "resourceServerUrl">,
+  request: ResourceServerRequestLike,
+): string {
+  if (config.resourceServerUrl) {
+    return config.resourceServerUrl.replace(/\/+$/, "");
+  }
+  const host = readHeaderIgnoreCase(request.headers, "host");
+  if (host === undefined || host.length === 0) {
+    throw new HttpConfigError(
+      "Cannot resolve resource server base URL: MCP_RESOURCE_SERVER_URL is unset " +
+        "and the request has no Host header. Set MCP_RESOURCE_SERVER_URL on the " +
+        "resource server, or ensure the request includes a Host header.",
+    );
+  }
+  const forwardedProto = readHeaderIgnoreCase(request.headers, "x-forwarded-proto");
+  const rawScheme = forwardedProto !== undefined
+    ? forwardedProto.split(",")[0]?.trim() ?? ""
+    : "";
+  const scheme = rawScheme.length > 0 ? rawScheme : "http";
+  return `${scheme}://${host}`;
+}
+
+/**
+ * Read a single header value from a Node `IncomingMessage`-shaped
+ * headers map. Multi-value headers are returned as the first value of
+ * the array (e.g. `x-forwarded-proto` when chained proxies produce
+ * a list).
+ */
+function readHeaderIgnoreCase(
+  headers: Record<string, string | string[] | undefined>,
+  name: string,
+): string | undefined {
+  const raw = headers[name.toLowerCase()];
+  if (raw === undefined) return undefined;
+  if (Array.isArray(raw)) {
+    return raw[0];
+  }
+  return raw;
 }
 
 /**

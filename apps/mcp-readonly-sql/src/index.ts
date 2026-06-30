@@ -34,6 +34,7 @@ import { sanitizeError } from "./security/sanitizeError.js";
 import { buildReadOnlyMcpServer } from "./serverFactory.js";
 import { runStdioTransport } from "./transports/stdio.js";
 import { loadHttpRuntimeConfig, HttpRuntimeConfigError } from "./config/http.js";
+import { buildScopeCatalog } from "./config/scopeCatalog.js";
 import { runHttpTransport } from "./transports/http.js";
 import type { Logger } from "@customized-mcps/mcp-http-base";
 
@@ -158,9 +159,21 @@ async function runHttpServer(): Promise<void> {
   // 4. Hand the server factory to the HTTP transport. The transport
   //    delegates to `@customized-mcps/mcp-http-base` for the actual HTTP wiring
   //    (listener, auth, /healthz, body limits, shutdown).
+  //
+  //    PR4 task 4.1: the resource server advertises its scope catalog
+  //    at `/.well-known/oauth-protected-resource` (RFC 9728). The
+  //    catalog is derived from profile aliases (`read:<alias>` +
+  //    `list:<alias>` per profile) OR an explicit `MCP_RESOURCE_SCOPES`
+  //    env override. The closure is passed to the transport which
+  //    forwards it to the shared base; the shared base invokes the
+  //    closure on every well-known request so the value is fresh.
+  const scopeCatalog = (): string[] => buildScopeCatalog(profiles, {
+    MCP_RESOURCE_SCOPES: process.env.MCP_RESOURCE_SCOPES,
+  });
   const transport = runHttpTransport({
     config,
     serverFactory: () => buildReadOnlyMcpServer({ profiles, limits, connections: handle.connections }).server,
+    scopeCatalog,
   });
   await transport.start();
   log(

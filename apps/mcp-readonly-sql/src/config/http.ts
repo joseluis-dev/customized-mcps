@@ -227,6 +227,13 @@ export async function loadHttpRuntimeConfig(): Promise<HttpRuntimeConfig> {
     MCP_AUTHORITY_JWKS_TTL_S: process.env.MCP_AUTHORITY_JWKS_TTL_S,
     MCP_AUTHORITY_LEEWAY_S: process.env.MCP_AUTHORITY_LEEWAY_S,
     MCP_AUTHORITY_FETCH_TIMEOUT_MS: process.env.MCP_AUTHORITY_FETCH_TIMEOUT_MS,
+    // PR1 (mcp-http-base) added `MCP_RESOURCE_SERVER_URL` so the resource
+    // server's 401 `WWW-Authenticate` header and the
+    // `/.well-known/oauth-protected-resource` body can point at the
+    // resource server's own public base URL. When unset, the shared base
+    // falls back to the per-request `Host` header + `x-forwarded-proto`
+    // (see `resolveResourceServerBaseUrl`).
+    MCP_RESOURCE_SERVER_URL: process.env.MCP_RESOURCE_SERVER_URL,
   };
 
   let http: HttpConfig;

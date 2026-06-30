@@ -10,6 +10,11 @@ import {
 } from "../src/server.js";
 import { createLogger } from "../src/logging.js";
 
+/** Local stand-in for the OAuth authority URL. The well-known handler and the
+ * 401 `WWW-Authenticate` header use this in tests; production wires the
+ * real `MCP_AUTHORITY_URL`. */
+const TEST_AUTHORITY_URL = "http://127.0.0.1:3002";
+
 /**
  * A hand-rolled `TokenAuthority` for the unit tests in this file. The
  * resource server is wired against an external OAuth / JWKS authority
@@ -43,6 +48,7 @@ function makeOptions(
       }
       throw new (await import("../src/authority/index.js")).TokenInvalidError("nope");
     }),
+    authorityUrl: TEST_AUTHORITY_URL,
     sessionMode: "stateful",
     logger: createLogger({ format: "text" }),
     shutdownTimeoutMs: 1000,
@@ -277,6 +283,176 @@ describe("createHttpMcpServer", () => {
       // the auth middleware short-circuits to 401 for missing headers).
       const noauth = await http(port, "POST", "/mcp-readonly-sql", {}, "{}");
       expect(noauth.status).toBe(401);
+    });
+  });
+
+  describe("WWW-Authenticate on 401", () => {
+    // RFC 6750 §3 + RFC 9728 §5.1: a 401 from a resource server MUST
+    // include `WWW-Authenticate: Bearer resource_metadata="<url>"` so
+    // the client can discover the authority. The URL MUST point at the
+    // resource server's own well-known endpoint (NOT the authority
+    // issuer). The 401 body is the sanitized JSON-RPC envelope; only
+    // the header is new.
+
+    it("emits WWW-Authenticate with the env-driven resource_server_url on a 401 (missing bearer)", async () => {
+      const { handle, port } = await startServer(
+        makeOptions({ resourceServerUrl: "https://mcp.example.com" }),
+      );
+      stopHandle = handle;
+      const res = await http(port, "POST", "/mcp", {}, "{}");
+      expect(res.status).toBe(401);
+      const wwwAuth = res.headers["www-authenticate"];
+      expect(typeof wwwAuth === "string" ? wwwAuth : wwwAuth?.[0]).toBe(
+        'Bearer resource_metadata="https://mcp.example.com/.well-known/oauth-protected-resource"',
+      );
+    });
+
+    it("falls back to the request Host header (http://) when no resourceServerUrl is set", async () => {
+      const { handle, port } = await startServer(makeOptions());
+      stopHandle = handle;
+      const res = await http(port, "POST", "/mcp", {}, "{}");
+      expect(res.status).toBe(401);
+      const wwwAuth = res.headers["www-authenticate"];
+      expect(typeof wwwAuth === "string" ? wwwAuth : wwwAuth?.[0]).toBe(
+        `Bearer resource_metadata="http://127.0.0.1:${port}/.well-known/oauth-protected-resource"`,
+      );
+    });
+
+    it("uses x-forwarded-proto when present (https behind a TLS-terminating proxy)", async () => {
+      const { handle, port } = await startServer(makeOptions());
+      stopHandle = handle;
+      const res = await http(
+        port,
+        "POST",
+        "/mcp",
+        { "X-Forwarded-Proto": "https" },
+        "{}",
+      );
+      expect(res.status).toBe(401);
+      const wwwAuth = res.headers["www-authenticate"];
+      expect(typeof wwwAuth === "string" ? wwwAuth : wwwAuth?.[0]).toBe(
+        `Bearer resource_metadata="https://127.0.0.1:${port}/.well-known/oauth-protected-resource"`,
+      );
+    });
+
+    it("does NOT emit WWW-Authenticate on 503 (authority-unavailable is a transport problem, not an auth challenge)", async () => {
+      const { AuthorityUnavailableError } = await import("../src/authority/index.js");
+      const authority: TokenAuthority = {
+        verify: async () => {
+          throw new AuthorityUnavailableError("JWKS down");
+        },
+      };
+      const { handle, port } = await startServer(
+        makeOptions({
+          authority,
+          resourceServerUrl: "https://mcp.example.com",
+        }),
+      );
+      stopHandle = handle;
+      const res = await http(
+        port,
+        "POST",
+        "/mcp",
+        { Authorization: "Bearer anything" },
+        "{}",
+      );
+      expect(res.status).toBe(503);
+      expect(res.headers["www-authenticate"]).toBeUndefined();
+    });
+
+    it("the 401 body remains the sanitized JSON-RPC envelope (no token / no agent id leaked)", async () => {
+      const { handle, port } = await startServer(
+        makeOptions({ resourceServerUrl: "https://mcp.example.com" }),
+      );
+      stopHandle = handle;
+      const res = await http(
+        port,
+        "POST",
+        "/mcp",
+        { Authorization: "Bearer secret-token-value-12345" },
+        "{}",
+      );
+      expect(res.status).toBe(401);
+      expect(res.body).not.toContain("secret-token-value-12345");
+      const parsed = JSON.parse(res.body) as { error?: { message?: string } };
+      expect(parsed.error?.message).toBe("unauthorized");
+    });
+  });
+
+  describe("GET /.well-known/oauth-protected-resource", () => {
+    // RFC 9728 §3.1: the protected resource metadata document. The
+    // resource server returns its own public base URL in `resource`
+    // and the OAuth authority's URL in `authorization_servers`. The
+    // handler is unauthenticated by design — clients discover the
+    // authority from the resource server, then start the auth-code
+    // flow against the authority.
+
+    it("returns RFC 9728 JSON with the env-driven resource URL and the authority's issuer URL", async () => {
+      const { handle, port } = await startServer(
+        makeOptions({
+          resourceServerUrl: "https://mcp.example.com",
+          scopeCatalog: () => ["read:bi_catastro", "list:bi_catastro"],
+        }),
+      );
+      stopHandle = handle;
+      const res = await http(
+        port,
+        "GET",
+        "/.well-known/oauth-protected-resource",
+      );
+      expect(res.status).toBe(200);
+      const ct = res.headers["content-type"];
+      expect(typeof ct === "string" ? ct : ct?.[0]).toMatch(/application\/json/);
+      const body = JSON.parse(res.body) as {
+        resource?: string;
+        authorization_servers?: string[];
+        bearer_methods_supported?: string[];
+        scopes_supported?: string[];
+      };
+      expect(body.resource).toBe("https://mcp.example.com");
+      expect(body.authorization_servers).toEqual([TEST_AUTHORITY_URL]);
+      expect(body.bearer_methods_supported).toEqual(["header"]);
+      expect(body.scopes_supported).toEqual([
+        "read:bi_catastro",
+        "list:bi_catastro",
+      ]);
+    });
+
+    it("uses the request Host as the `resource` value when no MCP_RESOURCE_SERVER_URL is set", async () => {
+      const { handle, port } = await startServer(makeOptions());
+      stopHandle = handle;
+      const res = await http(
+        port,
+        "GET",
+        "/.well-known/oauth-protected-resource",
+      );
+      expect(res.status).toBe(200);
+      const body = JSON.parse(res.body) as { resource?: string };
+      expect(body.resource).toBe(`http://127.0.0.1:${port}`);
+    });
+
+    it("defaults scopes_supported to [] when no scopeCatalog is provided", async () => {
+      const { handle, port } = await startServer(makeOptions());
+      stopHandle = handle;
+      const res = await http(
+        port,
+        "GET",
+        "/.well-known/oauth-protected-resource",
+      );
+      expect(res.status).toBe(200);
+      const body = JSON.parse(res.body) as { scopes_supported?: string[] };
+      expect(body.scopes_supported).toEqual([]);
+    });
+
+    it("the well-known endpoint does not require an Authorization header (it's public, per RFC 9728)", async () => {
+      const { handle, port } = await startServer(makeOptions());
+      stopHandle = handle;
+      const res = await http(
+        port,
+        "GET",
+        "/.well-known/oauth-protected-resource",
+      );
+      expect(res.status).toBe(200);
     });
   });
 });
