@@ -99,6 +99,13 @@ function readHttpConfig(): ReturnType<typeof parseHttpConfig> {
     MCP_AUTHORITY_JWKS_TTL_S: undefined,
     MCP_AUTHORITY_LEEWAY_S: undefined,
     MCP_AUTHORITY_FETCH_TIMEOUT_MS: undefined,
+    // Resource-server-side env var; the authority does not act as a
+    // resource server so the value is intentionally undefined (the
+    // shared base falls back to the per-request `Host` header when
+    // needed). Keeping the field present keeps the type contract
+    // honest — a future maintainer who copies one of these lines
+    // sees the "intentionally undefined" comment in context.
+    MCP_RESOURCE_SERVER_URL: undefined,
   });
 }
 

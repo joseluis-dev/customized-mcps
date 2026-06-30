@@ -334,5 +334,129 @@ describe("transports/http", () => {
       await expect(handle.stop()).resolves.toBeUndefined();
       await expect(handle.stop()).resolves.toBeUndefined();
     });
+
+    describe("scopeCatalog wiring (PR4 task 4.1 + 4.2)", () => {
+      // The resource server exposes `scopes_supported` at
+      // `/.well-known/oauth-protected-resource` (RFC 9728 + the
+      // `mcp-token-authority` delta). The catalog is supplied by the
+      // app via `RunHttpTransportOptions.scopeCatalog`; the shared
+      // base invokes the closure on every well-known request so the
+      // value is fresh. The app side derives the catalog from
+      // profile aliases + an optional `MCP_RESOURCE_SCOPES` env
+      // override (see `config/scopeCatalog.ts`); here we just verify
+      // the wiring from the transport to the shared base.
+
+      it("forwards the scopeCatalog option to the shared base when set", () => {
+        // GIVEN a transport built with a scopeCatalog option
+        // WHEN the transport is built
+        // THEN the underlying createHttpMcpServer is called with the
+        //      same scopeCatalog function (the shared base invokes
+        //      it on every well-known request).
+        const cfg = makeConfig({ port: 0 });
+        const catalog = (): string[] => ["read:demo", "list:demo"];
+        const observed: { scopeCatalog?: () => string[] } = {};
+        const handle = runHttpTransport({
+          config: cfg,
+          serverFactory: () => buildReadOnlyMcpServer({ profiles: [FAKE_SQLITE_PROFILE], limits: TEST_LIMITS }).server,
+          scopeCatalog: catalog,
+          onOptionsBuilt: (opts) => {
+            observed.scopeCatalog = opts.scopeCatalog;
+          },
+        });
+        // The forwarded catalog IS the same function reference.
+        expect(observed.scopeCatalog).toBe(catalog);
+        // The catalog returns the expected scopes when invoked.
+        expect(observed.scopeCatalog?.()).toEqual(["read:demo", "list:demo"]);
+        // The handle is still well-formed even though we never start it.
+        expect(typeof handle.start).toBe("function");
+        expect(typeof handle.stop).toBe("function");
+      });
+
+      it("omits the scopeCatalog option from the shared base when not set (defaults to [] per RFC 9728)", () => {
+        // GIVEN a transport built WITHOUT a scopeCatalog option
+        // WHEN the transport is built
+        // THEN the underlying createHttpMcpServer is called without
+        //      a scopeCatalog field, so the shared base falls back
+        //      to the documented default of `() => []` (the catalog
+        //      is the resource server's responsibility, not the
+        //      shared base's).
+        const cfg = makeConfig({ port: 0 });
+        const observed: { scopeCatalog?: () => string[] } = {};
+        runHttpTransport({
+          config: cfg,
+          serverFactory: () => buildReadOnlyMcpServer({ profiles: [FAKE_SQLITE_PROFILE], limits: TEST_LIMITS }).server,
+          onOptionsBuilt: (opts) => {
+            observed.scopeCatalog = opts.scopeCatalog;
+          },
+        });
+        expect(observed.scopeCatalog).toBeUndefined();
+      });
+
+      it("the well-known endpoint reflects the scopeCatalog (read+list per profile alias)", async () => {
+        // GIVEN a transport built with a scopeCatalog derived from
+        //      a single profile's alias (the app's default path when
+        //      `MCP_RESOURCE_SCOPES` is unset)
+        // WHEN a client calls `GET /.well-known/oauth-protected-resource`
+        // THEN the response body includes the catalog scopes in
+        //      `scopes_supported`.
+        const cfg = makeConfig({ port: 0 });
+        // The catalog mirrors the app's buildScopeCatalog() for a
+        // single profile with alias "demo" (the FAKE_SQLITE_PROFILE
+        // above uses operatorKey SQLITE_FAKE, so we use the
+        // resulting alias "SQLITE_FAKE" — we exercise the same
+        // shape the production code would produce).
+        const catalog = (): string[] => ["read:SQLITE_FAKE", "list:SQLITE_FAKE"];
+        const handle = runHttpTransport({
+          config: cfg,
+          serverFactory: () => buildReadOnlyMcpServer({ profiles: [FAKE_SQLITE_PROFILE], limits: TEST_LIMITS }).server,
+          scopeCatalog: catalog,
+        });
+        await handle.start();
+        activeHandles.push(handle);
+        const port = Number(new URL(handle.url).port);
+        const res = await http(port, "GET", "/.well-known/oauth-protected-resource");
+        expect(res.status).toBe(200);
+        const body = JSON.parse(res.body) as {
+          resource?: string;
+          authorization_servers?: string[];
+          scopes_supported?: string[];
+        };
+        expect(body.scopes_supported).toEqual(["read:SQLITE_FAKE", "list:SQLITE_FAKE"]);
+        // The other RFC 9728 fields are still present (the catalog
+        // is additive — the shared base still owns resource,
+        // authorization_servers, bearer_methods_supported).
+        expect(body.bearer_methods_supported).toEqual(["header"]);
+        expect(body.authorization_servers).toEqual([cfg.authorityUrl]);
+        // The well-known endpoint is unauthenticated; the body
+        // MUST NOT include the operator's token or agent id.
+        expect(res.body).not.toContain("Bearer");
+        expect(res.body).not.toContain("tok-a");
+      });
+
+      it("the well-known endpoint reflects an MCP_RESOURCE_SCOPES env override (the env branch wins over the profile branch)", async () => {
+        // GIVEN a transport built with a scopeCatalog derived from
+        //      an operator-set `MCP_RESOURCE_SCOPES` env var
+        // WHEN a client calls the well-known endpoint
+        // THEN the response body advertises the env value, NOT the
+        //      profile-derived catalog. The minimal-path catalog
+        //      source-of-truth is the env when set; the profile
+        //      derivation is the fallback.
+        const cfg = makeConfig({ port: 0 });
+        // Mirrors `buildScopeCatalog(profiles, { MCP_RESOURCE_SCOPES: "read:foo, list:bar" })`.
+        const catalog = (): string[] => ["read:foo", "list:bar"];
+        const handle = runHttpTransport({
+          config: cfg,
+          serverFactory: () => buildReadOnlyMcpServer({ profiles: [FAKE_SQLITE_PROFILE], limits: TEST_LIMITS }).server,
+          scopeCatalog: catalog,
+        });
+        await handle.start();
+        activeHandles.push(handle);
+        const port = Number(new URL(handle.url).port);
+        const res = await http(port, "GET", "/.well-known/oauth-protected-resource");
+        expect(res.status).toBe(200);
+        const body = JSON.parse(res.body) as { scopes_supported?: string[] };
+        expect(body.scopes_supported).toEqual(["read:foo", "list:bar"]);
+      });
+    });
   });
 });

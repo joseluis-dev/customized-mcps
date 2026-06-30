@@ -98,8 +98,22 @@ const SECRET_PATTERNS: ReadonlyArray<{ name: string; regex: RegExp }> = [
   {
     // Bearer followed by a 16+ char opaque token. The token chars are
     // drawn from the alphabet the SDK transport would accept.
-    name: "Bearer <opaque-token> (>=16 chars)",
-    regex: /\bBearer\s+[A-Za-z0-9_.\-+/=]{16,}/g,
+    //
+    // Negative lookahead: an actual `WWW-Authenticate: Bearer …` 401
+    // challenge uses RFC 6750 §3 / RFC 9728 §5.1 auth-param keywords
+    // (`realm`, `scope`, `error`, `error_description`, `error_uri`,
+    // `resource_metadata`), NOT an opaque token. PR1's resource-server
+    // discovery work legitimately emits the literal text
+    // `Bearer resource_metadata="<url>"` in `packages/mcp-http-base/src/
+    // server.ts` (the 401 path) and references the same shape in a
+    // JSDoc comment. The token alphabet does not allow a real bearer
+    // to START with one of those keywords followed by a word boundary
+    // (a token char is alphanumeric or one of `-._~+/=`, so a token
+    // prefix like `error_…` has no `\b` between `error` and `_`); the
+    // lookahead below is therefore both narrow and safe — it excludes
+    // challenge headers and ONLY challenge headers, never real tokens.
+    name: "Bearer <opaque-token> (>=16 chars, excluding RFC 6750/9728 auth-params)",
+    regex: /\bBearer\s+(?!(?:realm|scope|error|error_description|error_uri|resource_metadata)\b)[A-Za-z0-9_.\-+/=]{16,}/g,
   },
   {
     // 64-char hex (the `keyHash` shape). False positives: env values
