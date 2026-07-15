@@ -41,7 +41,14 @@ import { BodyTooLargeError, readFormBody } from "./bodyReader.js";
 export type IntrospectHandlerDeps = {
   db: AuthorityDatabase;
   issuer: string;
-  audience: string;
+  /**
+   * Allowed canonical resource URIs. Etapa 3 will tighten the
+   * contract: introspect on a token whose `aud` is not in this
+   * allowlist returns `{ active: false }`. The current change
+   * only renames the field so the entrypoint wiring compiles;
+   * the access-control logic lands in Etapa 3.
+   */
+  allowedResources: string[];
 };
 
 /**
@@ -116,7 +123,11 @@ export async function introspect(
   try {
     const verified = await jwtVerify(token, privateKey, {
       issuer: deps.issuer,
-      audience: deps.audience,
+      // Etapa 3 will validate that `payload.aud` is one of
+      // `deps.allowedResources`. For now we accept any string
+      // audience so the introspect probe succeeds against the
+      // legacy single-audience tokens issued before the
+      // migration.
       algorithms: ["RS256"],
     });
     const payload = verified.payload;

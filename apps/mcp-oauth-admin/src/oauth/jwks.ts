@@ -13,6 +13,10 @@
  *   type the authority supports is `code` (the
  *   authorization-code flow); the implicit `token` flow
  *   is out of scope and MUST NOT be advertised.
+ * - `GET /.well-known/oauth-authorization-server` advertises
+ *   the same endpoints for OAuth2-only clients (RFC 8414).
+ *   The body is the same as `openid-configuration` minus the
+ *   OIDC-only fields.
  *
  * These handlers are intentionally thin: they read the
  * current `keys` row and shape the response. The handlers
@@ -24,6 +28,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { loadActiveSigningKey } from "./keys.js";
 import type { AuthorityDatabase } from "../db/connection.js";
+import type { OAuthConfig } from "../config/oauth.js";
 
 /**
  * The JWK fields that are considered "public" per the spec.
@@ -68,13 +73,15 @@ export function createJwksHandler(options: {
 
 /**
  * Construct the `/.well-known/openid-configuration` handler.
- * The discovery doc is built from the request's host so the
- * issuer matches the URL the resource server actually sees
- * (no port mismatch when the authority is behind a reverse
- * proxy on the default port).
+ * The discovery doc is built from the canonical issuer so
+ * clients always see the same URL regardless of the bind
+ * address (a TLS-terminating reverse proxy is the typical
+ * case). When the canonical issuer is not set (the OAuth
+ * wiring is disabled), the handler falls back to deriving
+ * the issuer from the request host.
  *
  * Per the spec:
- * - The `issuer` is the authority URL.
+ * - The `issuer` is the canonical MCP_AUTHORITY_URL.
  * - The `token_endpoint`, `introspection_endpoint`, and
  *   `authorization_endpoint` are advertised. (The
  *   introspect endpoint is an internal contract; we
@@ -93,13 +100,18 @@ export function createJwksHandler(options: {
  *   `user:<agentId>`, `client:<clientId>`) to every
  *   relying party. No pairwise / sector-identifier mapping
  *   is performed.
+ * - `protected_resources` (RFC 9728 §4) advertises the
+ *   canonical resource URIs the authority is willing to
+ *   mint tokens for. The field is omitted when the OAuth
+ *   wiring is disabled (no allowlist to advertise).
  */
 export function createOidcDiscoveryHandler(options: {
   issuer?: string;
+  oauth?: OAuthConfig;
 }): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
   return async (req, res) => {
     const issuer = options.issuer ?? deriveIssuer(req);
-    const body = {
+    const body: Record<string, unknown> = {
       issuer,
       jwks_uri: `${issuer}/.well-known/jwks.json`,
       authorization_endpoint: `${issuer}/oauth/authorize`,
@@ -124,6 +136,50 @@ export function createOidcDiscoveryHandler(options: {
       code_challenge_methods_supported: ["S256"],
       subject_types_supported: ["public"],
     };
+    if (options.oauth && options.oauth.allowedResources.length > 0) {
+      body["protected_resources"] = options.oauth.allowedResources;
+    }
+    res.statusCode = 200;
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    res.setHeader("Cache-Control", "public, max-age=300");
+    res.end(JSON.stringify(body));
+  };
+}
+
+/**
+ * Construct the RFC 8414 `/.well-known/oauth-authorization-server`
+ * handler. The body shape is the same as the OIDC discovery
+ * handler minus the OIDC-only fields (`subject_types_supported`,
+ * `id_token_signing_alg_values_supported`). MCP spec §Authorization
+ * Server Discovery: clients that do not implement OIDC discover
+ * the authority via this endpoint.
+ */
+export function createOAuthAuthorizationServerMetadataHandler(options: {
+  issuer?: string;
+  oauth?: OAuthConfig;
+}): (req: IncomingMessage, res: ServerResponse) => Promise<void> {
+  return async (req, res) => {
+    const issuer = options.issuer ?? deriveIssuer(req);
+    const body: Record<string, unknown> = {
+      issuer,
+      jwks_uri: `${issuer}/.well-known/jwks.json`,
+      authorization_endpoint: `${issuer}/oauth/authorize`,
+      token_endpoint: `${issuer}/oauth/token`,
+      introspection_endpoint: `${issuer}/oauth/introspect`,
+      registration_endpoint: `${issuer}/oauth/register`,
+      grant_types_supported: [
+        "client_credentials",
+        "password",
+        "refresh_token",
+        "authorization_code",
+      ],
+      response_types_supported: ["code"],
+      token_endpoint_auth_methods_supported: ["client_secret_post", "client_secret_basic"],
+      code_challenge_methods_supported: ["S256"],
+    };
+    if (options.oauth && options.oauth.allowedResources.length > 0) {
+      body["protected_resources"] = options.oauth.allowedResources;
+    }
     res.statusCode = 200;
     res.setHeader("Content-Type", "application/json; charset=utf-8");
     res.setHeader("Cache-Control", "public, max-age=300");

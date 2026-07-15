@@ -82,7 +82,7 @@ describe("oauth/introspect — empty token regression (PR 3 W4-style)", () => {
     const deps: IntrospectHandlerDeps = {
       db,
       issuer: "http://127.0.0.1:3002",
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
     };
     const handler = createIntrospectHandler(deps);
     server = createServer((req, res) => {
@@ -204,7 +204,7 @@ describe("oauth/introspect — response body has no `scope` field (PR 3 of remov
     deps = {
       db,
       issuer: "http://127.0.0.1:3002",
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
     };
     const handler = createIntrospectHandler(deps);
     server = createServer((req, res) => {

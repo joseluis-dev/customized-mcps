@@ -47,7 +47,12 @@ import { createServer } from "node:http";
 import { randomBytes } from "node:crypto";
 import { openDatabase, initializeSchema, defaultDatabasePath, drainWriterChain } from "./db/index.js";
 import { setActiveSigningKey } from "./oauth/keys.js";
-import { createJwksHandler, createOidcDiscoveryHandler } from "./oauth/jwks.js";
+import {
+  createJwksHandler,
+  createOidcDiscoveryHandler,
+  createOAuthAuthorizationServerMetadataHandler,
+} from "./oauth/jwks.js";
+import { createHealthHandler, type HealthHandlerOptions } from "./oauth/health.js";
 import { createTokenHandler, type TokenHandlerDeps } from "./oauth/token.js";
 import { createIntrospectHandler, type IntrospectHandlerDeps } from "./oauth/introspect.js";
 import { createAuthorizeHandler, type AuthorizeDeps } from "./oauth/authorize.js";
@@ -57,6 +62,7 @@ import { generateSessionSecret } from "./admin/session.js";
 import { ensureBootstrapAdmin, resolveBootstrapEnv, shouldWarnBootstrapEnv } from "./admin/bootstrap.js";
 import { startBackupLoop, resolveBackupTarget, resolveBackupIntervalSeconds, runBackupOnce } from "./backup.js";
 import { startSweepLoop } from "./sweep.js";
+import { loadOAuthConfig, type OAuthConfig } from "./config/oauth.js";
 import { parseHttpConfig, HttpConfigError } from "@customized-mcps/mcp-http-base";
 import { createLogger } from "@customized-mcps/mcp-http-base";
 
@@ -120,6 +126,11 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
   const db = openDatabase({ path: dbPath });
   await initializeSchema(db);
   const logger = createLogger({ format: httpConfig.logFormat });
+  // OAuth config: the canonical issuer + resource allowlist. The
+  // loader is fail-closed: when MCP_AUTHORITY_URL is set, the
+  // loader requires MCP_OAUTH_ALLOWED_RESOURCES and rejects
+  // duplicate / invalid entries.
+  const oauthConfig = loadOAuthConfig();
   // Bootstrap admin: read the env, insert the row if
   // missing, and emit a WARN while the env vars are set.
   const env = resolveBootstrapEnv({
@@ -156,10 +167,23 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
   // the per-IP DCR rate-limit or distort the audit
   // attribution on a direct-bind deployment.
   const trustProxy = httpConfig.behindProxy;
+  // The canonical issuer is the operator-supplied
+  // MCP_AUTHORITY_URL when set. When unset (the OAuth
+  // wiring is disabled), the issuer falls back to the
+  // listener URL so the JWS verification still finds a
+  // match (the resource servers that depend on the issuer
+  // MUST be configured to match the value they see).
+  const canonicalIssuer: string = oauthConfig.issuer
+    ?? `http://${httpConfig.host}:${httpConfig.port}`;
+  // Deprecated `MCP_AUTHORITY_AUDIENCE` is now informational
+  // only — the per-resource audience is canonicalized from
+  // MCP_OAUTH_ALLOWED_RESOURCES. The token endpoint no longer
+  // accepts a single global audience; every minted token's
+  // `aud` claim is one of the allowed resources.
   const tokenDeps: TokenHandlerDeps = {
     db,
-    issuer: `http://${httpConfig.host}:${httpConfig.port}`,
-    audience: process.env.MCP_AUTHORITY_AUDIENCE ?? `mcp:${process.env.MCP_OAUTH_APP_ID ?? "admin"}`,
+    issuer: canonicalIssuer,
+    allowedResources: oauthConfig.allowedResources,
     defaultScope: process.env.MCP_OAUTH_DEFAULT_SCOPE ?? "read:bi_catastro",
     accessTokenTtlSeconds: 3600,
     activeKey,
@@ -167,8 +191,8 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
   };
   const introspectDeps: IntrospectHandlerDeps = {
     db,
-    issuer: `http://${httpConfig.host}:${httpConfig.port}`,
-    audience: tokenDeps.audience,
+    issuer: canonicalIssuer,
+    allowedResources: oauthConfig.allowedResources,
   };
   // Authorize handler deps. The handler reuses the admin
   // session secret (the spec's "one login surface" rule)
@@ -237,9 +261,23 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
   const authorizeHandler = createAuthorizeHandler(authorizeDeps);
   const registerHandler = createRegisterHandler(registerDeps);
   const jwksHandler = createJwksHandler({ db });
-  const oidcHandler = createOidcDiscoveryHandler({ issuer: tokenDeps.issuer });
+  const oidcHandler = createOidcDiscoveryHandler({
+    issuer: canonicalIssuer,
+    oauth: oauthConfig,
+  });
+  const oauthMetadataHandler = createOAuthAuthorizationServerMetadataHandler({
+    issuer: canonicalIssuer,
+    oauth: oauthConfig,
+  });
+  const healthHandler = createHealthHandler({
+    db,
+    oauth: oauthConfig,
+  } satisfies HealthHandlerOptions);
   const server = createServer((req, res) => {
     const url = req.url ?? "/";
+    if (url === "/healthz") {
+      return healthHandler(req, res);
+    }
     if (url.startsWith("/admin")) {
       return adminRouter(req, res);
     }
@@ -248,6 +286,9 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
     }
     if (url === "/.well-known/openid-configuration") {
       return oidcHandler(req, res);
+    }
+    if (url === "/.well-known/oauth-authorization-server") {
+      return oauthMetadataHandler(req, res);
     }
     if (url.startsWith("/oauth/authorize")) {
       return authorizeHandler(req, res);
@@ -275,7 +316,7 @@ export async function main(): Promise<{ server: ReturnType<typeof createServer>;
   });
   logger.info(
     `mcp-oauth-admin: listening on http://${httpConfig.host}:${httpConfig.port} ` +
-      `(audience=${tokenDeps.audience})`,
+      `(issuer=${canonicalIssuer}, resources=${oauthConfig.allowedResources.length})`,
   );
   // Shutdown wiring.
   const shutdown = async (): Promise<void> => {

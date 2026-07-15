@@ -73,7 +73,7 @@ async function setupApp(): Promise<{
   const deps: TokenHandlerDeps = {
     db,
     issuer: "http://127.0.0.1:3002",
-    audience: "mcp:readonly-sql",
+    allowedResources: ["https://mcp.example.com"],
     defaultScope: "read:bi_catastro",
     accessTokenTtlSeconds: 3600,
     activeKey: key,
@@ -147,7 +147,7 @@ describe("oauth/oauth-grant (PR 3 of remove-scope-authorization) — incoming `s
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -199,7 +199,7 @@ describe("oauth/oauth-grant (PR 3 of remove-scope-authorization) — incoming `s
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -249,7 +249,7 @@ describe("oauth/oauth-grant (PR 3 of remove-scope-authorization) — incoming `s
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -314,7 +314,7 @@ describe("oauth/oauth-grant (PR 3 of remove-scope-authorization) — incoming `s
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();

@@ -33,6 +33,20 @@ export {
 } from "./config.js";
 
 /**
+ * Canonical resource URI handling for RFC 8707 / RFC 9728. The shared
+ * base exposes a single canonicalization function so every component
+ * (config parser, JWKS verifier, metadata handler, 401 challenge
+ * writer) compares the same way. See `resource.ts` for the rules.
+ */
+export {
+  canonicalizeResourceUri,
+  isCanonicalResourceUri,
+  ResourceUriError,
+  type CanonicalResourceErrorCode,
+  type CanonicalizeOptions,
+} from "./resource.js";
+
+/**
  * Phase 1a of `external-token-authority-verification` introduces the
  * `TokenAuthority` interface. The shared base ships the production
  * backends: `JwksAuthority` (Phase 1b) and `OAuthAdminAuthority`

@@ -59,7 +59,6 @@ async function makeArgonHash(plain: string): Promise<string> {
 }
 
 async function setupApp(opts: {
-  audience: string;
   issuer: string;
   defaultScope: string;
   now?: () => number;
@@ -73,7 +72,7 @@ async function setupApp(opts: {
   const deps: TokenHandlerDeps = {
     db,
     issuer: opts.issuer,
-    audience: opts.audience,
+    allowedResources: ["https://mcp.example.com"],
     defaultScope: opts.defaultScope,
     accessTokenTtlSeconds: 3600,
     activeKey: key,
@@ -109,7 +108,7 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
 
   beforeEach(async () => {
     ctx = await setupApp({
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
       issuer: "http://127.0.0.1:3002",
       defaultScope: "read:bi_catastro",
     });
@@ -170,7 +169,7 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       await importPKCS8(ctx.key.privatePem, "RS256"),
       {
         issuer: "http://127.0.0.1:3002",
-        audience: "mcp:readonly-sql",
+        allowedResources: ["https://mcp.example.com"],
         algorithms: ["RS256"],
       },
     );
@@ -180,7 +179,7 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     expect(header.typ).toBe("JWT");
     const payload = verified.payload;
     expect(payload.iss).toBe("http://127.0.0.1:3002");
-    expect(payload.aud).toBe("mcp:readonly-sql");
+    expect(payload.aud).toBe("https://mcp.example.com");
     expect(typeof payload.sub).toBe("string");
     // The JWT MUST NOT include a `scope` or `scopes` claim.
     // The `remove-scope-authorization` change mints
@@ -240,7 +239,7 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
       await importPKCS8(ctx.key.privatePem, "RS256"),
       {
         issuer: "http://127.0.0.1:3002",
-        audience: "mcp:readonly-sql",
+        allowedResources: ["https://mcp.example.com"],
         algorithms: ["RS256"],
       },
     );
@@ -368,7 +367,7 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -408,7 +407,7 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -502,9 +501,9 @@ describe("oauth/token (RS256 + claims + TTL)", () => {
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
-    expect(verified.payload.aud).toBe("mcp:readonly-sql");
+    expect(verified.payload.aud).toBe("https://mcp.example.com");
     // The JWT MUST NOT include a `scope` or `scopes` claim
     // even though the refresh token's bound `scopes` column
     // holds a legacy value.
@@ -536,7 +535,7 @@ describe("oauth/token (authorization_code grant — PKCE S256)", () => {
     // by the time the test calls `jwtVerify`.
     nowRef = { value: Math.floor(Date.now() / 1000) - 60 };
     ctx = await setupApp({
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
       issuer: "http://127.0.0.1:3002",
       defaultScope: "read:bi_catastro",
       now: () => nowRef.value,
@@ -627,13 +626,13 @@ describe("oauth/token (authorization_code grant — PKCE S256)", () => {
       await importPKCS8(ctx.key.privatePem, "RS256"),
       {
         issuer: "http://127.0.0.1:3002",
-        audience: "mcp:readonly-sql",
+        allowedResources: ["https://mcp.example.com"],
         algorithms: ["RS256"],
       },
     );
     expect(verified.payload.sub).toBe(`user:${userId}`);
     expect(verified.payload.iss).toBe("http://127.0.0.1:3002");
-    expect(verified.payload.aud).toBe("mcp:readonly-sql");
+    expect(verified.payload.aud).toBe("https://mcp.example.com");
     // The JWT MUST NOT include a `scope` or `scopes` claim.
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -663,6 +662,10 @@ describe("oauth/token (authorization_code grant — PKCE S256)", () => {
     expect(JSON.stringify(body)).not.toMatch(/challenge/i);
     expect(JSON.stringify(body)).not.toMatch(/127\.0\.0\.1/);
     expect(JSON.stringify(body)).not.toMatch(/mcp:readonly-sql/);
+    // The minted token's `aud` is the canonical resource URI
+    // (RFC 8707); the previous legacy audience value MUST NOT
+    // appear anywhere in the response body.
+    expect(JSON.stringify(body)).not.toMatch(/https:\/\/mcp\.example\.com/);
     // No access_token.
     expect(body.access_token).toBeUndefined();
   });
@@ -840,7 +843,7 @@ describe("oauth/token (authorization_code grant — PKCE S256)", () => {
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -854,7 +857,7 @@ describe("oauth/token — client_secret_basic (RFC 6749 §2.3.1)", () => {
 
   beforeEach(async () => {
     ctx = await setupApp({
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
       issuer: "http://127.0.0.1:3002",
       defaultScope: "read:bi_catastro",
     });
@@ -944,7 +947,7 @@ describe("oauth/token — incoming `scope` parameter is tolerated and ignored (P
 
   beforeEach(async () => {
     ctx = await setupApp({
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
       issuer: "http://127.0.0.1:3002",
       defaultScope: "read:bi_catastro",
     });
@@ -978,7 +981,7 @@ describe("oauth/token — incoming `scope` parameter is tolerated and ignored (P
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -1015,7 +1018,7 @@ describe("oauth/token — incoming `scope` parameter is tolerated and ignored (P
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -1063,7 +1066,7 @@ describe("oauth/token — incoming `scope` parameter is tolerated and ignored (P
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -1128,7 +1131,7 @@ describe("oauth/token — incoming `scope` parameter is tolerated and ignored (P
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -1157,7 +1160,7 @@ describe("oauth/token — legacy wildcard / mixed scope storage mints a scope-fr
     _resetCodeStore();
     nowRef = { value: Math.floor(Date.now() / 1000) - 60 };
     ctx = await setupApp({
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
       issuer: "http://127.0.0.1:3002",
       defaultScope: "read:bi_catastro",
       now: () => nowRef.value,
@@ -1220,7 +1223,7 @@ describe("oauth/token — legacy wildcard / mixed scope storage mints a scope-fr
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -1259,7 +1262,7 @@ describe("oauth/token — legacy wildcard / mixed scope storage mints a scope-fr
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -1293,7 +1296,7 @@ describe("oauth/token — legacy wildcard / mixed scope storage mints a scope-fr
     const verified = await jwtVerify(
       json.access_token,
       await importPKCS8(ctx.key.privatePem, "RS256"),
-      { issuer: "http://127.0.0.1:3002", audience: "mcp:readonly-sql", algorithms: ["RS256"] },
+      { issuer: "http://127.0.0.1:3002", allowedResources: ["https://mcp.example.com"], algorithms: ["RS256"] },
     );
     expect(verified.payload.scope).toBeUndefined();
     expect(verified.payload.scopes).toBeUndefined();
@@ -1320,7 +1323,7 @@ describe("oauth/token — sanitized audit_log rows for grants (success + denial)
 
   beforeEach(async () => {
     ctx = await setupApp({
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
       issuer: "http://127.0.0.1:3002",
       defaultScope: "read:bi_catastro",
     });
@@ -1550,7 +1553,7 @@ describe("oauth/token — audit timestamps use the injected clock (deterministic
     // `jwtVerify` runs in 2026.
     nowRef = { value: Math.floor(Date.now() / 1000) - 60 };
     ctx = await setupApp({
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
       issuer: "http://127.0.0.1:3002",
       defaultScope: "read:bi_catastro",
       now: () => nowRef.value,
@@ -1602,7 +1605,7 @@ describe("oauth/token — audit timestamps use the injected clock (deterministic
       await importPKCS8(ctx.key.privatePem, "RS256"),
       {
         issuer: "http://127.0.0.1:3002",
-        audience: "mcp:readonly-sql",
+        allowedResources: ["https://mcp.example.com"],
         algorithms: ["RS256"],
       },
     );
@@ -1642,7 +1645,7 @@ describe("oauth/token — oversized body returns sanitized 400 (not connection r
 
   beforeEach(async () => {
     ctx = await setupApp({
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
       issuer: "http://127.0.0.1:3002",
       defaultScope: "read:bi_catastro",
     });
@@ -1676,7 +1679,7 @@ describe("oauth/introspect", () => {
 
   beforeEach(async () => {
     ctx = await setupApp({
-      audience: "mcp:readonly-sql",
+      allowedResources: ["https://mcp.example.com"],
       issuer: "http://127.0.0.1:3002",
       defaultScope: "read:bi_catastro",
     });
@@ -1724,7 +1727,7 @@ describe("oauth/introspect", () => {
       scope?: string;
     };
     expect(body.active).toBe(true);
-    expect(body.aud).toBe("mcp:readonly-sql");
+    expect(body.aud).toBe("https://mcp.example.com");
     expect(body.iss).toBe("http://127.0.0.1:3002");
     // The body MUST NOT include a `scope` field.
     expect(body.scope).toBeUndefined();

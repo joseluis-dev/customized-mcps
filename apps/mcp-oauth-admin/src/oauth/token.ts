@@ -77,7 +77,23 @@ import { createLogger, type Logger } from "@customized-mcps/mcp-http-base";
 export type TokenHandlerDeps = {
   db: AuthorityDatabase;
   issuer: string;
-  audience: string;
+  /**
+   * Canonical resource URIs (RFC 8707) the authority is
+   * willing to mint tokens for. Every `aud` claim in a
+   * minted JWT is one of these URIs. When the OAuth wiring
+   * is disabled, the field is the empty array — the token
+   * endpoint fails closed on the resource validation path
+   * (a token without a `resource` parameter is rejected).
+   *
+   * Etapa 3 will replace the `audience` field (and the
+   * `mintAccessToken` signature) with the full RFC 8707
+   * flow: resource validation, `resource` parameter on the
+   * authorization / token requests, and refresh-token
+   * resource binding. This PR only adds the field so the
+   * entrypoint wiring compiles; the resource-aware logic
+   * lands in Etapa 3.
+   */
+  allowedResources: string[];
   /** @deprecated Retained for backward compatibility with
    *  the v1 wiring in `index.ts`; the field is no longer
    *  read (PR 3 of `remove-scope-authorization` ignores
@@ -106,6 +122,28 @@ export type TokenHandlerDeps = {
 
 function getNow(deps: TokenHandlerDeps): number {
   return deps.now ? deps.now() : Math.floor(Date.now() / 1000);
+}
+
+/**
+ * Mint a JWT for the supplied canonical resource URI. The
+ * `aud` claim is the canonical URI (RFC 8707 §2). When the
+ * caller does not supply a resource (legacy `client_credentials`
+ * / `password` grants without RFC 8707), the function falls
+ * back to the first allowed resource — Etapa 3 will tighten
+ * the contract so every grant MUST supply a resource.
+ */
+function pickAudience(
+  deps: TokenHandlerDeps,
+  resource: string | undefined,
+): string {
+  if (resource !== undefined) return resource;
+  if (deps.allowedResources.length > 0) {
+    return deps.allowedResources[0]!;
+  }
+  // Fail closed: no allowed resources means the OAuth wiring
+  // is disabled. The token endpoint will surface the
+  // appropriate error in the per-grant branches.
+  throw new Error("No allowed resources configured; refusing to mint a token.");
 }
 
 /**
@@ -283,7 +321,7 @@ async function handleClientCredentials(
   // it has NO effect on the minted token).
   void params.get("scope");
   const sub = `client:${clientId}`;
-  const token = await mintAccessToken(deps, sub);
+  const token = await mintAccessToken(deps, sub, undefined);
   await recordTokenOk(
     deps.db,
     logger,
@@ -439,7 +477,7 @@ async function handlePasswordGrant(
   // Incoming `scope` is tolerated and ignored.
   void params.get("scope");
   const sub = `user:${user.id}`;
-  const token = await mintAccessToken(deps, sub);
+  const token = await mintAccessToken(deps, sub, undefined);
   await recordTokenOk(
     deps.db,
     logger,
@@ -586,7 +624,7 @@ async function handleRefreshTokenGrant(
   // Incoming `scope` is tolerated and ignored.
   void params.get("scope");
   const sub = `user:${row.agentId}`;
-  const token = await mintAccessToken(deps, sub);
+  const token = await mintAccessToken(deps, sub, undefined);
   await recordTokenOk(
     deps.db,
     logger,
@@ -805,7 +843,7 @@ async function handleAuthorizationCodeGrant(
   // resource server can resolve the agent without an
   // extra DB lookup. The minted token is scope-free.
   const sub = `user:${record.agentId}`;
-  const token = await mintAccessToken(deps, sub);
+  const token = await mintAccessToken(deps, sub, undefined);
   await recordTokenOk(
     deps.db,
     logger,
@@ -881,6 +919,7 @@ function extractClientCredentials(
 async function mintAccessToken(
   deps: TokenHandlerDeps,
   sub: string,
+  resource: string | undefined,
 ): Promise<string> {
   const privateKey = await importSigningPrivateKey(deps.activeKey);
   // The `iat` / `nbf` / `exp` claims are derived from the
@@ -889,9 +928,10 @@ async function mintAccessToken(
   // clock so the TTL boundary is deterministic; the
   // direct `Date.now()` call would defeat that.
   const now = getNow(deps);
+  const aud = pickAudience(deps, resource);
   const payload: JWTPayload = {
     iss: deps.issuer,
-    aud: deps.audience,
+    aud,
     sub,
     iat: now,
     nbf: now,
